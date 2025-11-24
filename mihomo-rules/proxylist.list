@@ -8,7 +8,7 @@ DOMAIN-KEYWORD,panel
 # 域名关键字匹配
 DOMAIN-KEYWORD,1e100
 DOMAIN-SUFFIX,ping0.cc
-speedtest.net
+DOMAIN-SUFFIX,speedtest.net
 # 国外DNS
 DOMAIN-SUFFIX,dns.google
 DOMAIN-SUFFIX,1dot1dot1dot1.cloudflare-dns.com
