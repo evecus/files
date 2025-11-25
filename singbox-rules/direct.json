@@ -3,16 +3,38 @@
   "rules": [
     {
       "domain_suffix": [
-        "54647.global",
-        "54647.io",
-        "54647.online",
-        "54647.org"
+        "ryplay11.com",
+          "955500.xyz",
+          "668599.xyz",
+          "166001.xyz",
+          "dytt-cinema.com",
+          "tyyszywvod5.com",
+          "fengbao8.com",
+          "360xyz.vip",
+          "bdzybf22.com",
+          "cdn.wicdn88.com",
+          "panel.freecloud.ltd",
+          "pterodactyl.freecloud.ltd",
+          "acl4.ssr",
+          "freecloud.ltd",
+          "www.gstatic.com",
+          "ming8600.xyz",
+          "bing.com",
+          "fjmtop.dpdns.org"
       ]
     },
     {
         "source_ip_cidr": [
-          "192.168.1.100/32"
+          "192.168.1.100/30"
         ]
-    }
+    },
+    {
+        "ip_cidr": [
+          "192.168.0.0/16",
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "127.0.0.0/8"
+        ]
+      }
   ]
 }
