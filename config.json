@@ -412,38 +412,27 @@
         "download_detour": "Direct"
       }
     ],
-    "final": "ZOTHERS",
+    "final": "OTHERS",
     "auto_detect_interface": true,
     "default_domain_resolver": {
       "server": "ali"
     }
   },
   "log": {
-    "disabled": true,
-    "level": "warning",
-    "timestamp": true
+    "disabled": true
   },
   "outbounds": [
     {
-      "tag": "all",
+      "tag": "PROXY",
       "type": "selector",
       "outbounds": []
     },
     {
-      "tag": "all-auto",
-      "type": "urltest",
-      "outbounds": [],
-      "url": "https://www.gstatic.com/generate_204",
-      "interval": "1m",
-      "tolerance": 50
-    },
-    {
-      "tag": "ZOTHERS",
+      "tag": "OTHERS",
       "type": "selector",
       "outbounds": [
         "Direct",
-        "all",
-        "all-auto"
+        "PROXY"
       ]
     },
     {
