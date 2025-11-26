@@ -1,7 +1,7 @@
 const { type, name } = $arguments
 const compatible_outbound = {
   tag: 'COMPATIBLE',
-  type: 'direct',
+  type: 'Direct',
 }
 
 let compatible
@@ -25,7 +25,7 @@ config.outbounds.forEach(outbound => {
   if (Array.isArray(outbound.outbounds) && outbound.outbounds.length === 0) {
     if (!compatible) {
       config.outbounds.push(compatible_outbound)
-      compatible = true
+      compatible = false
     }
     outbound.outbounds.push(compatible_outbound.tag);
   }
