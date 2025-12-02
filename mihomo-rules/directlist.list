@@ -2,7 +2,7 @@ IP-CIDR,192.168.0.0/16,no-resolve
 IP-CIDR,10.0.0.0/24,no-resolve
 IP-CIDR,172.16.0.0/12,no-resolve
 IP-CIDR,127.0.0.0/8,no-resolve
-SRC-IP-CIDR,192.168.1.100/30,no-resolve
+SRC-IP-CIDR,10.0.0.100/30,no-resolve
 DOMAIN-SUFFIX,ryplay11.com
 DOMAIN-SUFFIX,955500.xyz
 DOMAIN-SUFFIX,668599.xyz
