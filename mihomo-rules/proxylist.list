@@ -12,6 +12,9 @@ DOMAIN-SUFFIX,speedtest.net
 DOMAIN-SUFFIX,grok.com
 DOMAIN-KEYWORD,grok
 SRC-IP-CIDR,10.0.0.200/32,no-resolve
+SRC-IP-CIDR,192.168.1.200/32,no-resolve
+SRC-IP-CIDR,192.168.0.200/32,no-resolve
+SRC-IP-CIDR,192.168.31.200/32,no-resolve
 # 国外DNS
 DOMAIN-SUFFIX,dns.google
 DOMAIN-SUFFIX,1dot1dot1dot1.cloudflare-dns.com
