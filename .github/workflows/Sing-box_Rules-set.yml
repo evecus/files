@@ -3,6 +3,9 @@ name: Sing-box_Rules-set
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write   # 👈 必须有这个，否则无法 push
+
 jobs:
   build-and-push-ruleset:
     runs-on: ubuntu-latest
@@ -41,11 +44,9 @@ jobs:
         done
 
     - name: Commit and Push
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         git config user.name "GitHub Action"
-        git config user.email "action@github.com"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
 
         git add singbox-rules/*.srs
         git commit -m "Update SRS (Auto compiled)" || echo "No changes."
