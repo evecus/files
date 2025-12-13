@@ -20,9 +20,6 @@ jobs:
         run: |
           git clone --depth=1 -b meta https://github.com/MetaCubeX/meta-rules-dat.git meta
 
-      - name: Prepare update directory
-        run: mkdir -p update
-
       - name: Merge rules
         run: |
           set -euo pipefail
@@ -38,9 +35,9 @@ jobs:
             '
           }
 
-          CN_OUT=update/cn_domain.yaml
-          ADS_OUT=update/ads_domain.yaml
-          FOREIGN_OUT=update/foreign_domain.yaml
+          CN_OUT=mihomo-rules/cn_domain.yaml
+          ADS_OUT=mihomo-rules/ads_domain.yaml
+          FOREIGN_OUT=mihomo-rules/foreign_domain.yaml
 
           echo "payload:" > "$CN_OUT"
           echo "payload:" > "$ADS_OUT"
@@ -121,7 +118,7 @@ jobs:
           git config user.name "github-actions"
           git config user.email "action@github.com"
 
-          git add update/*.yaml
+          git add mihomo-rules/*.yaml
 
           if git diff --cached --quiet; then
             echo "No changes"
