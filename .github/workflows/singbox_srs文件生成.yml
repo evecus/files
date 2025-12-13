@@ -2,8 +2,6 @@ name: singbox_srs文件生成
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 8 * * *"   # 每天 6 点（UTC）
 
 permissions:
   contents: write
