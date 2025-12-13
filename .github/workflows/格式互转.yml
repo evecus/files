@@ -21,6 +21,9 @@ on:
           - ip-text2yaml
           - ip-text2json
 
+permissions:
+  contents: write
+
 jobs:
   convert:
     runs-on: ubuntu-latest
