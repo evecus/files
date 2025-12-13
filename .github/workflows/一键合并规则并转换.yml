@@ -1,9 +1,10 @@
-name: Merge and Generate All Rules
+name: 一键合并规则并转换
 
 on:
   workflow_dispatch:
   schedule:
     - cron: "0 8 * * *"
+
 permissions:
   contents: write
 
