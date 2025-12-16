@@ -109,21 +109,24 @@
         ],
         "action": "hijack-dns"
       },
-      {"ip_is_private": true, "outbound": "Direct"},
-      {
-        "rule_set": "ads",
-        "outbound": "Reject"
-      },
-      {
-        "rule_set": "medirect",
-        "outbound": "Direct"
-      },
       {
         "ip_is_private": true,
         "outbound": "Direct"
       },
       {
         "clash_mode": "direct",
+        "outbound": "Direct"
+      },
+      {
+        "clash_mode": "global",
+        "outbound": "GLOBAL"
+      },
+      {
+        "rule_set": "ads",
+        "outbound": "Reject"
+      },
+      {
+        "rule_set": "medirect",
         "outbound": "Direct"
       },
       {
@@ -187,7 +190,7 @@
         "tag": "cn_domain",
         "type": "remote",
         "format": "binary",
-        "url": "https://raw.githubusercontent.com/evecus/files/refs/heads/main/singbox-rules/cnplus_domain.srs",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
         "download_detour": "PROXY"
       },
       {
@@ -205,13 +208,6 @@
         "download_detour": "PROXY"
       },
       {
-        "tag": "privateip",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/refs/heads/sing/geo/geoip/private.srs",
-        "download_detour": "PROXY"
-      },
-      {
         "tag": "cn-ip",
         "type": "remote",
         "format": "binary",
@@ -222,7 +218,7 @@
     "final": "OTHERS",
     "auto_detect_interface": true,
     "default_domain_resolver": {
-      "server": "ali"
+      "server": "google"
     }
   },
   "log": {
@@ -253,4 +249,5 @@
   ]
 
 }
+
 
