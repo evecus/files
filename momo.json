@@ -109,6 +109,7 @@
         ],
         "action": "hijack-dns"
       },
+      {"ip_is_private": true, "outbound": "Direct"},
       {
         "rule_set": "ads",
         "outbound": "Reject"
@@ -139,10 +140,6 @@
       },
       {
         "action": "resolve"
-      },
-      {
-        "rule_set": "privateip",
-        "outbound": "Direct"
       },
       {
         "rule_set": "cn-ip",
@@ -256,3 +253,4 @@
   ]
 
 }
+
