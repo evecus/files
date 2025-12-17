@@ -1,4 +1,4 @@
-name: JSON 规则合并
+name: 合并并校验 sing-box JSON 规则
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
         description: "多个 JSON raw 链接，用英文逗号 , 分隔"
         required: true
       output_name:
-        description: "输出文件名（不含路径，如 merged.json）"
+        description: "输出文件名（如 merged.json）"
         required: true
         default: merged.json
 
@@ -26,7 +26,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq jq curl dos2unix
 
-      - name: Download & Merge JSON
+      - name: Download, Validate & Merge
         env:
           URLS: ${{ github.event.inputs.urls }}
           OUTPUT: ${{ github.event.inputs.output_name }}
@@ -38,22 +38,31 @@ jobs:
 
           mkdir -p "$WORKDIR"
 
-          # 逗号分隔 → 每行一个 URL
+          # 解析逗号分隔 URL
           echo "$URLS" \
             | tr ',' '\n' \
             | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
             | sed '/^$/d' \
+            | sort -u \
             > "$TMPDIR/urls.txt"
 
           echo "Parsed URLs:"
           cat "$TMPDIR/urls.txt"
 
-          echo "Downloading files..."
           i=0
           while read -r url; do
             i=$((i+1))
-            echo "  [$i] $url"
+            echo "Downloading [$i]: $url"
             curl -fsSL "$url" -o "$TMPDIR/file_$i.json"
+
+            echo "Validating JSON syntax..."
+            jq empty "$TMPDIR/file_$i.json"
+
+            echo "Validating sing-box structure..."
+            jq -e '
+              .rules
+              and (.rules | type == "array")
+            ' "$TMPDIR/file_$i.json" > /dev/null
           done < "$TMPDIR/urls.txt"
 
           echo "Merging rules..."
@@ -62,22 +71,24 @@ jobs:
             {
               version: 2,
               rules: (
-                [
-                  .[] | .rules[]?
-                ]
-                | reduce .[] as $item ({}; 
-                    reduce ($item | keys[]) as $k (.;
-                      .[$k] += ($item[$k] // [])
+                map(.rules[]?)
+                | add
+                | to_entries
+                | map({
+                    ( .key ): (
+                      .value
+                      | flatten
+                      | map(select(type == "string"))
+                      | unique
+                      | sort
                     )
-                  | with_entries(
-                      .value |= (unique | sort)
-                    )
-                ]
+                  })
               )
             }
           ' "$TMPDIR"/file_*.json > "$WORKDIR/$OUTPUT"
 
-          echo "Output written to $WORKDIR/$OUTPUT"
+          echo "Final output:"
+          jq '.' "$WORKDIR/$OUTPUT"
 
       - name: Commit & Push
         run: |
@@ -91,5 +102,5 @@ jobs:
             exit 0
           fi
 
-          git commit -m "chore: merge json rules"
+          git commit -m "chore: merge & validate sing-box rules"
           git push
