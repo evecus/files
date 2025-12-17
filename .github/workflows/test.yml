@@ -1,0 +1,88 @@
+name: JSON 规则合并
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: "多个 JSON raw 链接（每行一个）"
+        required: true
+        type: multiline
+      output_name:
+        description: "输出文件名（不含路径，如 merged.json）"
+        required: true
+        default: merged.json
+
+permissions:
+  contents: write
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq curl dos2unix
+
+      - name: Download & Merge JSON
+        env:
+          URLS: ${{ github.event.inputs.urls }}
+          OUTPUT: ${{ github.event.inputs.output_name }}
+        run: |
+          set -euo pipefail
+
+          WORKDIR="change"
+          TMPDIR="$(mktemp -d)"
+
+          mkdir -p "$WORKDIR"
+
+          echo "$URLS" | dos2unix | sed '/^\s*$/d' > "$TMPDIR/urls.txt"
+
+          echo "Downloading files..."
+          i=0
+          while read -r url; do
+            i=$((i+1))
+            echo "  [$i] $url"
+            curl -fsSL "$url" -o "$TMPDIR/file_$i.json"
+          done < "$TMPDIR/urls.txt"
+
+          echo "Merging rules..."
+
+          jq -s '
+            {
+              version: 2,
+              rules: (
+                [
+                  .[] | .rules[]?
+                ]
+                | reduce .[] as $item ({}; 
+                    reduce ($item | keys[]) as $k (.;
+                      .[$k] += ($item[$k] // [])
+                    )
+                  | with_entries(
+                      .value |= (unique | sort)
+                    )
+                ]
+              )
+            }
+          ' "$TMPDIR"/file_*.json > "$WORKDIR/$OUTPUT"
+
+          echo "Output written to $WORKDIR/$OUTPUT"
+
+      - name: Commit & Push
+        run: |
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+
+          git add change
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "chore: merge json rules"
+          git push
