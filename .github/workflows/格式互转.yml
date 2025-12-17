@@ -1,4 +1,4 @@
-name: 格式互转
+name: 格式互转test）
 
 on:
   workflow_dispatch:
@@ -27,285 +27,157 @@ permissions:
 jobs:
   convert:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
 
-      - name: Install tools (jq)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq jq
+          sudo apt-get install -y -qq jq dos2unix
 
-      - name: Convert according to mode
+      - name: Convert
         env:
           MODE: ${{ github.event.inputs.mode }}
         run: |
           set -euo pipefail
+          shopt -s nullglob
+
           CD_DIR="change"
           mkdir -p "$CD_DIR"
-          cd "$CD_DIR" || exit 1
+          cd "$CD_DIR"
 
-          # ---------------------------
-          # Helper: clean line
-          # Remove leading/trailing spaces, bullets, common YAML keys, quotes
-          # ---------------------------
-          clean_line() {
-            local line="$1"
-            line="${line#"${line%%[![:space:]]*}"}"
-            line="${line%"${line##*[![:space:]]}"}"
-            # Remove leading bullets, hyphens, pluses, stars, and common keys
-            line="$(echo "$line" | sed -E 's/^[[:space:]]*[-+*]*[[:space:]]*//; s/^[[:space:]]*[a-zA-Z0-9_-]+:[[:space:]]*//')"
-            # Remove surrounding quotes
-            if [[ "${line:0:1}" == "'" && "${line: -1}" == "'" ]] || [[ "${line:0:1}" == '"' && "${line: -1}" == '"' ]]; then
-              line="${line:1:-1}"
-            fi
-            line="${line#"${line%%[![:space:]]*}"}"
-            line="${line%"${line##*[![:space:]]}"}"
-            printf "%s" "$line"
-          }
+          # ------------------------------
+          # 统一转换文件为 Unix 格式（去掉 \r）
+          # ------------------------------
+          find . -type f \( -name "*_domain.yaml" -o -name "*_domain.text" -o -name "*_ip.yaml" -o -name "*_ip.text" \) \
+            -exec dos2unix {} +
 
-          # ---------------------------
-          # Domain normalization
-          # ---------------------------
-          normalize_domain_yaml() {
-            local d
-            d="$(clean_line "$1")"
-            # Keep +. for YAML domain output
-            d="${d//\"/}"
-            d="${d//\'/}"
-            printf "%s" "$d"
-          }
+          # ------------------------------
+          # 通用 awk 清洗规则
+          # ------------------------------
+          domain_clean='
+            {
+              gsub(/\r/, "", $0)
+              gsub(/^[[:space:]]*[-+*]?[[:space:]]*/, "", $0)
+              gsub(/^[a-zA-Z0-9_-]+:[[:space:]]*/, "", $0)
+              gsub(/^["'\'']|["'\'']$/, "", $0)
+              gsub(/^[+*.]+/, "", $0)
+              if ($0 ~ /\./) print $0
+            }
+          '
 
-          normalize_domain_json_text() {
-            local d
-            d="$(clean_line "$1")"
-            # Remove +. or *.
-            d="$(echo "$d" | sed -E 's/^[+*\.]+//')"
-            printf "%s" "$d"
-          }
+          ip_clean='
+            {
+              gsub(/\r/, "", $0)
+              gsub(/^[[:space:]]*[-+*]?[[:space:]]*/, "", $0)
+              gsub(/^[a-zA-Z0-9_-]+:[[:space:]]*/, "", $0)
+              gsub(/^["'\'']|["'\'']$/, "", $0)
+              gsub(/^[+*.]+/, "", $0)
+              if ($0 != "") print $0
+            }
+          '
 
-          # ---------------------------
-          # IP normalization
-          # ---------------------------
-          normalize_ip() {
-            local ip
-            ip="$(clean_line "$1")"
-            # Remove +., *., quotes
-            ip="$(echo "$ip" | sed -E 's/^[+*\.]+//')"
-            ip="${ip//\"/}"
-            ip="${ip//\'/}"
-            printf "%s" "$ip"
-          }
+          # ------------------------------
+          # 主分发逻辑
+          # ------------------------------
+          case "$MODE" in
 
-          # ---------------------------
-          # domain: yaml -> json
-          # ---------------------------
-          if [[ "$MODE" == "domain-yaml2json" ]]; then
-            shopt -s nullglob
+          # -------- domain --------
+          domain-yaml2json)
             for f in *_domain.yaml; do
-              out="${f%.yaml}.json"
-              tmpfile="$(mktemp)"
-              while IFS= read -r line || [[ -n "$line" ]]; do
-                d="$(normalize_domain_json_text "$line")"
-                [[ -n "$d" && "$d" == *.* ]] && printf '%s\n' "$d" >> "$tmpfile"
-              done < "$f"
-              if [[ -s "$tmpfile" ]]; then
-                arr=$(jq -R -s -c 'split("\n")[:-1]' < "$tmpfile")
-                jq -n --argjson arr "$arr" '{version:2,rules:[{domain_suffix:$arr}]}' > "$out"
-              fi
-              rm -f "$tmpfile"
+              awk "$domain_clean" "$f" | sort -u \
+              | jq -Rn '[inputs] | {version:2,rules:[{domain_suffix:.}]}'> "${f%.yaml}.json"
             done
-          fi
+            ;;
 
-          # ---------------------------
-          # domain: yaml -> text
-          # ---------------------------
-          if [[ "$MODE" == "domain-yaml2text" ]]; then
-            shopt -s nullglob
+          domain-yaml2text)
             for f in *_domain.yaml; do
-              out="${f%.yaml}.text"
-              : > "$out"
-              while IFS= read -r line || [[ -n "$line" ]]; do
-                d="$(normalize_domain_json_text "$line")"
-                [[ -n "$d" && "$d" == *.* ]] && echo "$d" >> "$out"
-              done < "$f"
+              awk "$domain_clean" "$f" | sort -u > "${f%.yaml}.text"
             done
-          fi
+            ;;
 
-          # ---------------------------
-          # domain: json -> yaml
-          # ---------------------------
-          if [[ "$MODE" == "domain-json2yaml" ]]; then
-            shopt -s nullglob
+          domain-json2yaml)
             for f in *_domain.json; do
-              out="${f%.json}.yaml"
-              echo "payload:" > "$out"
-              jq -r '.rules[0].domain_suffix[]' "$f" | while IFS= read -r d; do
-                d_clean="$(normalize_domain_yaml "$d")"
-                [[ -n "$d_clean" ]] && echo "  - $d_clean" >> "$out"
-              done
+              jq -r '.rules[].domain_suffix[]?' "$f" | sort -u \
+              | awk '{print "  - " $0}' | sed '1i payload:' > "${f%.json}.yaml"
             done
-          fi
+            ;;
 
-          # ---------------------------
-          # domain: json -> text
-          # ---------------------------
-          if [[ "$MODE" == "domain-json2text" ]]; then
-            shopt -s nullglob
+          domain-json2text)
             for f in *_domain.json; do
-              out="${f%.json}.text"
-              : > "$out"
-              jq -r '.rules[0].domain_suffix[]' "$f" | while IFS= read -r d; do
-                d_clean="$(normalize_domain_json_text "$d")"
-                [[ -n "$d_clean" ]] && echo "$d_clean" >> "$out"
-              done
+              jq -r '.rules[].domain_suffix[]?' "$f" | sort -u > "${f%.json}.text"
             done
-          fi
+            ;;
 
-          # ---------------------------
-          # domain: text -> yaml
-          # ---------------------------
-          if [[ "$MODE" == "domain-text2yaml" ]]; then
-            shopt -s nullglob
+          domain-text2yaml)
             for f in *_domain.text; do
-              out="${f%.text}.yaml"
-              echo "payload:" > "$out"
-              while IFS= read -r line || [[ -n "$line" ]]; do
-                d="$(normalize_domain_yaml "$line")"
-                [[ -n "$d" ]] && echo "  - $d" >> "$out"
-              done < "$f"
+              awk "$domain_clean" "$f" | sort -u \
+              | awk '{print "  - " $0}' | sed '1i payload:' > "${f%.text}.yaml"
             done
-          fi
+            ;;
 
-          # ---------------------------
-          # domain: text -> json
-          # ---------------------------
-          if [[ "$MODE" == "domain-text2json" ]]; then
-            shopt -s nullglob
+          domain-text2json)
             for f in *_domain.text; do
-              out="${f%.text}.json"
-              tmpfile="$(mktemp)"
-              while IFS= read -r line || [[ -n "$line" ]]; do
-                d="$(normalize_domain_json_text "$line")"
-                [[ -n "$d" ]] && printf '%s\n' "$d" >> "$tmpfile"
-              done < "$f"
-              if [[ -s "$tmpfile" ]]; then
-                arr=$(jq -R -s -c 'split("\n")[:-1]' < "$tmpfile")
-                jq -n --argjson arr "$arr" '{version:2,rules:[{domain_suffix:$arr}]}' > "$out"
-              fi
-              rm -f "$tmpfile"
+              awk "$domain_clean" "$f" | sort -u \
+              | jq -Rn '[inputs] | {version:2,rules:[{domain_suffix:.}]}'> "${f%.text}.json"
             done
-          fi
+            ;;
 
-          # ---------------------------
-          # ip: yaml -> json
-          # ---------------------------
-          if [[ "$MODE" == "ip-yaml2json" ]]; then
-            shopt -s nullglob
+          # -------- ip --------
+          ip-yaml2json)
             for f in *_ip.yaml; do
-              out="${f%.yaml}.json"
-              tmpfile="$(mktemp)"
-              while IFS= read -r line || [[ -n "$line" ]]; do
-                ip="$(normalize_ip "$line")"
-                [[ -n "$ip" && "$ip" =~ [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ]] && printf '%s\n' "$ip" >> "$tmpfile"
-              done < "$f"
-              if [[ -s "$tmpfile" ]]; then
-                arr=$(jq -R -s -c 'split("\n")[:-1]' < "$tmpfile")
-                jq -n --argjson arr "$arr" '{version:2,rules:[{ip_cidr:$arr}]}' > "$out"
-              fi
-              rm -f "$tmpfile"
+              awk "$ip_clean" "$f" | sort -u \
+              | jq -Rn '[inputs] | {version:2,rules:[{ip_cidr:.}]}' > "${f%.yaml}.json"
             done
-          fi
+            ;;
 
-          # ---------------------------
-          # ip: yaml -> text
-          # ---------------------------
-          if [[ "$MODE" == "ip-yaml2text" ]]; then
-            shopt -s nullglob
+          ip-yaml2text)
             for f in *_ip.yaml; do
-              out="${f%.yaml}.text"
-              : > "$out"
-              while IFS= read -r line || [[ -n "$line" ]]; do
-                ip="$(normalize_ip "$line")"
-                [[ -n "$ip" ]] && echo "$ip" >> "$out"
-              done < "$f"
+              awk "$ip_clean" "$f" | sort -u > "${f%.yaml}.text"
             done
-          fi
+            ;;
 
-          # ---------------------------
-          # ip: json -> yaml
-          # ---------------------------
-          if [[ "$MODE" == "ip-json2yaml" ]]; then
-            shopt -s nullglob
+          ip-json2yaml)
             for f in *_ip.json; do
-              out="${f%.json}.yaml"
-              echo "payload:" > "$out"
-              jq -r '.rules[0].ip_cidr[]' "$f" | while IFS= read -r ip; do
-                ip_clean="$(normalize_ip "$ip")"
-                [[ -n "$ip_clean" ]] && echo "  - $ip_clean" >> "$out"
-              done
+              jq -r '.rules[].ip_cidr[]?' "$f" | sort -u \
+              | awk '{print "  - " $0}' | sed '1i payload:' > "${f%.json}.yaml"
             done
-          fi
+            ;;
 
-          # ---------------------------
-          # ip: json -> text
-          # ---------------------------
-          if [[ "$MODE" == "ip-json2text" ]]; then
-            shopt -s nullglob
+          ip-json2text)
             for f in *_ip.json; do
-              out="${f%.json}.text"
-              : > "$out"
-              jq -r '.rules[0].ip_cidr[]' "$f" | while IFS= read -r ip; do
-                ip_clean="$(normalize_ip "$ip")"
-                [[ -n "$ip_clean" ]] && echo "$ip_clean" >> "$out"
-              done
+              jq -r '.rules[].ip_cidr[]?' "$f" | sort -u > "${f%.json}.text"
             done
-          fi
+            ;;
 
-          # ---------------------------
-          # ip: text -> yaml
-          # ---------------------------
-          if [[ "$MODE" == "ip-text2yaml" ]]; then
-            shopt -s nullglob
+          ip-text2yaml)
             for f in *_ip.text; do
-              out="${f%.text}.yaml"
-              echo "payload:" > "$out"
-              while IFS= read -r line || [[ -n "$line" ]]; do
-                ip="$(normalize_ip "$line")"
-                [[ -n "$ip" ]] && echo "  - $ip" >> "$out"
-              done < "$f"
+              awk "$ip_clean" "$f" | sort -u \
+              | awk '{print "  - " $0}' | sed '1i payload:' > "${f%.text}.yaml"
             done
-          fi
+            ;;
 
-          # ---------------------------
-          # ip: text -> json
-          # ---------------------------
-          if [[ "$MODE" == "ip-text2json" ]]; then
-            shopt -s nullglob
+          ip-text2json)
             for f in *_ip.text; do
-              out="${f%.text}.json"
-              tmpfile="$(mktemp)"
-              while IFS= read -r line || [[ -n "$line" ]]; do
-                ip="$(normalize_ip "$line")"
-                [[ -n "$ip" ]] && printf '%s\n' "$ip" >> "$tmpfile"
-              done < "$f"
-              if [[ -s "$tmpfile" ]]; then
-                arr=$(jq -R -s -c 'split("\n")[:-1]' < "$tmpfile")
-                jq -n --argjson arr "$arr" '{version:2,rules:[{ip_cidr:$arr}]}' > "$out"
-              fi
-              rm -f "$tmpfile"
+              awk "$ip_clean" "$f" | sort -u \
+              | jq -Rn '[inputs] | {version:2,rules:[{ip_cidr:.}]}' > "${f%.text}.json"
             done
-          fi
+            ;;
 
-      - name: Commit & Push changes
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          *)
+            echo "Unknown mode: $MODE"
+            exit 1
+            ;;
+          esac
+
+      - name: Commit & Push
         run: |
-          git config --global user.name "GitHub Action"
-          git config --global user.email "actions@github.com"
+          git config user.name "GitHub Action"
+          git config user.email "actions@github.com"
           git add change/*
-          if git commit -m "Auto convert rules: ${{ github.event.inputs.mode }}"; then
-            git push origin HEAD:main
+          if git commit -m "Auto convert (${{ github.event.inputs.mode }})"; then
+            git push
           else
-            echo "No changes to commit"
+            echo "No changes"
           fi
