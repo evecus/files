@@ -1,0 +1,191 @@
+name: 格式互转（test）
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "选择转换模式 (12 options)"
+        required: true
+        type: choice
+        options:
+          - domain-yaml2json
+          - domain-yaml2text
+          - domain-json2yaml
+          - domain-json2text
+          - domain-text2yaml
+          - domain-text2json
+          - ip-yaml2json
+          - ip-yaml2text
+          - ip-json2yaml
+          - ip-json2text
+          - ip-text2yaml
+          - ip-text2json
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq
+
+      - name: Convert
+        env:
+          MODE: ${{ github.event.inputs.mode }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          CD_DIR="change"
+          mkdir -p "$CD_DIR"
+          cd "$CD_DIR"
+
+          ############################
+          # 通用 awk 清洗规则
+          ############################
+
+          domain_clean='
+            {
+              gsub(/^[[:space:]]*[-+*]?[[:space:]]*/, "", $0)
+              gsub(/^[a-zA-Z0-9_-]+:[[:space:]]*/, "", $0)
+              gsub(/^["'\'']|["'\'']$/, "", $0)
+              gsub(/^[+*.]+/, "", $0)
+              if ($0 ~ /\./) print $0
+            }
+          '
+
+          ip_clean='
+            {
+              gsub(/^[[:space:]]*[-+*]?[[:space:]]*/, "", $0)
+              gsub(/^[a-zA-Z0-9_-]+:[[:space:]]*/, "", $0)
+              gsub(/^["'\'']|["'\'']$/, "", $0)
+              gsub(/^[+*.]+/, "", $0)
+              if ($0 != "") print $0
+            }
+          '
+
+          ############################
+          # 主分发逻辑（case）
+          ############################
+
+          case "$MODE" in
+
+          # -------- domain --------
+
+          domain-yaml2json)
+            for f in *_domain.yaml; do
+              awk "$domain_clean" "$f" \
+              | jq -Rn '[inputs] | {version:2,rules:[{domain_suffix:.}]}' \
+              > "${f%.yaml}.json"
+            done
+            ;;
+
+          domain-yaml2text)
+            for f in *_domain.yaml; do
+              awk "$domain_clean" "$f" > "${f%.yaml}.text"
+            done
+            ;;
+
+          domain-json2yaml)
+            for f in *_domain.json; do
+              jq -r '.rules[].domain_suffix[]?' "$f" \
+              | awk '{print "  - " $0}' \
+              | sed '1i payload:' \
+              > "${f%.json}.yaml"
+            done
+            ;;
+
+          domain-json2text)
+            for f in *_domain.json; do
+              jq -r '.rules[].domain_suffix[]?' "$f" > "${f%.json}.text"
+            done
+            ;;
+
+          domain-text2yaml)
+            for f in *_domain.text; do
+              awk "$domain_clean" "$f" \
+              | awk '{print "  - " $0}' \
+              | sed '1i payload:' \
+              > "${f%.text}.yaml"
+            done
+            ;;
+
+          domain-text2json)
+            for f in *_domain.text; do
+              awk "$domain_clean" "$f" \
+              | jq -Rn '[inputs] | {version:2,rules:[{domain_suffix:.}]}' \
+              > "${f%.text}.json"
+            done
+            ;;
+
+          # -------- ip --------
+
+          ip-yaml2json)
+            for f in *_ip.yaml; do
+              awk "$ip_clean" "$f" \
+              | jq -Rn '[inputs] | {version:2,rules:[{ip_cidr:.}]}' \
+              > "${f%.yaml}.json"
+            done
+            ;;
+
+          ip-yaml2text)
+            for f in *_ip.yaml; do
+              awk "$ip_clean" "$f" > "${f%.yaml}.text"
+            done
+            ;;
+
+          ip-json2yaml)
+            for f in *_ip.json; do
+              jq -r '.rules[].ip_cidr[]?' "$f" \
+              | awk '{print "  - " $0}' \
+              | sed '1i payload:' \
+              > "${f%.json}.yaml"
+            done
+            ;;
+
+          ip-json2text)
+            for f in *_ip.json; do
+              jq -r '.rules[].ip_cidr[]?' "$f" > "${f%.json}.text"
+            done
+            ;;
+
+          ip-text2yaml)
+            for f in *_ip.text; do
+              awk "$ip_clean" "$f" \
+              | awk '{print "  - " $0}' \
+              | sed '1i payload:' \
+              > "${f%.text}.yaml"
+            done
+            ;;
+
+          ip-text2json)
+            for f in *_ip.text; do
+              awk "$ip_clean" "$f" \
+              | jq -Rn '[inputs] | {version:2,rules:[{ip_cidr:.}]}' \
+              > "${f%.text}.json"
+            done
+            ;;
+
+          *)
+            echo "Unknown mode: $MODE"
+            exit 1
+            ;;
+          esac
+
+      - name: Commit & Push
+        run: |
+          git config user.name "GitHub Action"
+          git config user.email "actions@github.com"
+          git add change/*
+          if git commit -m "Auto convert (${{ github.event.inputs.mode }})"; then
+            git push
+          else
+            echo "No changes"
+          fi
