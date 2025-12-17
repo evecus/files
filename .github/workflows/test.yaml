@@ -48,11 +48,11 @@ jobs:
           cd "$CD_DIR"
 
           ############################
-          # 通用 awk 清洗规则
+          # 通用 awk 清洗规则 + 去 CR
           ############################
-
           domain_clean='
             {
+              gsub(/\r/, "", $0)                              # 去 CR
               gsub(/^[[:space:]]*[-+*]?[[:space:]]*/, "", $0)
               gsub(/^[a-zA-Z0-9_-]+:[[:space:]]*/, "", $0)
               gsub(/^["'\'']|["'\'']$/, "", $0)
@@ -63,6 +63,7 @@ jobs:
 
           ip_clean='
             {
+              gsub(/\r/, "", $0)                              # 去 CR
               gsub(/^[[:space:]]*[-+*]?[[:space:]]*/, "", $0)
               gsub(/^[a-zA-Z0-9_-]+:[[:space:]]*/, "", $0)
               gsub(/^["'\'']|["'\'']$/, "", $0)
@@ -74,14 +75,13 @@ jobs:
           ############################
           # 主分发逻辑（case）
           ############################
-
           case "$MODE" in
 
           # -------- domain --------
-
           domain-yaml2json)
             for f in *_domain.yaml; do
               awk "$domain_clean" "$f" \
+              | sort -u \
               | jq -Rn '[inputs] | {version:2,rules:[{domain_suffix:.}]}' \
               > "${f%.yaml}.json"
             done
@@ -89,13 +89,16 @@ jobs:
 
           domain-yaml2text)
             for f in *_domain.yaml; do
-              awk "$domain_clean" "$f" > "${f%.yaml}.text"
+              awk "$domain_clean" "$f" \
+              | sort -u \
+              > "${f%.yaml}.text"
             done
             ;;
 
           domain-json2yaml)
             for f in *_domain.json; do
               jq -r '.rules[].domain_suffix[]?' "$f" \
+              | sort -u \
               | awk '{print "  - " $0}' \
               | sed '1i payload:' \
               > "${f%.json}.yaml"
@@ -104,13 +107,16 @@ jobs:
 
           domain-json2text)
             for f in *_domain.json; do
-              jq -r '.rules[].domain_suffix[]?' "$f" > "${f%.json}.text"
+              jq -r '.rules[].domain_suffix[]?' "$f" \
+              | sort -u \
+              > "${f%.json}.text"
             done
             ;;
 
           domain-text2yaml)
             for f in *_domain.text; do
               awk "$domain_clean" "$f" \
+              | sort -u \
               | awk '{print "  - " $0}' \
               | sed '1i payload:' \
               > "${f%.text}.yaml"
@@ -120,16 +126,17 @@ jobs:
           domain-text2json)
             for f in *_domain.text; do
               awk "$domain_clean" "$f" \
+              | sort -u \
               | jq -Rn '[inputs] | {version:2,rules:[{domain_suffix:.}]}' \
               > "${f%.text}.json"
             done
             ;;
 
           # -------- ip --------
-
           ip-yaml2json)
             for f in *_ip.yaml; do
               awk "$ip_clean" "$f" \
+              | sort -u \
               | jq -Rn '[inputs] | {version:2,rules:[{ip_cidr:.}]}' \
               > "${f%.yaml}.json"
             done
@@ -137,13 +144,16 @@ jobs:
 
           ip-yaml2text)
             for f in *_ip.yaml; do
-              awk "$ip_clean" "$f" > "${f%.yaml}.text"
+              awk "$ip_clean" "$f" \
+              | sort -u \
+              > "${f%.yaml}.text"
             done
             ;;
 
           ip-json2yaml)
             for f in *_ip.json; do
               jq -r '.rules[].ip_cidr[]?' "$f" \
+              | sort -u \
               | awk '{print "  - " $0}' \
               | sed '1i payload:' \
               > "${f%.json}.yaml"
@@ -152,13 +162,16 @@ jobs:
 
           ip-json2text)
             for f in *_ip.json; do
-              jq -r '.rules[].ip_cidr[]?' "$f" > "${f%.json}.text"
+              jq -r '.rules[].ip_cidr[]?' "$f" \
+              | sort -u \
+              > "${f%.json}.text"
             done
             ;;
 
           ip-text2yaml)
             for f in *_ip.text; do
               awk "$ip_clean" "$f" \
+              | sort -u \
               | awk '{print "  - " $0}' \
               | sed '1i payload:' \
               > "${f%.text}.yaml"
@@ -168,6 +181,7 @@ jobs:
           ip-text2json)
             for f in *_ip.text; do
               awk "$ip_clean" "$f" \
+              | sort -u \
               | jq -Rn '[inputs] | {version:2,rules:[{ip_cidr:.}]}' \
               > "${f%.text}.json"
             done
