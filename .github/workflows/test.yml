@@ -4,9 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       urls:
-        description: "多个 JSON raw 链接（每行一个）"
+        description: "多个 JSON raw 链接，用英文逗号 , 分隔"
         required: true
-        type: multiline
       output_name:
         description: "输出文件名（不含路径，如 merged.json）"
         required: true
@@ -39,7 +38,15 @@ jobs:
 
           mkdir -p "$WORKDIR"
 
-          echo "$URLS" | dos2unix | sed '/^\s*$/d' > "$TMPDIR/urls.txt"
+          # 逗号分隔 → 每行一个 URL
+          echo "$URLS" \
+            | tr ',' '\n' \
+            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+            | sed '/^$/d' \
+            > "$TMPDIR/urls.txt"
+
+          echo "Parsed URLs:"
+          cat "$TMPDIR/urls.txt"
 
           echo "Downloading files..."
           i=0
