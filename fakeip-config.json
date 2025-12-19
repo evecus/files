@@ -73,15 +73,15 @@
   "experimental": {
     "cache_file": {
       "enabled": true,
-      "path": "/etc/momo/run/cache.db",
+      "path": "/opt/singbox/cache.db",
       "store_fakeip": false
     },
     "clash_api": {
       "external_controller": "0.0.0.0:9090",
-      "external_ui": "/etc/momo/run/ui",
+      "external_ui": "/opt/singbox/ui",
       "external_ui_download_url": "https://github.com/Zephyruso/zashboard/archive/refs/heads/gh-pages.zip",
-      "external_ui_download_detour": "PROXY",
-      "secret": "",
+      "external_ui_download_detour": "默认代理",
+      "secret": "1234",
       "default_mode": "rule"
     }
   },
@@ -111,11 +111,11 @@
       },
       {
         "ip_is_private": true,
-        "outbound": "Direct"
+        "outbound": "直连"
       },
       {
         "clash_mode": "direct",
-        "outbound": "Direct"
+        "outbound": "直连"
       },
       {
         "clash_mode": "global",
@@ -123,38 +123,38 @@
       },
       {
         "rule_set": "ads",
-        "outbound": "Reject"
+        "outbound": "拦截"
       },
       {
         "rule_set": "medirect",
-        "outbound": "Direct"
+        "outbound": "直连"
       },
       {
         "rule_set": "meproxy",
-        "outbound": "PROXY"
+        "outbound": "默认代理"
       },
       {
         "rule_set": "foreign",
-        "outbound": "PROXY"
+        "outbound": "默认代理"
       },
       {
         "rule_set": "cn_domain",
-        "outbound": "Direct"
+        "outbound": "直连"
       },
       {
         "action": "resolve"
       },
       {
         "rule_set": "cn-ip",
-        "outbound": "Direct"
+        "outbound": "直连"
       },
       {
         "rule_set": "geoip-telegram",
-        "outbound": "PROXY"
+        "outbound": "默认代理"
       },
       {
         "rule_set": "geoip-google",
-        "outbound": "PROXY"
+        "outbound": "默认代理"
       }
     ],
     "rule_set": [
@@ -163,59 +163,59 @@
         "type": "remote",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblocksingbox.srs",
-        "download_detour": "PROXY"
+        "download_detour": "默认代理"
       },
       {
         "tag": "medirect",
         "type": "remote",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/evecus/files/refs/heads/main/singbox-rules/direct.srs",
-        "download_detour": "PROXY"
+        "download_detour": "默认代理"
       },
       {
         "tag": "meproxy",
         "type": "remote",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/evecus/files/refs/heads/main/singbox-rules/proxy.srs",
-        "download_detour": "PROXY"
+        "download_detour": "默认代理"
       },
       {
         "tag": "foreign",
         "type": "remote",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/evecus/files/refs/heads/main/singbox-rules/foreign_domain.srs",
-        "download_detour": "PROXY"
+        "download_detour": "默认代理"
       },
       {
         "tag": "cn_domain",
         "type": "remote",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
-        "download_detour": "PROXY"
+        "download_detour": "默认代理"
       },
       {
         "tag": "geoip-google",
         "type": "remote",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/google.srs",
-        "download_detour": "PROXY"
+        "download_detour": "默认代理"
       },
       {
         "tag": "geoip-telegram",
         "type": "remote",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/telegram.srs",
-        "download_detour": "PROXY"
+        "download_detour": "默认代理"
       },
       {
         "tag": "cn-ip",
         "type": "remote",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/refs/heads/sing/geo/geoip/cn.srs",
-        "download_detour": "PROXY"
+        "download_detour": "默认代理"
       }
     ],
-    "final": "OTHERS",
+    "final": "漏网之鱼",
     "auto_detect_interface": true,
     "default_domain_resolver": {
       "server": "google"
@@ -226,28 +226,33 @@
   },
   "outbounds": [
     {
-      "tag": "PROXY",
+      "tag": "默认代理",
       "type": "selector",
       "outbounds": []
     },
     {
-      "tag": "OTHERS",
+      "tag": "自动选择",
+      "type": "urltest",
+      "outbounds": []
+    },
+    {
+      "tag": "漏网之鱼",
       "type": "selector",
       "outbounds": [
-        "Direct",
-        "PROXY"
+        "直连",
+        "默认代理"
       ]
     },
     {
-      "tag": "Direct",
+      "tag": "直连",
       "type": "direct"
     },
     {
-      "tag": "Reject",
+      "tag": "拦截",
       "type": "block"
     }
   ]
-
 }
+
 
 
