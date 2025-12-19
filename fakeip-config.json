@@ -64,8 +64,8 @@
       "listen_port": 1053
     },
     {
-      "tag": "http-in",
-      "type": "http",
+      "tag": "mixed-in",
+      "type": "mixed",
       "listen": "::",
       "listen_port": 7890
     },
@@ -259,6 +259,7 @@
     }
   ]
 }
+
 
 
 
