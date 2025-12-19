@@ -12,7 +12,7 @@
       {"domain_suffix": ["services.googleapis.cn", "googleapis.cn", "xn--ngstr-lra8j.com"], "server": "google"},
       {"rule_set": ["cn_domain"], "server": "local"}
     ],
-    "final": "foreign",
+    "final": "google",
     "strategy": "prefer_ipv4",
     "independent_cache": true,
     "reverse_mapping": true
@@ -90,8 +90,6 @@
     }
   },
   "log": {
-    "disabled": false,
-    "level": "waring",
-    "timestamp": true
+    "disabled": true
   }
 }
