@@ -1,0 +1,114 @@
+name: singbox-ip规则集生成
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  build-ip-rules:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Checkout meta-rules-dat (sing branch)
+        uses: actions/checkout@v4
+        with:
+          repository: MetaCubeX/meta-rules-dat
+          ref: sing
+          path: meta-rules-dat
+
+      - name: Download sing-box
+        run: |
+          wget https://github.com/SagerNet/sing-box/releases/download/v1.12.17/sing-box-1.12.17-linux-amd64.tar.gz
+          tar -xzf sing-box-1.12.17-linux-amd64.tar.gz
+          mv sing-box-1.12.17-linux-amd64/sing-box /usr/local/bin/
+
+      - name: Process IP Rules
+        run: |
+          set -euo pipefail
+          SRC="meta-rules-dat/geo/geoip"
+          OUT_DIR="singbox-rules"
+          mkdir -p "$OUT_DIR"
+          
+          # 定义源文件路径
+          GOOGLE="$SRC/google.json"
+          TWITTER="$SRC/twitter.json"
+          FACEBOOK="$SRC/facebook.json"
+          TELEGRAM="$SRC/telegram.json"
+          CN="$SRC/cn.json"
+
+          # --- 工具函数：提取 IP 并分类 (v4/v6) ---
+          # 参数 1: 输出文件名, 参数 2+: 输入文件列表
+          process_ip() {
+            local out_name="$1"
+            shift
+            local files=("$@")
+            
+            # 提取所有 IP 并初步去重
+            jq -r '.rules[].ip_cidr[]?' "${files[@]}" | sed 's/[[:space:]]//g; /^$/d' | sort -u > all_ips.txt
+            
+            # 过滤 IPv4 (带 . 的)
+            grep "\." all_ips.txt > v4.txt || touch v4.txt
+            # 过滤 IPv6 (带 : 的)
+            grep ":" all_ips.txt > v6.txt || touch v6.txt
+            
+            # 1. 生成仅 IPv4 的 JSON (针对 foreign_ip4 和 cn_ip4)
+            if [[ "$out_name" == *"_ip4" ]]; then
+              jq -n --rawfile v4 v4.txt \
+                '{ version: 2, rules: [{ ip_cidr: ($v4 | split("\n") | map(select(length > 0))) }] }' \
+                > "$OUT_DIR/${out_name}.json"
+            
+            # 2. 生成全量 IP JSON (IPv4 在前，IPv6 在后)
+            else
+              cat v4.txt v6.txt > combined.txt
+              jq -n --rawfile all combined.txt \
+                '{ version: 2, rules: [{ ip_cidr: ($all | split("\n") | map(select(length > 0))) }] }' \
+                > "$OUT_DIR/${out_name}.json"
+            fi
+            
+            rm -f all_ips.txt v4.txt v6.txt combined.txt
+          }
+
+          # --- 执行合并逻辑 ---
+
+          # 1. 合并 Foreign IP (Google, Twitter, Facebook, Telegram)
+          echo "Processing Foreign IPs..."
+          process_ip "foreign_ip4" "$GOOGLE" "$TWITTER" "$FACEBOOK" "$TELEGRAM"
+          process_ip "foreign_ip" "$GOOGLE" "$TWITTER" "$FACEBOOK" "$TELEGRAM"
+
+          # 2. 处理 CN IP (仅提取 IPv4)
+          echo "Processing CN IPs..."
+          process_ip "cn_ip4" "$CN"
+
+      - name: Compile IP JSON → SRS
+        run: |
+          cd singbox-rules
+          # 指定本次需要编译的三个目标
+          TARGETS=("foreign_ip4" "foreign_ip" "cn_ip4")
+          for name in "${TARGETS[@]}"; do
+            echo "Compiling ${name}.json to ${name}.srs..."
+            sing-box rule-set compile --output "${name}.srs" "${name}.json"
+          done
+
+      - name: Commit and Push
+        run: |
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+          
+          # 精准添加 6 个文件，确保不删除目录内其他内容
+          git add singbox-rules/foreign_ip4.json singbox-rules/foreign_ip4.srs \
+                  singbox-rules/foreign_ip.json singbox-rules/foreign_ip.srs \
+                  singbox-rules/cn_ip4.json singbox-rules/cn_ip4.srs
+
+          if git diff --cached --quiet; then
+            echo "No changes in IP rules."
+          else
+            git commit -m "Update IP Rules: 3 JSON & 3 SRS (IPv4 prioritized)"
+            git push
+          fi
