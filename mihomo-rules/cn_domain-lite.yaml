@@ -1,6 +1,6 @@
 payload:
-  - +..baidu
-  - +..sohu
+  - +.baidu
+  - +.sohu
   - +.00cdn.com
   - +.0123456789.com
   - +.0379home.com
