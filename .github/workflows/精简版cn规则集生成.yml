@@ -1,4 +1,4 @@
-name: 精简版规则集生成 (彻底修复点号问题)
+name: 精简版cn规则集生成
 
 on:
   workflow_dispatch:
