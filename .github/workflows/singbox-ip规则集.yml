@@ -2,8 +2,6 @@ name: singbox-ip规则集生成
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 2 * * *"
 
 permissions:
   contents: write
