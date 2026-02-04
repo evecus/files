@@ -1,4 +1,4 @@
-name: 合并去重并生成 MRS 规则 (完整版)
+name: 合并去重并生成 MRS 规则 (精确转换版)
 
 on:
   workflow_dispatch:
@@ -44,22 +44,19 @@ jobs:
             '
           }
 
-          # --- 2. 核心写出与分类函数 (增强防错版) ---
+          # --- 2. 核心写出与分类函数 ---
           write_final_yaml() {
             local tmp_in="$1"
             local final_out="$2"
             local exclude_list="$3"
             
-            # 如果输入为空，生成基础 payload
             if [ ! -s "$tmp_in" ]; then
               echo "payload: []" > "$final_out"
               return 0
             fi
 
-            # 基础去重排序
             sort -u "$tmp_in" > "${tmp_in}.sorted"
             
-            # 跨文件优先级去重
             if [ -f "$exclude_list" ] && [ -s "$exclude_list" ]; then
               sort -u "$exclude_list" -o "$exclude_list"
               comm -23 "${tmp_in}.sorted" "$exclude_list" > "${tmp_in}.final" || true
@@ -67,7 +64,6 @@ jobs:
               cp "${tmp_in}.sorted" "${tmp_in}.final"
             fi
 
-            # 写入 YAML 并进行内部二次分类 (+. 在前，普通域名在后)
             echo "payload:" > "$final_out"
             
             # 分类 1: 后缀域名 (+.)
@@ -80,16 +76,13 @@ jobs:
               grep -v '^\+\.' "${tmp_in}.final" | sed 's/^/  - /' >> "$final_out"
             fi
             
-            # 将处理完的域名加入全局排除库，供下一优先级剔除
             cat "${tmp_in}.final" >> all_processed_domains.txt
             sort -u all_processed_domains.txt -o all_processed_domains.txt
           }
 
           # --- 3. 初始化变量 ---
           touch all_processed_domains.txt
-          ADS_TMP="ads_raw.txt"
-          FOREIGN_TMP="foreign_raw.txt"
-          CN_TMP="cn_raw.txt"
+          ADS_TMP="ads_raw.txt"; FOREIGN_TMP="foreign_raw.txt"; CN_TMP="cn_raw.txt"
           touch "$ADS_TMP" "$FOREIGN_TMP" "$CN_TMP"
 
           EXACT_FOREIGN=(
@@ -107,8 +100,7 @@ jobs:
             return 1
           }
 
-          # --- 4. 分步骤合并 (优先级：ADS > FOREIGN > CN) ---
-
+          # --- 4. 分步骤合并 ---
           echo "Merging ADS..."
           find meta/geo/geosite -name '*.yaml' | while read f; do
             [[ "$(basename "$f")" =~ (^|[-_])ads([.-]|$) ]] && process_raw_domains < "$f" >> "$ADS_TMP" || true
@@ -133,22 +125,28 @@ jobs:
           done
           write_final_yaml "$CN_TMP" "mihomo-rules/cn_domain.yaml" "all_processed_domains.txt"
 
-      - name: Convert to MRS (Binary Format)
+      - name: Convert specific YAML to MRS
         run: |
-          find mihomo-rules -type f -name "*.yaml" | while read FILE; do
-            OUTPUT="${FILE%.*}.mrs"
-            echo "Compiling $FILE to $OUTPUT"
-            mihomo convert-ruleset domain yaml "$FILE" "$OUTPUT"
+          # 明确指定转换这三个合成后的文件
+          TARGETS=("ads_domain.yaml" "foreign_domain.yaml" "cn_domain.yaml")
+          
+          for FILE_NAME in "${TARGETS[@]}"; do
+            FILE_PATH="mihomo-rules/$FILE_NAME"
+            if [ -f "$FILE_PATH" ]; then
+              OUTPUT_PATH="${FILE_PATH%.*}.mrs"
+              echo "Compiling $FILE_PATH to $OUTPUT_PATH"
+              mihomo convert-ruleset domain yaml "$FILE_PATH" "$OUTPUT_PATH"
+            fi
           done
 
       - name: Commit and Push
         run: |
           git config --global user.name "GitHub Action"
           git config --global user.email "actions@github.com"
-          git add mihomo-rules/*.yaml mihomo-rules/*.mrs
+          git add mihomo-rules/ads_domain.* mihomo-rules/foreign_domain.* mihomo-rules/cn_domain.*
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "Update rules: Merged, Sorted (+. vs domain), and Compiled to MRS"
+            git commit -m "Update rules: Precision compilation for ads, foreign, and cn"
             git push
           fi
