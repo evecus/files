@@ -1,4 +1,4 @@
-name: 外网精简域名集生成 (Foreign Lite)
+name: 外网精简域名集生成 (格式精准修复版)
 
 on:
   workflow_dispatch:
@@ -18,23 +18,20 @@ jobs:
 
       - name: Install Tools
         run: |
-          # 安装 Sing-box
           wget https://github.com/SagerNet/sing-box/releases/download/v1.12.17/sing-box-1.12.17-linux-amd64.tar.gz
           tar -xzf sing-box-1.12.17-linux-amd64.tar.gz
           mv sing-box-1.12.17-linux-amd64/sing-box /usr/local/bin/
-          # 安装 Mihomo
           wget https://github.com/MetaCubeX/mihomo/releases/download/v1.19.17/mihomo-linux-amd64-v1.19.17.gz
           gunzip mihomo-linux-amd64-v1.19.17.gz
           mv mihomo-linux-amd64-v1.19.17 mihomo
           chmod +x mihomo
           sudo mv mihomo /usr/local/bin/mihomo
 
-      - name: 1. 下载并提取域名 (Mihomo 格式)
+      - name: 1. 下载并精准提取域名
         run: |
           set -euo pipefail
           mkdir -p temp_source temp_build singbox-rules mihomo-rules
           
-          # 定义要下载的文件列表
           FILES=(
             "category-ai-!cn.yaml" "discord.yaml" "facebook.yaml" "github.yaml" 
             "google.yaml" "instagram.yaml" "paypal.yaml" "reddit.yaml" 
@@ -44,41 +41,36 @@ jobs:
           
           BASE_URL="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite"
           
-          echo "==== 开始合并以下 YAML 文件 ===="
-          touch temp_build/all_suffix.txt
-          touch temp_build/all_domain.txt
-          
+          echo "==== 开始精准处理以下文件 ===="
           for file in "${FILES[@]}"; do
             echo "正在处理: $file"
-            # 下载文件
             curl -sL "$BASE_URL/$file" -o "temp_source/$file"
             
-            # 提取 domain_suffix (格式为 - +.domain.com)
-            # 逻辑：匹配包含 +. 的行，去掉前导点防止双点
-            grep -E '^\s*-\s*"\?\+\.' "temp_source/$file" | sed 's/^[[:space:]]*- "//; s/+"$//' | sed 's/^\.*//' >> temp_build/all_suffix.txt || true
-            # 如果是标准格式 - +.domain.com
-            grep -E '^\s*-\s*\+\.' "temp_source/$file" | sed 's/^[[:space:]]*- \+\.//' | sed 's/^\.*//' >> temp_build/all_suffix.txt || true
+            # --- 核心修复逻辑 ---
+            # 提取 domain_suffix: 匹配包含 +. 的行，但只保留 +. 之后到引号或行尾之间的纯域名内容
+            # 1. sed 匹配带引号或不带引号的 +. 格式
+            # 2. 移除所有前缀（空格、减号、加号、点、引号）
+            grep -E '^\s*-\s*"?\+\.' "temp_source/$file" | sed -E 's/^[[:space:]]*- "?\+\.//; s/"$//; s/^\.*//' >> temp_build/raw_suffix.txt || true
             
-            # 提取精确 domain (格式为 - domain.com)
-            # 逻辑：匹配不含 +. 的普通行，且排除 payload: 行
-            grep -E '^\s*-\s*[^+. ]' "temp_source/$file" | sed 's/^[[:space:]]*- //' | grep -v 'payload:' >> temp_build/all_domain.txt || true
+            # 提取 domain: 排除包含 +. 的行，提取纯域名
+            grep -E '^\s*-\s*[^+. ]' "temp_source/$file" | grep -v "payload:" | sed -E 's/^[[:space:]]*- "//; s/^[[:space:]]*- //; s/"$//' >> temp_build/raw_domain.txt || true
           done
           
           # 去重排序
-          sort -u temp_build/all_suffix.txt -o temp_build/all_suffix.txt
-          sort -u temp_build/all_domain.txt -o temp_build/all_domain.txt
+          sort -u temp_build/raw_suffix.txt -o temp_build/all_suffix.txt
+          sort -u temp_build/raw_domain.txt -o temp_build/all_domain.txt
           
-          # 生成 foreign_domain-lite.yaml
+          # 生成 Mihomo YAML (确保格式为 - +.domain.com)
           echo "payload:" > mihomo-rules/foreign_domain-lite.yaml
           sed 's/^/  - +./' temp_build/all_suffix.txt >> mihomo-rules/foreign_domain-lite.yaml
           sed 's/^/  - /' temp_build/all_domain.txt >> mihomo-rules/foreign_domain-lite.yaml
           
-          echo "==== 合并完成，生成 foreign_domain-lite.yaml ===="
+          echo "==== 合并完成 ===="
 
       - name: 2. 转换为 Sing-box JSON
         run: |
           set -euo pipefail
-          # 使用 jq 构建 Sing-box 标准 JSON 格式
+          # 使用 jq 生成干净的 JSON 数组，不再包含 "- +." 干扰符
           jq -n --rawfile suffix temp_build/all_suffix.txt --rawfile exact temp_build/all_domain.txt \
             '{
               version: 2,
@@ -92,18 +84,13 @@ jobs:
 
       - name: 3. 编译二进制文件 (MRS & SRS)
         run: |
-          set -euo pipefail
-          # 编译 Mihomo MRS
           mihomo convert-ruleset domain yaml mihomo-rules/foreign_domain-lite.yaml mihomo-rules/foreign_domain-lite.mrs
-          
-          # 编译 Sing-box SRS
           sing-box rule-set compile --output singbox-rules/foreign_domain-lite.srs singbox-rules/foreign_domain-lite.json
 
       - name: Commit and Push
         run: |
           git config user.name "GitHub Action"
           git config user.email "action@github.com"
-          git add singbox-rules/foreign_domain-lite.json singbox-rules/foreign_domain-lite.srs
-          git add mihomo-rules/foreign_domain-lite.yaml mihomo-rules/foreign_domain-lite.mrs
-          git commit -m "Update foreign_domain-lite rules" || echo "No changes"
+          git add singbox-rules/foreign_domain-lite.* mihomo-rules/foreign_domain-lite.*
+          git commit -m "Fix: correct formatting for foreign_domain-lite" || echo "No changes"
           git push origin main
