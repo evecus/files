@@ -1,4 +1,4 @@
-name: Sing-box-Mihomo规则集全量生成
+name: 规则集全量生成 (Sing-box & Mihomo)
 
 on:
   workflow_dispatch:
@@ -34,7 +34,7 @@ jobs:
           chmod +x mihomo
           sudo mv mihomo /usr/local/bin/mihomo
 
-      - name: 1. Process Domain Rules (Sing-box & Mihomo)
+      - name: 1. Process Domain Rules
         run: |
           set -euo pipefail
           mkdir -p singbox-rules mihomo-rules
@@ -80,7 +80,7 @@ jobs:
           mapfile -t CN_F < <(find "$SRC_S" -type f -name "*.json" | grep -Ev '!cn' | grep -E '(^|[^a-zA-Z0-9])cn([^a-zA-Z0-9]|\.json$)')
           build_domain_all "cn_domain" "all_processed_domains.txt" "${CN_F[@]}"
 
-      - name: 2. Process IP Rules (Sing-box & Mihomo)
+      - name: 2. Process IP Rules
         run: |
           set -euo pipefail
           SRC_IP_S="source-sing/geo/geoip"
@@ -116,11 +116,9 @@ jobs:
 
       - name: 3. Compile Binary Rules (SRS & MRS)
         run: |
-          # Sing-box SRS
           for f in singbox-rules/*.json; do
             sing-box rule-set compile --output "${f%.json}.srs" "$f"
           done
-          # Mihomo MRS
           for f in mihomo-rules/*.yaml; do
             TYPE=$([[ "$f" == *"ip"* ]] && echo "ipcidr" || echo "domain")
             mihomo convert-ruleset "$TYPE" yaml "$f" "${f%.yaml}.mrs"
@@ -131,5 +129,5 @@ jobs:
           git config user.name "GitHub Action"
           git config user.email "action@github.com"
           git add singbox-rules/*.json singbox-rules/*.srs mihomo-rules/*.yaml mihomo-rules/*.mrs
-          git commit -m "Auto update all rules (Sing-box & Mihomo Domain/IP)" || echo "No changes"
+          git commit -m "Auto update rules" || echo "No changes"
           git push origin main
