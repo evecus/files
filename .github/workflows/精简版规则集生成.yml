@@ -1,0 +1,90 @@
+name: 精简版规则集生成 (无引号优化版)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  convert-lite-rules:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Install Tools
+        run: |
+          # 安装 Sing-box
+          wget https://github.com/SagerNet/sing-box/releases/download/v1.12.17/sing-box-1.12.17-linux-amd64.tar.gz
+          tar -xzf sing-box-1.12.17-linux-amd64.tar.gz
+          mv sing-box-1.12.17-linux-amd64/sing-box /usr/local/bin/
+          # 安装 Mihomo
+          wget https://github.com/MetaCubeX/mihomo/releases/download/v1.19.17/mihomo-linux-amd64-v1.19.17.gz
+          gunzip mihomo-linux-amd64-v1.19.17.gz
+          mv mihomo-linux-amd64-v1.19.17 mihomo
+          chmod +x mihomo
+          sudo mv mihomo /usr/local/bin/mihomo
+
+      - name: 1. 处理 IP 规则 (逆向 & 提取 v4)
+        run: |
+          set -euo pipefail
+          mkdir -p singbox-rules mihomo-rules temp_lite
+          
+          # 下载并反编译 IP 规则
+          curl -L "https://fastly.jsdelivr.net/gh/1715173329/IPCIDR-CHINA@rule-set/cn.srs" -o temp_lite/cn_raw.srs
+          sing-box rule-set decompile --output temp_lite/cn_ip-lite.json temp_lite/cn_raw.srs
+          
+          # 提取仅 IPv4 规则
+          jq '.rules[0] |= {ip_cidr: [.ip_cidr[] | select(contains(":") | not)]}' temp_lite/cn_ip-lite.json > temp_lite/cn_ip4-lite.json
+
+          # 转换为 Mihomo IP 格式 (无引号列表)
+          for f in cn_ip-lite cn_ip4-lite; do
+            echo "payload:" > "temp_lite/$f.yaml"
+            jq -r '.rules[].ip_cidr[]?' "temp_lite/$f.json" | sed 's/^/  - /' >> "temp_lite/$f.yaml"
+          done
+
+      - name: 2. 处理域名规则 (逆向 & 格式清洗)
+        run: |
+          set -euo pipefail
+          # 下载并反编译域名规则
+          curl -L "https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-cn.srs" -o temp_lite/cn_dom_raw.srs
+          sing-box rule-set decompile --output temp_lite/raw_dom.json temp_lite/cn_dom_raw.srs
+          
+          # 清洗 JSON：只保留 domain 和 domain_suffix
+          jq '{version: .version, rules: [.rules[] | {domain: .domain, domain_suffix: .domain_suffix} | del(..|nulls)]}' temp_lite/raw_dom.json > temp_lite/cn_domain-lite.json
+          
+          # 转换为 Mihomo 域名格式 (无引号)
+          echo "payload:" > temp_lite/cn_domain-lite.yaml
+          
+          # A. 后缀匹配： domain_suffix ->  - +.google.com
+          jq -r '.rules[].domain_suffix[]?' temp_lite/cn_domain-lite.json | sed 's/^/  - +./' >> temp_lite/cn_domain-lite.yaml || true
+          
+          # B. 精确匹配： domain ->  - zs2.cnzz.com
+          jq -r '.rules[].domain[]?' temp_lite/cn_domain-lite.json | sed 's/^/  - /' >> temp_lite/cn_domain-lite.yaml || true
+
+      - name: 3. 编译并分发文件
+        run: |
+          # 编译 Sing-box SRS 并同步 JSON
+          for f in cn_ip-lite cn_ip4-lite cn_domain-lite; do
+            sing-box rule-set compile --output "singbox-rules/$f.srs" "temp_lite/$f.json"
+            cp "temp_lite/$f.json" "singbox-rules/$f.json"
+          done
+          
+          # 编译 Mihomo MRS 并同步 YAML
+          for f in cn_ip-lite cn_ip4-lite cn_domain-lite; do
+            TYPE=$([[ "$f" == *"ip"* ]] && echo "ipcidr" || echo "domain")
+            mihomo convert-ruleset "$TYPE" yaml "temp_lite/$f.yaml" "mihomo-rules/$f.mrs"
+            cp "temp_lite/$f.yaml" "mihomo-rules/$f.yaml"
+          done
+
+      - name: Commit and Push
+        run: |
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+          git add singbox-rules/ mihomo-rules/
+          git commit -m "Update Lite Rules: Removed quotes from Mihomo YAML" || echo "No changes"
+          git push origin main
