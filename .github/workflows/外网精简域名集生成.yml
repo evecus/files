@@ -1,4 +1,4 @@
-name: 外网精简域名集生成 (格式精准修复版)
+name: 外网精简域名集生成
 
 on:
   workflow_dispatch:
