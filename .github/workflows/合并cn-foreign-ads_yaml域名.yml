@@ -1,4 +1,4 @@
-name: 合并cn-foreign-ads_yaml域名
+name: 精准覆盖更新合并规则 (YAML & MRS)
 
 on:
   workflow_dispatch:
@@ -29,10 +29,13 @@ jobs:
       - name: Generate, Deduplicate and Categorize Rules
         run: |
           set -euo pipefail
-          # 确保输出目录存在
-          mkdir -p mihomo-rules
           
-          # --- 1. 域名清洗函数 ---
+          # 1. 准备工作：创建输出目录（如果不存在），但绝对不删除它
+          mkdir -p mihomo-rules
+          # 创建临时工作目录，避免干扰现有文件
+          mkdir -p temp_build
+          
+          # --- 域名清洗函数 ---
           process_raw_domains() {
             sed -E '
               /^[[:space:]]*payload:/d;
@@ -45,10 +48,10 @@ jobs:
             '
           }
 
-          # --- 2. YAML 写出函数 (包含优先级去重与二次分类) ---
+          # --- YAML 写出函数 (仅在 temp_build 中操作) ---
           write_final_yaml() {
             local tmp_in="$1"
-            local final_out="$2"
+            local final_out="temp_build/$2"
             local exclude_list="$3"
             
             if [ ! -s "$tmp_in" ]; then
@@ -58,7 +61,6 @@ jobs:
 
             sort -u "$tmp_in" > "${tmp_in}.sorted"
             
-            # 跨文件去重逻辑
             if [ -f "$exclude_list" ] && [ -s "$exclude_list" ]; then
               sort -u "$exclude_list" -o "$exclude_list"
               comm -23 "${tmp_in}.sorted" "$exclude_list" > "${tmp_in}.final" || true
@@ -66,29 +68,19 @@ jobs:
               cp "${tmp_in}.sorted" "${tmp_in}.final"
             fi
 
-            # 生成 YAML 内容
             echo "payload:" > "$final_out"
+            # 分类：+. 在前
+            grep '^\+\.' "${tmp_in}.final" | sed 's/^/  - /' >> "$final_out" || true
+            # 分类：普通域名在后
+            grep -v '^\+\.' "${tmp_in}.final" | sed 's/^/  - /' >> "$final_out" || true
             
-            # 分类 1: +. 后缀格式排在前面
-            if grep -q '^\+\.' "${tmp_in}.final"; then
-              grep '^\+\.' "${tmp_in}.final" | sed 's/^/  - /' >> "$final_out"
-            fi
-            
-            # 分类 2: 普通域名排在后面
-            if grep -qv '^\+\.' "${tmp_in}.final"; then
-              grep -v '^\+\.' "${tmp_in}.final" | sed 's/^/  - /' >> "$final_out"
-            fi
-            
-            # 更新已处理域名记录 (用于后续类别的去重)
             cat "${tmp_in}.final" >> all_processed_domains.txt
             sort -u all_processed_domains.txt -o all_processed_domains.txt
           }
 
-          # --- 3. 初始化缓冲区 ---
+          # --- 初始化缓冲区 ---
           touch all_processed_domains.txt
-          ADS_RAW="ads_raw.txt"
-          FOREIGN_RAW="foreign_raw.txt"
-          CN_RAW="cn_raw.txt"
+          ADS_RAW="ads_raw.txt"; FOREIGN_RAW="foreign_raw.txt"; CN_RAW="cn_raw.txt"
           touch "$ADS_RAW" "$FOREIGN_RAW" "$CN_RAW"
 
           EXACT_FOREIGN=(
@@ -106,15 +98,13 @@ jobs:
             return 1
           }
 
-          # --- 4. 合并逻辑 (ADS -> FOREIGN -> CN) ---
-
-          echo "Merging ADS..."
+          # --- 执行合并 ---
           find meta/geo/geosite -name '*.yaml' | while read f; do
-            [[ "$(basename "$f")" =~ (^|[-_])ads([.-]|$) ]] && process_raw_domains < "$f" >> "$ADS_RAW" || true
+            base=$(basename "$f")
+            [[ "$base" =~ (^|[-_])ads([.-]|$) ]] && process_raw_domains < "$f" >> "$ADS_RAW" || true
           done
-          write_final_yaml "$ADS_RAW" "mihomo-rules/ads_domain.yaml" "none"
+          write_final_yaml "$ADS_RAW" "ads_domain.yaml" "none"
 
-          echo "Merging FOREIGN..."
           find meta/geo/geosite -name '*.yaml' | while read f; do
             name=$(basename "$f")
             if [[ "$name" =~ '!cn' ]] && [[ ! "$name" =~ 'ads' ]]; then
@@ -123,44 +113,43 @@ jobs:
               process_raw_domains < "$f" >> "$FOREIGN_RAW" || true
             fi
           done
-          write_final_yaml "$FOREIGN_RAW" "mihomo-rules/foreign_domain.yaml" "all_processed_domains.txt"
+          write_final_yaml "$FOREIGN_RAW" "foreign_domain.yaml" "all_processed_domains.txt"
 
-          echo "Merging CN..."
           find meta/geo/geosite -name '*.yaml' | while read f; do
             name=$(basename "$f")
             [[ "$name" =~ (^|[-_])cn([.-]|$) ]] && [[ ! "$name" =~ '!cn' ]] && process_raw_domains < "$f" >> "$CN_RAW" || true
           done
-          # 注意：这里已修正为 $CN_RAW
-          write_final_yaml "$CN_RAW" "mihomo-rules/cn_domain.yaml" "all_processed_domains.txt"
+          write_final_yaml "$CN_RAW" "cn_domain.yaml" "all_processed_domains.txt"
 
-      - name: Compile newly generated YAML to MRS
+      - name: Compile to MRS and Copy to mihomo-rules
         run: |
-          FILES=("ads_domain.yaml" "foreign_domain.yaml" "cn_domain.yaml")
-          for name in "${FILES[@]}"; do
-            YAML="mihomo-rules/$name"
-            MRS="mihomo-rules/${name%.*}.mrs"
+          # 1. 将临时生成的 YAML 转化为 MRS
+          for name in ads_domain foreign_domain cn_domain; do
+            YAML="temp_build/$name.yaml"
+            MRS="temp_build/$name.mrs"
             if [ -f "$YAML" ]; then
-              echo "Compiling $YAML to $MRS"
+              echo "Compiling $YAML..."
               mihomo convert-ruleset domain yaml "$YAML" "$MRS"
+              
+              # 2. 精准复制这 6 个文件到目标目录进行覆盖
+              cp "$YAML" "mihomo-rules/$name.yaml"
+              cp "$MRS" "mihomo-rules/$name.mrs"
             fi
           done
 
-      - name: Force Commit and Push
+      - name: Commit and Push (Preserving other files)
         run: |
           git config --global user.name "GitHub Action"
           git config --global user.email "actions@github.com"
           
-          # 强制覆盖添加这 6 个文件
-          git add mihomo-rules/ads_domain.yaml \
-                  mihomo-rules/ads_domain.mrs \
-                  mihomo-rules/foreign_domain.yaml \
-                  mihomo-rules/foreign_domain.mrs \
-                  mihomo-rules/cn_domain.yaml \
-                  mihomo-rules/cn_domain.mrs
+          # 只添加这 6 个特定文件，不 touch 其他文件
+          git add mihomo-rules/ads_domain.yaml mihomo-rules/ads_domain.mrs \
+                  mihomo-rules/foreign_domain.yaml mihomo-rules/foreign_domain.mrs \
+                  mihomo-rules/cn_domain.yaml mihomo-rules/cn_domain.mrs
 
           if git diff --cached --quiet; then
-            echo "No changes in rules."
+            echo "No changes in merged rules."
           else
-            git commit -m "Overwrite update: Updated 3 YAMLs and 3 MRS files"
+            git commit -m "Update rules: Precision overwrite 6 files, preserving others"
             git push
           fi
