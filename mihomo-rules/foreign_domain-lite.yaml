@@ -198,6 +198,7 @@ payload:
   - +.cash2.com
   - +.cashify.com
   - +.cashify.net
+  - +.cdn-telegram.org
   - +.cdninstagram.com
   - +.celebgramme.com
   - +.cerebras.ai
@@ -241,9 +242,11 @@ payload:
   - +.comfy.org
   - +.comfyci.org
   - +.comfyregistry.org
+  - +.comments.app
   - +.como-hackearfacebook.com
   - +.conscrypt.com
   - +.conscrypt.org
+  - +.contest.com
   - +.cookiechoices.org
   - +.coova.com
   - +.coova.net
@@ -633,6 +636,7 @@ payload:
   - +.fpacebook.com
   - +.fqcebook.com
   - +.fracebook.com
+  - +.fragment.com
   - +.freeb.com
   - +.freebasics.com
   - +.freebasics.net
@@ -987,6 +991,7 @@ payload:
   - +.gooogle.com
   - +.graph-fallback.instagram.com
   - +.graph.instagram.com
+  - +.graph.org
   - +.graph.whatsapp.com
   - +.graph.whatsapp.net
   - +.gridaware.app
@@ -1394,6 +1399,7 @@ payload:
   - +.questvisual.com
   - +.quickoffice.com
   - +.quiksee.com
+  - +.quiz.directory
   - +.reachtheworldonfacebook.com
   - +.redd.it
   - +.reddit.app.link
@@ -1462,10 +1468,21 @@ payload:
   - +.swiftfinancial.net
   - +.synergyse.com
   - +.t.co
+  - +.t.me
+  - +.tdesktop.com
+  - +.telega.one
+  - +.telegra.ph
+  - +.telegram-cdn.org
+  - +.telegram.dog
+  - +.telegram.me
+  - +.telegram.org
+  - +.telegram.space
+  - +.telesco.pe
   - +.tellapart.com
   - +.tensorflow.org
   - +.terragraph.com
   - +.tfhub.dev
+  - +.tg.dev
   - +.thecleversense.com
   - +.thefacebook.com
   - +.thefacebook.net
@@ -1525,11 +1542,13 @@ payload:
   - +.twttr.com
   - +.twttr.net
   - +.twvid.com
+  - +.tx.me
   - +.txcloud.net
   - +.txvia.com
   - +.unfiltered.news
   - +.urchin.com
   - +.useplannr.com
+  - +.usercontent.dev
   - +.usvimosquito.com
   - +.usvimosquitoproject.com
   - +.v8.dev
