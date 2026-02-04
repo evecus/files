@@ -1,4 +1,4 @@
-name: 合并去重并生成 MRS 规则 (精确转换版)
+name: 合并cn-foreign-ads_yaml域名
 
 on:
   workflow_dispatch:
@@ -26,9 +26,10 @@ jobs:
           chmod +x mihomo
           sudo mv mihomo /usr/local/bin/mihomo
 
-      - name: Merge, Deduplicate and Categorize Rules
+      - name: Generate, Deduplicate and Categorize Rules
         run: |
           set -euo pipefail
+          # 创建或清空目标目录，确保是全新的
           mkdir -p mihomo-rules
           
           # --- 1. 核心域名清洗函数 ---
@@ -44,7 +45,7 @@ jobs:
             '
           }
 
-          # --- 2. 核心写出与分类函数 ---
+          # --- 2. 核心写出函数 (负责 YAML 生成和去重) ---
           write_final_yaml() {
             local tmp_in="$1"
             local final_out="$2"
@@ -57,6 +58,7 @@ jobs:
 
             sort -u "$tmp_in" > "${tmp_in}.sorted"
             
+            # 跨规则集优先级去重
             if [ -f "$exclude_list" ] && [ -s "$exclude_list" ]; then
               sort -u "$exclude_list" -o "$exclude_list"
               comm -23 "${tmp_in}.sorted" "$exclude_list" > "${tmp_in}.final" || true
@@ -66,25 +68,27 @@ jobs:
 
             echo "payload:" > "$final_out"
             
-            # 分类 1: 后缀域名 (+.)
+            # 分类排列：+. 后缀在前
             if grep -q '^\+\.' "${tmp_in}.final"; then
               grep '^\+\.' "${tmp_in}.final" | sed 's/^/  - /' >> "$final_out"
             fi
             
-            # 分类 2: 普通域名 (不含 +.)
+            # 分类排列：普通域名在后
             if grep -qv '^\+\.' "${tmp_in}.final"; then
               grep -v '^\+\.' "${tmp_in}.final" | sed 's/^/  - /' >> "$final_out"
             fi
             
+            # 更新全局已处理库，确保后续分类不重复
             cat "${tmp_in}.final" >> all_processed_domains.txt
             sort -u all_processed_domains.txt -o all_processed_domains.txt
           }
 
-          # --- 3. 初始化变量 ---
+          # 初始化临时缓冲区
           touch all_processed_domains.txt
-          ADS_TMP="ads_raw.txt"; FOREIGN_TMP="foreign_raw.txt"; CN_TMP="cn_raw.txt"
-          touch "$ADS_TMP" "$FOREIGN_TMP" "$CN_TMP"
+          ADS_RAW="ads_raw.txt"; FOREIGN_RAW="foreign_raw.txt"; CN_RAW="cn_raw.txt"
+          touch "$ADS_RAW" "$FOREIGN_RAW" "$CN_RAW"
 
+          # 这里的白名单是针对 FOREIGN 规则集的补充
           EXACT_FOREIGN=(
             gfw.yaml google.yaml google-gemini.yaml youtube.yaml tiktok.yaml onedrive.yaml github.yaml
             telegram.yaml facebook.yaml twitter.yaml meta.yaml instagram.yaml paypal.yaml
@@ -100,53 +104,59 @@ jobs:
             return 1
           }
 
-          # --- 4. 分步骤合并 ---
-          echo "Merging ADS..."
+          # --- 3. 开始从源码合成新的 YAML (ADS -> FOREIGN -> CN) ---
+          
+          # 处理 ADS
           find meta/geo/geosite -name '*.yaml' | while read f; do
-            [[ "$(basename "$f")" =~ (^|[-_])ads([.-]|$) ]] && process_raw_domains < "$f" >> "$ADS_TMP" || true
+            [[ "$(basename "$f")" =~ (^|[-_])ads([.-]|$) ]] && process_raw_domains < "$f" >> "$ADS_RAW" || true
           done
-          write_final_yaml "$ADS_TMP" "mihomo-rules/ads_domain.yaml" "none"
+          write_final_yaml "$ADS_RAW" "mihomo-rules/ads_domain.yaml" "none"
 
-          echo "Merging FOREIGN..."
+          # 处理 FOREIGN
           find meta/geo/geosite -name '*.yaml' | while read f; do
             name=$(basename "$f")
             if [[ "$name" =~ '!cn' ]] && [[ ! "$name" =~ 'ads' ]]; then
-              process_raw_domains < "$f" >> "$FOREIGN_TMP" || true
+              process_raw_domains < "$f" >> "$FOREIGN_RAW" || true
             elif is_exact_foreign "$name"; then
-              process_raw_domains < "$f" >> "$FOREIGN_TMP" || true
+              process_raw_domains < "$f" >> "$FOREIGN_RAW" || true
             fi
           done
-          write_final_yaml "$FOREIGN_TMP" "mihomo-rules/foreign_domain.yaml" "all_processed_domains.txt"
+          write_final_yaml "$FOREIGN_RAW" "mihomo-rules/foreign_domain.yaml" "all_processed_domains.txt"
 
-          echo "Merging CN..."
+          # 处理 CN
           find meta/geo/geosite -name '*.yaml' | while read f; do
             name=$(basename "$f")
-            [[ "$name" =~ (^|[-_])cn([.-]|$) ]] && [[ ! "$name" =~ '!cn' ]] && process_raw_domains < "$f" >> "$CN_TMP" || true
+            [[ "$name" =~ (^|[-_])cn([.-]|$) ]] && [[ ! "$name" =~ '!cn' ]] && process_raw_domains < "$f" >> "$CN_RAW" || true
           done
           write_final_yaml "$CN_TMP" "mihomo-rules/cn_domain.yaml" "all_processed_domains.txt"
 
-      - name: Convert specific YAML to MRS
+      - name: Compile newly generated YAML to MRS
         run: |
-          # 明确指定转换这三个合成后的文件
-          TARGETS=("ads_domain.yaml" "foreign_domain.yaml" "cn_domain.yaml")
-          
-          for FILE_NAME in "${TARGETS[@]}"; do
-            FILE_PATH="mihomo-rules/$FILE_NAME"
-            if [ -f "$FILE_PATH" ]; then
-              OUTPUT_PATH="${FILE_PATH%.*}.mrs"
-              echo "Compiling $FILE_PATH to $OUTPUT_PATH"
-              mihomo convert-ruleset domain yaml "$FILE_PATH" "$OUTPUT_PATH"
-            fi
+          # 仅转化刚刚生成的这三个文件
+          FILES=("ads_domain.yaml" "foreign_domain.yaml" "cn_domain.yaml")
+          for name in "${FILES[@]}"; do
+            YAML="mihomo-rules/$name"
+            MRS="mihomo-rules/${name%.*}.mrs"
+            echo "Compiling $YAML to $MRS"
+            mihomo convert-ruleset domain yaml "$YAML" "$MRS"
           done
 
-      - name: Commit and Push
+      - name: Force Commit and Push (Covering mihomo-rules/)
         run: |
           git config --global user.name "GitHub Action"
           git config --global user.email "actions@github.com"
-          git add mihomo-rules/ads_domain.* mihomo-rules/foreign_domain.* mihomo-rules/cn_domain.*
+          
+          # 显式添加这 6 个文件
+          git add mihomo-rules/ads_domain.yaml \
+                  mihomo-rules/ads_domain.mrs \
+                  mihomo-rules/foreign_domain.yaml \
+                  mihomo-rules/foreign_domain.mrs \
+                  mihomo-rules/cn_domain.yaml \
+                  mihomo-rules/cn_domain.mrs
+
           if git diff --cached --quiet; then
-            echo "No changes to commit"
+            echo "No changes in rules."
           else
-            git commit -m "Update rules: Precision compilation for ads, foreign, and cn"
+            git commit -m "Overwrite: Update ads/foreign/cn rules (YAML & MRS)"
             git push
           fi
