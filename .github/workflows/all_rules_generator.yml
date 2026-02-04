@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  build-all-rules:
+  build-all:
     runs-on: ubuntu-latest
 
     steps:
@@ -21,13 +21,13 @@ jobs:
           git clone --depth=1 -b sing https://github.com/MetaCubeX/meta-rules-dat.git source-sing
           git clone --depth=1 -b meta https://github.com/MetaCubeX/meta-rules-dat.git source-meta
 
-      - name: Install Tools (Sing-box & Mihomo)
+      - name: Install Tools
         run: |
-          # 安装 Sing-box
+          # Install Sing-box
           wget https://github.com/SagerNet/sing-box/releases/download/v1.12.17/sing-box-1.12.17-linux-amd64.tar.gz
           tar -xzf sing-box-1.12.17-linux-amd64.tar.gz
           mv sing-box-1.12.17-linux-amd64/sing-box /usr/local/bin/
-          # 安装 Mihomo
+          # Install Mihomo
           wget https://github.com/MetaCubeX/mihomo/releases/download/v1.19.17/mihomo-linux-amd64-v1.19.17.gz
           gunzip mihomo-linux-amd64-v1.19.17.gz
           mv mihomo-linux-amd64-v1.19.17 mihomo
@@ -37,7 +37,7 @@ jobs:
       - name: 1. Process Domain Rules
         run: |
           set -euo pipefail
-          mkdir -p singbox-rules mihomo-rules
+          mkdir -p singbox-rules mihomo-rules temp_build
           touch all_processed_domains.txt
           
           build_domain_all() {
@@ -46,39 +46,48 @@ jobs:
             shift 2
             local files=("$@")
             
+            # 提取域名
             jq -r '.rules[].domain[]?' "${files[@]}" 2>/dev/null | sed 's/[[:space:]]//g; /^$/d' | sort -u > d_exact.txt || touch d_exact.txt
             jq -r '.rules[].domain_suffix[]?' "${files[@]}" 2>/dev/null | sed 's/[[:space:]]//g; /^$/d' | sort -u > d_suffix.txt || touch d_suffix.txt
 
+            # 跨类别去重
             if [ -f "$exclude_list" ] && [ -s "$exclude_list" ]; then
-              comm -23 d_exact.txt "$exclude_list" > tmp && mv tmp d_exact.txt
-              comm -23 d_suffix.txt "$exclude_list" > tmp && mv tmp d_suffix.txt
+              comm -23 d_exact.txt "$exclude_list" > tmp && mv tmp d_exact.txt || true
+              comm -23 d_suffix.txt "$exclude_list" > tmp && mv tmp d_suffix.txt || true
             fi
-            comm -23 d_exact.txt d_suffix.txt > d_exact_final.txt
+            # 内部去重：后缀覆盖精确匹配
+            comm -23 d_exact.txt d_suffix.txt > d_exact_final.txt || true
 
-            # Sing-box JSON
+            # 生成 Sing-box JSON
             jq -n --rawfile exact d_exact_final.txt --rawfile suffix d_suffix.txt \
               '{version: 2, rules: [{domain: ($exact | split("\n") | map(select(length > 0))), domain_suffix: ($suffix | split("\n") | map(select(length > 0)))}]}' \
               > "singbox-rules/${name}.json"
 
-            # Mihomo YAML
+            # 生成 Mihomo YAML
             echo "payload:" > "mihomo-rules/${name}.yaml"
             sed 's/^/  - +./' d_suffix.txt >> "mihomo-rules/${name}.yaml"
             sed 's/^/  - /' d_exact_final.txt >> "mihomo-rules/${name}.yaml"
 
+            # 更新全局排除列表
             cat d_exact_final.txt d_suffix.txt >> all_processed_domains.txt
             sort -u all_processed_domains.txt -o all_processed_domains.txt
           }
 
           SRC_S="source-sing/geo/geosite"
           # ADS
-          mapfile -t ADS_F < <(find "$SRC_S" -type f -name "*.json" | grep -E '(^|[^a-zA-Z0-9])ads([^a-zA-Z0-9]|\.json$)')
-          build_domain_all "ads_domain" "none" "${ADS_F[@]}"
+          mapfile -t ADS_F < <(find "$SRC_S" -type f -name "*.json" | grep -E '(^|[^a-zA-Z0-9])ads([^a-zA-Z0-9]|\.json$)' || true)
+          [ ${#ADS_F[@]} -gt 0 ] && build_domain_all "ads_domain" "none" "${ADS_F[@]}"
+
           # FOREIGN
-          mapfile -t FOR_F < <(find "$SRC_S" -type f -name "*.json" | grep '!cn' | grep -Ev 'ads')
-          build_domain_all "foreign_domain" "all_processed_domains.txt" "${FOR_F[@]}"
+          mapfile -t FOR_F < <(find "$SRC_S" -type f -name "*.json" | grep '!cn' | grep -Ev 'ads' || true)
+          # 添加精确白名单文件 (gfw, google, youtube 等)
+          EXACT_DOMS=("gfw.json" "google.json" "youtube.json" "tiktok.json" "telegram.json" "openai.json")
+          for d in "${EXACT_DOMS[@]}"; do [ -f "$SRC_S/$d" ] && FOR_F+=("$SRC_S/$d"); done
+          [ ${#FOR_F[@]} -gt 0 ] && build_domain_all "foreign_domain" "all_processed_domains.txt" "${FOR_F[@]}"
+
           # CN
-          mapfile -t CN_F < <(find "$SRC_S" -type f -name "*.json" | grep -Ev '!cn' | grep -E '(^|[^a-zA-Z0-9])cn([^a-zA-Z0-9]|\.json$)')
-          build_domain_all "cn_domain" "all_processed_domains.txt" "${CN_F[@]}"
+          mapfile -t CN_F < <(find "$SRC_S" -type f -name "*.json" | grep -Ev '!cn' | grep -E '(^|[^a-zA-Z0-9])cn([^a-zA-Z0-9]|\.json$)' || true)
+          [ ${#CN_F[@]} -gt 0 ] && build_domain_all "cn_domain" "all_processed_domains.txt" "${CN_F[@]}"
 
       - name: 2. Process IP Rules
         run: |
@@ -91,7 +100,7 @@ jobs:
             shift 2
             local files=("$@")
             
-            jq -r '.rules[].ip_cidr[]?' "${files[@]}" | sed 's/[[:space:]]//g; /^$/d' | sort -u > ips.txt
+            jq -r '.rules[].ip_cidr[]?' "${files[@]}" | sed 's/[[:space:]]//g; /^$/d' | sort -u > ips.txt || touch ips.txt
             grep "\." ips.txt > v4.txt || touch v4.txt
             grep ":" ips.txt > v6.txt || touch v6.txt
 
@@ -105,23 +114,28 @@ jobs:
 
             # Mihomo YAML
             echo "payload:" > "mihomo-rules/${name}.yaml"
-            sed 's/^/  - /' v4.txt >> "mihomo-rules/${name}.yaml"
-            [ "$v4_only" = "false" ] && sed 's/^/  - /' v6.txt >> "mihomo-rules/${name}.yaml"
+            [ -s v4.txt ] && sed 's/^/  - /' v4.txt >> "mihomo-rules/${name}.yaml" || true
+            if [ "$v4_only" = "false" ]; then
+              [ -s v6.txt ] && sed 's/^/  - /' v6.txt >> "mihomo-rules/${name}.yaml" || true
+            fi
           }
 
-          FOR_IPS=("$SRC_IP_S/google.json" "$SRC_IP_S/twitter.json" "$SRC_IP_S/facebook.json" "$SRC_IP_S/telegram.json")
-          process_ip_all "foreign_ip4" "true" "${FOR_IPS[@]}"
-          process_ip_all "foreign_ip" "false" "${FOR_IPS[@]}"
-          process_ip_all "cn_ip4" "true" "$SRC_IP_S/cn.json"
+          FOR_IPS=()
+          for f in google.json twitter.json facebook.json telegram.json; do [ -f "$SRC_IP_S/$f" ] && FOR_IPS+=("$SRC_IP_S/$f"); done
+          [ ${#FOR_IPS[@]} -gt 0 ] && process_ip_all "foreign_ip4" "true" "${FOR_IPS[@]}"
+          [ ${#FOR_IPS[@]} -gt 0 ] && process_ip_all "foreign_ip" "false" "${FOR_IPS[@]}"
+          [ -f "$SRC_IP_S/cn.json" ] && process_ip_all "cn_ip4" "true" "$SRC_IP_S/cn.json"
 
       - name: 3. Compile Binary Rules (SRS & MRS)
         run: |
+          # SRS Compilation
           for f in singbox-rules/*.json; do
-            sing-box rule-set compile --output "${f%.json}.srs" "$f"
+            [ -f "$f" ] && sing-box rule-set compile --output "${f%.json}.srs" "$f" || echo "Skip $f"
           done
+          # MRS Compilation
           for f in mihomo-rules/*.yaml; do
-            TYPE=$([[ "$f" == *"ip"* ]] && echo "ipcidr" || echo "domain")
-            mihomo convert-ruleset "$TYPE" yaml "$f" "${f%.yaml}.mrs"
+            [ -f "$f" ] && TYPE=$([[ "$f" == *"ip"* ]] && echo "ipcidr" || echo "domain")
+            [ -f "$f" ] && mihomo convert-ruleset "$TYPE" yaml "$f" "${f%.yaml}.mrs" || echo "Skip $f"
           done
 
       - name: Commit and Push
@@ -129,5 +143,5 @@ jobs:
           git config user.name "GitHub Action"
           git config user.email "action@github.com"
           git add singbox-rules/*.json singbox-rules/*.srs mihomo-rules/*.yaml mihomo-rules/*.mrs
-          git commit -m "Auto update rules" || echo "No changes"
+          git commit -m "Update all rules (Sing-box & Mihomo)" || echo "No changes"
           git push origin main
