@@ -16,7 +16,7 @@ jobs:
       - name: Checkout current repo
         uses: actions/checkout@v4
 
-      - name: Clone meta-rules-dat (Branches: sing & meta)
+      - name: Clone meta-rules-dat
         run: |
           git clone --depth=1 -b sing https://github.com/MetaCubeX/meta-rules-dat.git source-sing
           git clone --depth=1 -b meta https://github.com/MetaCubeX/meta-rules-dat.git source-meta
