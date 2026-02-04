@@ -1,9 +1,9 @@
-name: 精简版规则集生成 (彻底修复双点号)
+name: 精简版规则集生成 (彻底修复点号问题)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 3 * * *"
+    - cron: "0 2 * * *"
 
 permissions:
   contents: write
@@ -40,24 +40,30 @@ jobs:
             jq -r '.rules[].ip_cidr[]?' "temp_lite/$f.json" | sed 's/^/  - /' >> "temp_lite/$f.yaml"
           done
 
-      - name: 2. 处理域名规则 (修复双点号逻辑)
+      - name: 2. 处理域名规则 (修复 JSON/YAML 前导点)
         run: |
           set -euo pipefail
           curl -L "https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-cn.srs" -o temp_lite/cn_dom_raw.srs
           sing-box rule-set decompile --output temp_lite/raw_dom.json temp_lite/cn_dom_raw.srs
           
-          jq '{version: .version, rules: [.rules[] | {domain: .domain, domain_suffix: .domain_suffix} | del(..|nulls)]}' temp_lite/raw_dom.json > temp_lite/cn_domain-lite.json
+          # 修复 JSON：使用 map(sub("^\\.+"; "")) 清除数组元素开头的点
+          jq '{
+            version: .version, 
+            rules: [
+              .rules[] | {
+                domain: (.domain | map(sub("^\\.+"; ""))), 
+                domain_suffix: (.domain_suffix | map(sub("^\\.+"; "")))
+              } | del(..|nulls)
+            ]
+          }' temp_lite/raw_dom.json > temp_lite/cn_domain-lite.json
           
           echo "payload:" > temp_lite/cn_domain-lite.yaml
           
-          # 核心修复：先清理行首可能存在的点，再统一添加 +. 
-          # 1. 提取 domain_suffix
-          # 2. sed 's/^\.*//' 移除行首所有的点
-          # 3. sed 's/^/  - +./' 统一添加前缀
-          jq -r '.rules[].domain_suffix[]?' temp_lite/cn_domain-lite.json | sed 's/^\.*//' | sed 's/^/  - +./' >> temp_lite/cn_domain-lite.yaml || true
+          # 修复 YAML：提取 domain_suffix -> - +.baidu.com (无双点)
+          jq -r '.rules[].domain_suffix[]?' temp_lite/cn_domain-lite.json | sed 's/^\.*//; s/^/  - +./' >> temp_lite/cn_domain-lite.yaml || true
           
-          # 精确匹配 domain 保持原样
-          jq -r '.rules[].domain[]?' temp_lite/cn_domain-lite.json | sed 's/^/  - /' >> temp_lite/cn_domain-lite.yaml || true
+          # 修复 YAML：提取 domain -> - zs2.cnzz.com
+          jq -r '.rules[].domain[]?' temp_lite/cn_domain-lite.json | sed 's/^\.*//; s/^/  - /' >> temp_lite/cn_domain-lite.yaml || true
 
       - name: 3. 编译并分发文件
         run: |
@@ -75,5 +81,5 @@ jobs:
           git config user.name "GitHub Action"
           git config user.email "action@github.com"
           git add singbox-rules/ mihomo-rules/
-          git commit -m "Fix: correct domain_suffix format (no double dots)" || echo "No changes"
+          git commit -m "Fix: correct cn_domain-lite JSON and YAML dot format" || echo "No changes"
           git push origin main
