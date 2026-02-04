@@ -2,8 +2,6 @@ name: 一键合并规则并转换
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 23 * * *"
 
 permissions:
   contents: write
