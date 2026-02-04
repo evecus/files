@@ -1,4 +1,4 @@
-name: Sing-box&Mihomo规则集全量生成
+name: 规则集全量生成 (Sing-box & Mihomo)
 
 on:
   workflow_dispatch:
