@@ -3,8 +3,6 @@ name: 合并cn-foreign-ads_yaml域名
 on:
   workflow_dispatch:
 
-permissions:
-  contents: write
 
 jobs:
   merge:
@@ -22,105 +20,106 @@ jobs:
         run: |
           set -euo pipefail
 
-          process_rules() {
+          # 创建输出目录
+          mkdir -p mihomo-rules
+          
+          # 定义处理函数：提取并格式化域名
+          # 去除 payload、空行、正则，并将 DOMAIN-SUFFIX 转为 +. 格式
+          process_raw_domains() {
             sed -E '
               /^[[:space:]]*payload:/d;
               /^[[:space:]]*$/d;
               /^[[:space:]]*-[[:space:]]*DOMAIN-REGEX,/d;
-              s/^[[:space:]]*-[[:space:]]*DOMAIN-SUFFIX,([^\r\n]+)/  - +.\1/;
-              s/^[[:space:]]*-[[:space:]]*DOMAIN,([^\r\n]+)/  - \1/;
-              s/^[[:space:]]*-[[:space:]]*/  - /;
+              s/^[[:space:]]*-[[:space:]]*DOMAIN-SUFFIX,([^\r\n]+)/+.\1/;
+              s/^[[:space:]]*-[[:space:]]*DOMAIN,([^\r\n]+)/\1/;
+              s/^[[:space:]]*-[[:space:]]*//;
+              s/[[:space:]]//g;
             '
           }
 
-          CN_OUT=mihomo-rules/cn_domain.yaml
-          ADS_OUT=mihomo-rules/ads_domain.yaml
-          FOREIGN_OUT=mihomo-rules/foreign_domain.yaml
+          # 定义写出函数：进行去重并添加 yaml 格式
+          # 参数: 1:输入临时文件, 2:输出yaml文件, 3:排除列表文件
+          write_final_yaml() {
+            local tmp_in="$1"
+            local final_out="$2"
+            local exclude_list="$3"
+            
+            echo "payload:" > "$final_out"
+            
+            if [ -f "$exclude_list" ]; then
+              # 使用 comm -23 剔除已存在的域名 (要求文件必须已排序)
+              sort -u "$tmp_in" > "${tmp_in}.sorted"
+              comm -23 "${tmp_in}.sorted" "$exclude_list" | sed 's/^/  - /' >> "$final_out"
+            else
+              sort -u "$tmp_in" | sed 's/^/  - /' >> "$final_out"
+            fi
+            
+            # 更新全局排除列表
+            sort -u "$tmp_in" >> all_processed.txt
+            sort -u all_processed.txt -o all_processed.txt
+          }
 
-          echo "payload:" > "$CN_OUT"
-          echo "payload:" > "$ADS_OUT"
-          echo "payload:" > "$FOREIGN_OUT"
+          CN_TMP=cn_tmp.txt
+          ADS_TMP=ads_tmp.txt
+          FOREIGN_TMP=foreign_tmp.txt
+          TOUCH_FILE=all_processed.txt
+          touch "$TOUCH_FILE"
 
           EXACT_FOREIGN=(
             gfw.yaml google.yaml google-gemini.yaml youtube.yaml tiktok.yaml onedrive.yaml github.yaml
             telegram.yaml facebook.yaml twitter.yaml meta.yaml instagram.yaml paypal.yaml
-            reddit.yaml netflix.yaml discord.yaml
-
-            steam.yaml steamcommunity.yaml steampowered.yaml epic.yaml epicgames.yaml
-            origin.yaml ea.yaml uplay.yaml ubisoft.yaml battlenet.yaml blizzard.yaml
-            rockstar.yaml psn.yaml xbox.yaml google-gemini.yaml
-
-            medium.yaml tumblr.yaml blogspot.yaml blogger.yaml wordpress.yaml ghost.yaml
-            substack.yaml deviantart.yaml pixiv.yaml
-
-            binance.yaml coinbase.yaml kraken.yaml blockchain.yaml bitfinex.yaml okx.yaml
-            huobi.yaml ethereum.yaml bitcoin.yaml uniswap.yaml
-
-            arxiv.yaml nature.yaml science.yaml acm.yaml ieee.yaml springer.yaml jstor.yaml
-            researchgate.yaml pubmed.yaml
-
-            nordvpn.yaml expressvpn.yaml protonvpn.yaml surfshark.yaml windscribe.yaml
-            outline.yaml lantern.yaml psiphon.yaml mullvad.yaml
-
-            porn.yaml pornhub.yaml xvideos.yaml xnxx.yaml xhamster.yaml brazzers.yaml
-            youporn.yaml redtube.yaml spankbang.yaml rule34.yaml
-
-            openai.yaml anthropic.yaml novelai.yaml huggingface.yaml stability.yaml
-            midjourney.yaml civitai.yaml replicate.yaml perplexity.yaml
+            reddit.yaml netflix.yaml discord.yaml steam.yaml steamcommunity.yaml steampowered.yaml 
+            epic.yaml epicgames.yaml origin.yaml ea.yaml uplay.yaml ubisoft.yaml battlenet.yaml 
+            blizzard.yaml rockstar.yaml psn.yaml xbox.yaml openai.yaml anthropic.yaml 
+            huggingface.yaml perplexity.yaml
           )
 
           is_exact_foreign() {
             local f="$1"
-            for e in "${EXACT_FOREIGN[@]}"; do
-              [[ "$f" == "$e" ]] && return 0
-            done
+            for e in "${EXACT_FOREIGN[@]}"; do [[ "$f" == "$e" ]] && return 0; done
             return 1
           }
 
-          echo "===== CN FILES ====="
-          find meta/geo/geosite -name '*.yaml' | while read f; do
-            name=$(basename "$f")
-            if [[ "$name" =~ (^|[-_])cn([.-]|$) ]] && [[ ! "$name" =~ '!cn' ]]; then
-              echo "[CN] $name"
-              process_rules < "$f" >> "$CN_OUT"
-            fi
-          done
-
-          echo "===== ADS FILES ====="
+          # --- 1. 处理 ADS (优先级最高) ---
+          echo "Processing ADS..."
           find meta/geo/geosite -name '*.yaml' | while read f; do
             name=$(basename "$f")
             if [[ "$name" =~ (^|[-_])ads([.-]|$) ]]; then
-              echo "[ADS] $name"
-              process_rules < "$f" >> "$ADS_OUT"
+              process_raw_domains < "$f" >> "$ADS_TMP"
             fi
           done
+          write_final_yaml "$ADS_TMP" "mihomo-rules/ads_domain.yaml" "none_file"
 
-          echo "===== FOREIGN FILES ====="
+          # --- 2. 处理 FOREIGN (排除 ADS) ---
+          echo "Processing FOREIGN..."
           find meta/geo/geosite -name '*.yaml' | while read f; do
             name=$(basename "$f")
-
             if [[ "$name" =~ '!cn' ]] && [[ ! "$name" =~ 'ads' ]]; then
-              echo "[FOREIGN][!cn] $name"
-              process_rules < "$f" >> "$FOREIGN_OUT"
-              continue
-            fi
-
-            if is_exact_foreign "$name"; then
-              echo "[FOREIGN][EXACT] $name"
-              process_rules < "$f" >> "$FOREIGN_OUT"
+              process_raw_domains < "$f" >> "$FOREIGN_TMP"
+            elif is_exact_foreign "$name"; then
+              process_raw_domains < "$f" >> "$FOREIGN_TMP"
             fi
           done
+          write_final_yaml "$FOREIGN_TMP" "mihomo-rules/foreign_domain.yaml" "$TOUCH_FILE"
+
+          # --- 3. 处理 CN (排除 ADS 和 FOREIGN) ---
+          echo "Processing CN..."
+          find meta/geo/geosite -name '*.yaml' | while read f; do
+            name=$(basename "$f")
+            if [[ "$name" =~ (^|[-_])cn([.-]|$) ]] && [[ ! "$name" =~ '!cn' ]]; then
+              process_raw_domains < "$f" >> "$CN_TMP"
+            fi
+          done
+          write_final_yaml "$CN_TMP" "mihomo-rules/cn_domain.yaml" "$TOUCH_FILE"
 
       - name: Commit and push
         run: |
           git config user.name "github-actions"
           git config user.email "action@github.com"
-
           git add mihomo-rules/*.yaml
-
           if git diff --cached --quiet; then
             echo "No changes"
           else
-            git commit -m "Update cn / ads / foreign domain rules"
+            git commit -m "Update rules with deduplication"
             git push
           fi
