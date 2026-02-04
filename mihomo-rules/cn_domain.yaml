@@ -3062,6 +3062,9 @@ payload:
   - +.21tyn.com
   - +.21uv.com
   - +.21van.com
+  - +.21vbc.com
+  - +.21vbluecloud.com
+  - +.21vbluecloud.net
   - +.21viacloud.com
   - +.21vianet.com
   - +.21voa.com
@@ -4660,6 +4663,7 @@ payload:
   - +.4007123123.com
   - +.4007777958.com
   - +.4008-197-197.com
+  - +.4008-517-517.cn
   - +.400800.vip
   - +.4008000000.com
   - +.4008005216.com
@@ -9475,6 +9479,7 @@ payload:
   - +.aad5.com
   - +.aadcloud.com
   - +.aadongman.com
+  - +.aadrm.cn
   - +.aads-cng.net
   - +.aafxw.com
   - +.aai07251mu.com
@@ -9584,6 +9589,7 @@ payload:
   - +.aboatedu.com
   - +.aboboo.com
   - +.aboilgame.com
+  - +.aboutamazon.cn
   - +.aboutcg.com
   - +.aboutcg.net
   - +.aboutcg.org
@@ -9659,6 +9665,7 @@ payload:
   - +.acejoy.com
   - +.acelamicro.com
   - +.aceoo.com
+  - +.acer.com.cn
   - +.acesheep.com
   - +.acetace.com
   - +.acetaffy.club
@@ -9795,6 +9802,7 @@ payload:
   - +.adc-expo.com
   - +.adcdn.com
   - +.adcomeon.com
+  - +.adcommerce.cn
   - +.adcotechina.com
   - +.addaad.com
   - +.addchina.com
@@ -9829,6 +9837,9 @@ payload:
   - +.adhubbj.xyz
   - +.adhudong.com
   - +.adianshi.com
+  - +.adidas.cn
+  - +.adidas.com.cn
+  - +.adidasspecialtysports.cn
   - +.adiexpress.com
   - +.adigifactory.com
   - +.adiic.com
@@ -9876,6 +9887,7 @@ payload:
   - +.adnrhy.com
   - +.adobe-tool.com
   - +.adobeae.com
+  - +.adobedc.cn
   - +.adobeedu.com
   - +.adoebike.com
   - +.adonest.com
@@ -9996,6 +10008,7 @@ payload:
   - +.aerochina.net
   - +.aerocityholding.com
   - +.aerofugia.com
+  - +.aerogard.com.cn
   - +.aes-beijing.org
   - +.aesoftland.com
   - +.aestheticbutler.xyz
@@ -10058,6 +10071,7 @@ payload:
   - +.agenge.com
   - +.agenow.com
   - +.agentyun.com
+  - +.aggresmart.com
   - +.aghcdn.com
   - +.agi360.xyz
   - +.agile-china.com
@@ -10762,6 +10776,7 @@ payload:
   - +.airtofly.com
   - +.airtu.me
   - +.airwh.com
+  - +.airwick.com.cn
   - +.airworksoft.com
   - +.aisaohuo.com
   - +.aisbeijing.com
@@ -11078,6 +11093,8 @@ payload:
   - +.alenable.com
   - +.alertover.com
   - +.alevelwx.com
+  - +.alexafund.cn
+  - +.alexafund.com.cn
   - +.alexhaohao.com
   - +.alexinea.com
   - +.alexpad.fun
@@ -11520,6 +11537,8 @@ payload:
   - +.aloys233.top
   - +.alpha-browser.com
   - +.alpha-star.org
+  - +.alphabet.com.cn
+  - +.alphabet.net.cn
   - +.alphabiopharma.com
   - +.alphabole.com
   - +.alphassl.com
@@ -11564,8 +11583,24 @@ payload:
   - +.amayad.com
   - +.amazfit.com
   - +.amazingsys.com
+  - +.amazon.cn
   - +.amazonaws.cn
   - +.amazonaws.com.cn
+  - +.amazonbusiness.cn
+  - +.amazonbusiness.com.cn
+  - +.amazonchoice.cn
+  - +.amazonchoice.com.cn
+  - +.amazonchoices.cn
+  - +.amazonchoices.com.cn
+  - +.amazoninspire.cn
+  - +.amazoninspire.com.cn
+  - +.amazonlaunchpad.cn
+  - +.amazonlaunchpad.com.cn
+  - +.amazonlending.com.cn
+  - +.amazonnow.cn
+  - +.amazonnow.com.cn
+  - +.amazonprimevideo.cn
+  - +.amazonprimevideo.com.cn
   - +.amazonwebservices.com.cn
   - +.amazonworkdocs.cn
   - +.amazonworkdocs.com.cn
@@ -11624,6 +11659,7 @@ payload:
   - +.amphenol-jet.com
   - +.amphibiachina.org
   - +.amplesky.com
+  - +.amplifi.com.cn
   - +.amplly.com
   - +.ampmake.com
   - +.ampxl.com
@@ -11730,6 +11766,8 @@ payload:
   - +.anfensi.com
   - +.anfine-healthcare.com
   - +.anfipet.com
+  - +.anfutong.cn
+  - +.anfutong.com.cn
   - +.angeeks.com
   - +.angel-game.net
   - +.angel-hospital.com
@@ -12163,6 +12201,7 @@ payload:
   - +.aoqiangtc.com
   - +.aorankj.com
   - +.aoratec.com
+  - +.aoruszone.cn
   - +.aoscdn.com
   - +.aoscom.net
   - +.aosenm.com
@@ -12269,13 +12308,13 @@ payload:
   - +.apichina.com
   - +.apickup.com
   - +.apicloud.com
-  - +.apidns.kwd.inkuai.com
   - +.apifabric.net
   - +.apifox.cn
   - +.apifox.com
   - +.apifoxmock.com
   - +.apigateway.info
   - +.apigwtencent.com
+  - +.apihub-internal.cn
   - +.apilyzy.com
   - +.apim.work
   - +.apimkt.net
@@ -12372,6 +12411,7 @@ payload:
   - +.appfeng.com
   - +.appfenxiang.com
   - +.appfimo.com
+  - +.appforebay.cn
   - +.appganhuo.com
   - +.appgenuine.com
   - +.appgrub.com
@@ -12385,6 +12425,33 @@ payload:
   - +.appkaifa.com
   - +.appkefu.com
   - +.applausefz.com
+  - +.apple-appstore.cn
+  - +.apple-dns.cn
+  - +.apple-dns.com.cn
+  - +.apple-ibooks.cn
+  - +.apple-icloud.cn
+  - +.apple-itunes.cn
+  - +.apple-maps.cn
+  - +.apple-store.cn
+  - +.apple.cn
+  - +.apple.com.cn
+  - +.appleappstore.cn
+  - +.applecenter.cn
+  - +.applecenter.com.cn
+  - +.applecomputer.cn
+  - +.applecomputer.com.cn
+  - +.appledns.cn
+  - +.appledns.com.cn
+  - +.appleicloud.cn
+  - +.applepaycash.cn
+  - +.applepaycash.com.cn
+  - +.applepaysupplies.cn
+  - +.applepaysupplies.com.cn
+  - +.applesiri.cn
+  - +.applestore.cn
+  - +.applestore.com.cn
+  - +.appletv4.cn
+  - +.appletv4.com.cn
   - +.applinzi.com
   - +.applm.com
   - +.applogcdn.com
@@ -12404,6 +12471,7 @@ payload:
   - +.apps121.com
   - +.appscan.io
   - +.appsecurity.top
+  - +.appserviceenvironment.cn
   - +.appsflower.com
   - +.appsflyer-cn.com
   - +.appshike.com
@@ -12412,6 +12480,7 @@ payload:
   - +.appsina.com
   - +.appso.com
   - +.appsolution.cc
+  - +.appstoreapple.cn
   - +.apptao.com
   - +.apptaxi.net
   - +.apptrackerlink.com
@@ -12825,6 +12894,7 @@ payload:
   - +.asset-vendor-event.msi.com
   - +.asset.msi.com
   - +.assets-global.viveport.com
+  - +.assoc-amazon.cn
   - +.assrt.net
   - +.assyrb.com
   - +.astbbs.com
@@ -12846,6 +12916,7 @@ payload:
   - +.asujp.com
   - +.asurada.zone
   - +.asus-sh.com
+  - +.asus.com.cn
   - +.asussmart.com
   - +.asusw.net
   - +.asvm.net
@@ -12924,8 +12995,10 @@ payload:
   - +.atshph.com
   - +.atstudy.com
   - +.atsws.com
+  - +.att.cn
   - +.attacker.fit
   - +.attainsgroup.com
+  - +.attcorp.cn
   - +.attendees.link
   - +.atticus.vip
   - +.attomotion.com
@@ -13442,14 +13515,18 @@ payload:
   - +.azchcdnq.com
   - +.azchcdnr.com
   - +.azchcdns.com
+  - +.azcrmc-test.cn
+  - +.azcrmc.cn
   - +.azetac.com
   - +.azf010.com
   - +.azhimalayanvh.com
   - +.azhituo.com
   - +.azhubaby.com
   - +.azjy88.com
+  - +.azk8s.cn
   - +.azmcode.com
   - +.azmtszpk.com
+  - +.aznbcontent.cn
   - +.azonete.com
   - +.azooo.com
   - +.azoyacdn.com
@@ -13458,11 +13535,39 @@ payload:
   - +.azpdl.com
   - +.azpdl.net
   - +.azt365.com
+  - +.aztask.cn
+  - +.azure-api.cn
+  - +.azure-apihub.cn
+  - +.azure-automation.cn
+  - +.azure-connectedvehicles-stage.cn
+  - +.azure-connectedvehicles.cn
+  - +.azure-devices-provisioning.cn
+  - +.azure-devices.cn
+  - +.azure-dns-1.cn
+  - +.azure-dns-10.cn
+  - +.azure-dns-2.cn
+  - +.azure-dns-3.cn
+  - +.azure-dns-4.cn
+  - +.azure-dns-5.cn
+  - +.azure-dns-6.cn
+  - +.azure-dns-7.cn
+  - +.azure-dns-8.cn
+  - +.azure-dns-9.cn
+  - +.azure-dns.cn
   - +.azure-wave.com
   - +.azure.cc
+  - +.azure.cn
+  - +.azurecr-test.cn
+  - +.azurecr.cn
   - +.azureflying.com
+  - +.azurehdinsight.cn
+  - +.azureiotsuite.cn
   - +.azuremigrate.download.prss.microsoft.com
   - +.azuremigratetest.download.prss.microsoft.com
+  - +.azuremresolver.cn
+  - +.azureprivatedns.cn
+  - +.azurerms.cn
+  - +.azuresandbox.cn
   - +.azurestackhub.download.prss.microsoft.com
   - +.azurestackhubuat.download.prss.microsoft.com
   - +.azuretouch.net
@@ -13507,11 +13612,13 @@ payload:
   - +.b2byao.com
   - +.b2c.biz
   - +.b2cedu.com
+  - +.b2clogin.cn
   - +.b2clouds.com
   - +.b2jiaxiao.com
   - +.b2q.com
   - +.b2star.com
   - +.b3inside.com
+  - +.b3itech.cn
   - +.b3log.org
   - +.b3logfile.com
   - +.b555b.com
@@ -14786,7 +14893,13 @@ payload:
   - +.beasure.com
   - +.beatbeatone.com
   - +.beats-digital.com
+  - +.beats1.cn
+  - +.beats1.com.cn
+  - +.beats2.com.cn
+  - +.beats4.cn
   - +.beatsbydre.com
+  - +.beatsbydre.com.cn
+  - +.beatsep.cn
   - +.beaucare.org
   - +.beautifulbank.com
   - +.beautifullinux.com
@@ -14837,6 +14950,8 @@ payload:
   - +.behrenswatches.shop
   - +.bei1688.com
   - +.beianw.com
+  - +.beibao.cn
+  - +.beibao.com.cn
   - +.beibaobang.com
   - +.beibaozq.com
   - +.beibei.com
@@ -15141,6 +15256,8 @@ payload:
   - +.bestbeibao.com
   - +.bestblower.com
   - +.bestbrocciu.com
+  - +.bestbuy.cn
+  - +.bestbuy.com.cn
   - +.bestcdn.vip
   - +.bestcem.com
   - +.bestchoiceco.com
@@ -15742,6 +15859,7 @@ payload:
   - +.binfenyeke.com
   - +.binfenyingyu.com
   - +.binfenzhilv.com
+  - +.bing.com.cn
   - +.bing400.com
   - +.bingchenvacuum.com
   - +.bingd.com
@@ -16803,6 +16921,7 @@ payload:
   - +.blue-skylandscape.com
   - +.blue-zero.com
   - +.blue0123.com
+  - +.blueaggrestore.com
   - +.bluebeebox.com
   - +.bluebellls.com
   - +.bluebirdme.com
@@ -16815,6 +16934,7 @@ payload:
   - +.bluecatyun.com
   - +.bluecefa.com
   - +.bluecity.com
+  - +.bluecloudprod.com
   - +.blued.com
   - +.bluedgames.com
   - +.bluedhealth.com
@@ -16921,6 +17041,7 @@ payload:
   - +.bmser.com
   - +.bmshow.com
   - +.bmtrip.com
+  - +.bmw.com.cn
   - +.bmw8033.com
   - +.bmwallpaper.com
   - +.bmwchina.cloud
@@ -17003,6 +17124,7 @@ payload:
   - +.bocgi.com
   - +.bocgins.com
   - +.bochengmed.com
+  - +.bochk.com
   - +.bochkonline.com
   - +.bochyun.com
   - +.bocichina.com
@@ -17173,6 +17295,7 @@ payload:
   - +.bookersea.com
   - +.bookfedex.com
   - +.bookfeel.com
+  - +.booking.cn
   - +.booking001.com
   - +.bookingtee.com
   - +.bookinlife.net
@@ -17435,6 +17558,8 @@ payload:
   - +.bridge-image.com
   - +.bridgee.net
   - +.bridgelawfirm.com
+  - +.bridgestone.cn
+  - +.bridgestone.com.cn
   - +.brighost.com
   - +.bright-gene.com
   - +.bright-trend.com
@@ -18534,6 +18659,7 @@ payload:
   - +.caldigit.net
   - +.caledoniancable.com
   - +.calendar520.com
+  - +.calgon.cn
   - +.cali-light.com
   - +.callbei.com
   - +.callcenter88.com
@@ -18632,6 +18758,8 @@ payload:
   - +.cankaoxx.com
   - +.canlanjy.com
   - +.cannelton.org
+  - +.canon.cn
+  - +.canon.com.cn
   - +.canonpumps.com
   - +.canpdu.com
   - +.canpoint.net
@@ -19882,6 +20010,7 @@ payload:
   - +.ceeunion.com
   - +.cef114.com
   - +.ceggd.com
+  - +.cegid-cloud.cn
   - +.cehiy.com
   - +.cehome.com
   - +.cehuan.com
@@ -21434,6 +21563,10 @@ payload:
   - +.chinaclean.org
   - +.chinacleanexpo.com
   - +.chinacljt.com
+  - +.chinacloud-mobile.cn
+  - +.chinacloudapi.cn
+  - +.chinacloudapp.cn
+  - +.chinacloudsites.cn
   - +.chinacma.org
   - +.chinacmo.com
   - +.chinacoal.com
@@ -22876,6 +23009,8 @@ payload:
   - +.cirs-reach.com
   - +.cirscn.com
   - +.cisbeijing.com
+  - +.cisco.cn
+  - +.cisco.com.cn
   - +.ciscon.org
   - +.cisdish.com
   - +.cisgz.com
@@ -23177,6 +23312,8 @@ payload:
   - +.clear-sz.com
   - +.clear888.com
   - +.clearaki.com
+  - +.clearasil.cn
+  - +.clearasil.com.cn
   - +.clearcrane.com
   - +.cleargrass.com
   - +.clearmediatech.com
@@ -23593,7 +23730,6 @@ payload:
   - +.cmodel.com
   - +.cmodes.com
   - +.cmol.com
-  - +.cmpassport.com
   - +.cmpay.com
   - +.cmpe360.com
   - +.cmpedu.com
@@ -24470,6 +24606,7 @@ payload:
   - +.cnsolomo.com
   - +.cnsorl.com
   - +.cnspeed.com
+  - +.cnspeedtest.cn
   - +.cnsphoto.com
   - +.cnsrack.com
   - +.cnssr.org
@@ -24972,6 +25109,9 @@ payload:
   - +.congzhi.com
   - +.conhagroup.com
   - +.conlerpharm.com
+  - +.connectcommerce.cn
+  - +.connectcommerce.com.cn
+  - +.connectedcommerce.cn
   - +.conodmedical.com
   - +.conoha.vip
   - +.conpak.com
@@ -26998,6 +27138,8 @@ payload:
   - +.cyb-bot.com
   - +.cyb800.com
   - +.cybaojian.com
+  - +.cyber-bay.cn
+  - +.cyber-bay.com.cn
   - +.cyberspace.com
   - +.cybertogether.net
   - +.cyberway-china.net
@@ -28271,6 +28413,7 @@ payload:
   - +.dcmk17.com
   - +.dcn01.ps4.update.playstation.net
   - +.dcn01.ps5.update.playstation.net
+  - +.dcocsp.cn
   - +.dcpc.com
   - +.dcpfb.com
   - +.dcqsq.com
@@ -28584,13 +28727,17 @@ payload:
   - +.deliyun.com
   - +.dell-alw.com
   - +.dell-brand.com
+  - +.dell.com.cn
   - +.dell027.com
   - +.dellecs.com
   - +.dellemc-solution.com
+  - +.dellemc.com.cn
   - +.dellenglish.com
   - +.dellfuwuqi.com
   - +.dellhpibm.com
+  - +.dellmobile.cn
   - +.dellrsm.com
+  - +.delltechnologies.com.cn
   - +.dellzj.com
   - +.delong-group.com
   - +.delonggou.com
@@ -28716,6 +28863,7 @@ payload:
   - +.detion.com
   - +.detonfan.com
   - +.detonger.com
+  - +.dettol.com.cn
   - +.detu.com
   - +.dev-dh.com
   - +.dev59.com
@@ -28726,7 +28874,6 @@ payload:
   - +.devedu.net
   - +.develenv.com
   - +.developer.htcvive.com
-  - +.developer.microsoft.com
   - +.developer.vive.com
   - +.developers.pub
   - +.developwechat.com
@@ -29335,6 +29482,7 @@ payload:
   - +.digcredit.com
   - +.digeeker.com
   - +.digi-wo.com
+  - +.digicert.cn
   - +.digigd.com
   - +.digihail.com
   - +.digihuman.com
@@ -29543,6 +29691,7 @@ payload:
   - +.dishen.com
   - +.dishuge.com
   - +.dishuizhijia.com
+  - +.dishwashingexpert.com.cn
   - +.disimy.com
   - +.dislux.com
   - +.dislytegame.com
@@ -29940,14 +30089,8 @@ payload:
   - +.dns-url.com
   - +.dns-waf.com
   - +.dns.com
-  - +.dns.iqiyi.com
-  - +.dns.jd.com
   - +.dns.la
   - +.dns.pub
-  - +.dns.qiyipic.iqiyi.com
-  - +.dns.weibo.cn
-  - +.dns.weixin.qq.com
-  - +.dns.weixin.qq.com.cn
   - +.dns002.com
   - +.dns0755.net
   - +.dns100.net
@@ -30169,9 +30312,7 @@ payload:
   - +.dogmr.com
   - +.dogwhere.com
   - +.dogyun.com
-  - +.doh.iqiyi.com
   - +.doh.plus
-  - +.doh.ptqy.gitv.tv
   - +.doh.pub
   - +.dohai.com
   - +.dohia.com
@@ -30458,7 +30599,6 @@ payload:
   - +.dotgate.com
   - +.dothantech.com
   - +.doticloud.com
-  - +.dotserver.douyucdn.cn
   - +.dotty-china.com
   - +.dotwe.org
   - +.dou.bz
@@ -30618,8 +30758,9 @@ payload:
   - +.downke.com
   - +.downkr.com
   - +.downkuai.com
+  - +.download-cdn.jetbrains.com.cn
   - +.download.microsoft.com
-  - +.download.visualstudio.microsoft.com
+  - +.download.windowsupdate.com
   - +.downloads.ltd
   - +.downok.com
   - +.downos.com
@@ -31168,6 +31309,7 @@ payload:
   - +.duolexing.com
   - +.duolexq.com
   - +.duoliheng.com
+  - +.duolingo.cn
   - +.duoliucui.com
   - +.duoluodeyu.com
   - +.duomai.com
@@ -31235,6 +31377,8 @@ payload:
   - +.duplo-shandong.com
   - +.dur9.com
   - +.duread8.com
+  - +.durex.com.cn
+  - +.durexchina.com.cn
   - +.durkcell.com
   - +.durkeesox.net
   - +.durkflex.net
@@ -31496,6 +31640,7 @@ payload:
   - +.dymusictape.com
   - +.dymusicvideo.com
   - +.dynabook-dbh.com
+  - +.dynamics.cn
   - +.dynavolt.net
   - +.dynguyeniq.com
   - +.dyonr.com
@@ -32008,6 +32153,28 @@ payload:
   - +.ebaoquan.org
   - +.ebaotech.com
   - +.ebasset.com
+  - +.ebay.cn
+  - +.ebay.com.cn
+  - +.ebay.net.cn
+  - +.ebay.org.cn
+  - +.ebay.yn.cn
+  - +.ebay.zj.cn
+  - +.ebayadvertising.cn
+  - +.ebayclassifieds.cn
+  - +.ebayclassifieds.com.cn
+  - +.ebaydesc.cn
+  - +.ebaydesc.com.cn
+  - +.ebaydns.cn
+  - +.ebayenterprise.cn
+  - +.ebayenterprise.com.cn
+  - +.ebaymotors.cn
+  - +.ebaymotors.com.cn
+  - +.ebaypedia.cn
+  - +.ebaypedia.com.cn
+  - +.ebayshopping.cn
+  - +.ebayshopping.com.cn
+  - +.ebaystatic.cn
+  - +.ebaystores.cn
   - +.ebchina.com
   - +.ebchinaintl.com
   - +.ebchinatech.com
@@ -32099,6 +32266,7 @@ payload:
   - +.ecerdns.com
   - +.ecerimg.com
   - +.ecf-gov.com
+  - +.ecgapp.com.cn
   - +.ecgci.com
   - +.ecgoods.com
   - +.ecgtool.com
@@ -32873,6 +33041,7 @@ payload:
   - +.emr-volces.com
   - +.ems-audio.com
   - +.ems517.com
+  - +.emsec.hk
   - +.emsepc.com
   - +.emshost.com
   - +.emshua.com
@@ -32931,12 +33100,14 @@ payload:
   - +.enet369.com
   - +.enetedu.com
   - +.enfi.vip
+  - +.enfinitas.com.cn
   - +.enflame-tech.com
   - +.enfodesk.com
   - +.enforever.com
   - +.eng24.com
   - +.engeniustec.com
   - +.engeyuan.com
+  - +.engkoo.com
   - +.engley.com
   - +.englibrary.com
   - +.english163.com
@@ -33437,6 +33608,8 @@ payload:
   - +.etmoc.com
   - +.etmtoy.com
   - +.etmwanju.com
+  - +.etnet.com.cn
+  - +.etnetchina.com.cn
   - +.etocrm.com
   - +.etolies.com
   - +.etomlink.com
@@ -34003,6 +34176,7 @@ payload:
   - +.facephoto.com
   - +.faceplusplus.com
   - +.facernt.com
+  - +.faceshift.cn
   - +.faceu.com
   - +.faceu.mobi
   - +.faceu.net
@@ -34365,6 +34539,9 @@ payload:
   - +.farenhui.com
   - +.farennews.com
   - +.farerdak.com
+  - +.farfetch.cn
+  - +.farfetch.com.cn
+  - +.farfetch.net.cn
   - +.farfir.com
   - +.farisl.com
   - +.farmasino.com
@@ -35177,6 +35354,7 @@ payload:
   - +.financetcloud.com
   - +.financeun.com
   - +.financialdatamining.com
+  - +.financialsoccer.com.cn
   - +.financialstreetforum.com
   - +.finchina.com
   - +.finclip.com
@@ -35224,6 +35402,7 @@ payload:
   - +.fingertc.com
   - +.fingu.com
   - +.fingu.net
+  - +.finish.com.cn
   - +.finjetchemical.com
   - +.finndy.com
   - +.finogeeks.com
@@ -36106,6 +36285,7 @@ payload:
   - +.frontjs.com
   - +.frontopbd.com
   - +.frontpharm.com
+  - +.frontrow.com.cn
   - +.frontstreetcoffee.com
   - +.frontwize.com
   - +.frost-s.com
@@ -38145,6 +38325,7 @@ payload:
   - +.geewaza.com
   - +.geexek.com
   - +.geezn.com
+  - +.geforce.cn
   - +.gefund.com.cn
   - +.gegame.site
   - +.gegeailu.org
@@ -38992,6 +39173,7 @@ payload:
   - +.gifu-pr.com
   - +.giga-da.com
   - +.giga-science.com
+  - +.gigabyte.cn
   - +.gigaget.com
   - +.gigbl.com
   - +.gigpayroll.com
@@ -39351,6 +39533,8 @@ payload:
   - +.globalpingbao.com
   - +.globalrdp.cn
   - +.globalscanner.com
+  - +.globalsign.cn
+  - +.globalsign.com
   - +.globalsigncdn.com
   - +.globalslb.net
   - +.globalso.com
@@ -40126,6 +40310,7 @@ payload:
   - +.gptkong.com
   - +.gpubgm.com
   - +.gpuez.com
+  - +.gputechconf.cn
   - +.gpuztrvt.com
   - +.gpxiv5kew4mvk.com
   - +.gpxxz.com
@@ -40801,6 +40986,7 @@ payload:
   - +.guba163.com
   - +.gubaike.com
   - +.gubo.org
+  - +.gucci.cn
   - +.gucciblog.net
   - +.guccistar.com
   - +.gucheng.com
@@ -44336,6 +44522,7 @@ payload:
   - +.halade.com
   - +.halcyonz.com
   - +.halead.com
+  - +.half.com.cn
   - +.halfrost.com
   - +.haligame.com
   - +.halihali9.com
@@ -45677,6 +45864,7 @@ payload:
   - +.hdhosp.com
   - +.hdhospital.com
   - +.hdhui.com
+  - +.hdinsightservices.cn
   - +.hditec.com
   - +.hdj.me
   - +.hdjad.com
@@ -45706,7 +45894,6 @@ payload:
   - +.hdmtv168.com
   - +.hdmv.org
   - +.hdnd01.com
-  - +.hdns.ksyun.com
   - +.hdnychina.com
   - +.hdp88.com
   - +.hdph.com
@@ -46245,6 +46432,7 @@ payload:
   - +.hepingdao.net
   - +.hepmall.com
   - +.hepost.com
+  - +.heptio.cn
   - +.hepu123.com
   - +.hepurc.com
   - +.hepuwang.com
@@ -47339,6 +47527,7 @@ payload:
   - +.hlzzkj.com
   - +.hm-3223.net
   - +.hm-optics.com
+  - +.hm.com.cn
   - +.hm025.com
   - +.hm120.com
   - +.hm152n.com
@@ -47936,6 +48125,7 @@ payload:
   - +.homekoocdn.com
   - +.homelandhotel.com
   - +.homelandol.com
+  - +.homepod.cn
   - +.homesir110.com
   - +.hometex114.com
   - +.hometexjoin.com
@@ -48431,6 +48621,7 @@ payload:
   - +.hprx.com
   - +.hps-sh.com
   - +.hpstore.cc
+  - +.hpstore.cn
   - +.hptea.com
   - +.hpv112.com
   - +.hpwin.com
@@ -48862,41 +49053,6 @@ payload:
   - +.httingshu.com
   - +.httpcanary.com
   - +.httpcn.com
-  - +.httpdns-api.aliyuncs.com
-  - +.httpdns-browser.platform.dbankcloud.cn
-  - +.httpdns-sc.aliyuncs.com
-  - +.httpdns-sdk.n.netease.com
-  - +.httpdns.alicdn.com
-  - +.httpdns.baidu.com
-  - +.httpdns.baidubce.com
-  - +.httpdns.bcelive.com
-  - +.httpdns.bilivideo.com
-  - +.httpdns.browser.miui.com
-  - +.httpdns.c.cdnhwc2.com
-  - +.httpdns.cctv.com
-  - +.httpdns.danuoyi.tbcache.com
-  - +.httpdns.gslb.yy.com
-  - +.httpdns.huaweicloud.com
-  - +.httpdns.kg.qq.com
-  - +.httpdns.kwd.inkuai.com
-  - +.httpdns.meituan.com
-  - +.httpdns.music.163.com
-  - +.httpdns.n.netease.com
-  - +.httpdns.n.shifen.com
-  - +.httpdns.ocloud.heytapmobi.com
-  - +.httpdns.ocloud.oppomobile.com
-  - +.httpdns.platform.dbankcloud.cn
-  - +.httpdns.platform.dbankcloud.com
-  - +.httpdns.pro
-  - +.httpdns.push.heytapmobi.com
-  - +.httpdns.push.oppomobile.com
-  - +.httpdns.volcengineapi.com
-  - +.httpdns.yunxindns.com
-  - +.httpdns.zhihu.com
-  - +.httpdns.zybang.com
-  - +.httpdns1.cc.cdnhwc5.com
-  - +.httpdnsvip.meituan.com
-  - +.httpsdns.baidu.com
   - +.httpsok.com
   - +.httpssl.com
   - +.htucloud.com
@@ -51562,7 +51718,11 @@ payload:
   - +.iclickstatic.com
   - +.icliexpo.com
   - +.icljt.com
+  - +.icloud-apple.cn
   - +.icloud-power.com
+  - +.icloud.com.cn
+  - +.icloud.net.cn
+  - +.icloudapple.cn
   - +.icloudcity.com
   - +.icloudgslb.com
   - +.icloudnative.io
@@ -51950,6 +52110,7 @@ payload:
   - +.ifanrusercontent.com
   - +.ifanrx.com
   - +.ifareast.com
+  - +.ifastps.com.cn
   - +.ifatrabbit.com
   - +.ifaxin.com
   - +.ifaxin.org
@@ -52333,6 +52494,7 @@ payload:
   - +.ikcw.com
   - +.ikdmjx.com
   - +.ike-global.com
+  - +.ikea.cn
   - +.ikebukuro777.org
   - +.ikeled.com
   - +.ikemeng.com
@@ -52846,6 +53008,9 @@ payload:
   - +.ingdan.com
   - +.ingeek.com
   - +.ingenic.com
+  - +.ingka-dt.cn
+  - +.ingka-internal.cn
+  - +.ingka-system.cn
   - +.ingkee.com
   - +.ingping.com
   - +.ingping.net
@@ -52962,6 +53127,7 @@ payload:
   - +.insagee.com
   - +.insarticle.com
   - +.inshion.com
+  - +.insidear.cn
   - +.insigma-elec.com
   - +.insistence.tech
   - +.insmoin.com
@@ -52997,6 +53163,7 @@ payload:
   - +.integrity-funds.com
   - +.intekey.com
   - +.intel-space.com
+  - +.intel.cn
   - +.intelcupid.com
   - +.intelligen.ltd
   - +.intelligence-electricity.net
@@ -53217,6 +53384,7 @@ payload:
   - +.ipfsbit.com
   - +.ipgoal.com
   - +.ipguishu.com
+  - +.iphone-8.com.cn
   - +.iphonediule.com
   - +.ipidea.io
   - +.ipidea.net
@@ -53247,6 +53415,7 @@ payload:
   - +.ipo1688.com
   - +.ipo3.com
   - +.ipoceo.com
+  - +.ipod.com.cn
   - +.iposeidongame.com
   - +.ipostalcode.com
   - +.ipple.net
@@ -53289,6 +53458,7 @@ payload:
   - +.ipv6testingcenter.com
   - +.ipwuji.com
   - +.ipyy.com
+  - +.iq.com
   - +.iq123.com
   - +.iq33.com
   - +.iqalliance.org
@@ -53820,6 +53990,10 @@ payload:
   - +.ituad.com
   - +.ituchong.com
   - +.ituite.com
+  - +.itunes-apple.cn
+  - +.itunesapple.cn
+  - +.itunesradio.cn
+  - +.itunesradio.com.cn
   - +.ituopeng.com
   - +.iturco.com
   - +.itutu.tv
@@ -54116,6 +54290,7 @@ payload:
   - +.iyz168.com
   - +.izacholsm.com
   - +.izaodao.com
+  - +.izatcloud.net
   - +.izazamall.com
   - +.izb.pub
   - +.izdatatech.com
@@ -58406,6 +58581,7 @@ payload:
   - +.jusssportsvenue.com
   - +.jusstickets.com
   - +.jussyun.com
+  - +.just-do-it.cn
   - +.just-plain.fun
   - +.just4coding.com
   - +.just4fun.site
@@ -59483,6 +59659,7 @@ payload:
   - +.kashengauto.com
   - +.kasitesoft.com
   - +.kaslyju.com
+  - +.kaspersky.com.cn
   - +.kasscloud.com
   - +.kata.com.cn
   - +.kataliya.net
@@ -59994,6 +60171,8 @@ payload:
   - +.kiinii.com
   - +.kiiyi.com
   - +.kijifept.com
+  - +.kijijidns.cn
+  - +.kijijidns.com.cn
   - +.kikiwon.com
   - +.kikoplay.fun
   - +.kikusuitape.com
@@ -60019,7 +60198,10 @@ payload:
   - +.kina.cc
   - +.kinbull.com
   - +.kindechem.com
+  - +.kindle.cn
   - +.kindlelib.com
+  - +.kindleoasis.cn
+  - +.kindleoasis.com.cn
   - +.kindobest.com
   - +.kindsoft.net
   - +.king-capital.com
@@ -61001,7 +61183,6 @@ payload:
   - +.kuaishiedu.com
   - +.kuaishou.cn
   - +.kuaishou.com
-  - +.kuaishou.httpdns.pro
   - +.kuaishouapp.com
   - +.kuaishouapp.net
   - +.kuaishouapps.com
@@ -64062,6 +64243,8 @@ payload:
   - +.livemediav.com
   - +.livemook.com
   - +.livenmall.com
+  - +.livephotos.cn
+  - +.livephotos.com.cn
   - +.livesone.net
   - +.livesupport24x7.com
   - +.liveuc.net
@@ -64460,7 +64643,6 @@ payload:
   - +.loexu.com
   - +.loftcn.com
   - +.lofter.com
-  - +.lofter.httpdns.c.163.com
   - +.loftshine.com
   - +.lofu.net
   - +.log-research.com
@@ -64763,6 +64945,7 @@ payload:
   - +.loudseas.com
   - +.louge.ltd
   - +.louislivi.com
+  - +.louisvuitton.cn
   - +.loukky.com
   - +.loulanwang.com
   - +.loupan.com
@@ -64810,6 +64993,7 @@ payload:
   - +.lovepd.com
   - +.loverdoor.com
   - +.lovesec.com
+  - +.lovesexdurex.cn
   - +.loveshang.com
   - +.lovesoo.org
   - +.lovestu.com
@@ -65747,6 +65931,7 @@ payload:
   - +.lymarathon.com
   - +.lymmasu.xyz
   - +.lymy1684.com
+  - +.lync.cn
   - +.lynkco-test.com
   - +.lynkco.com
   - +.lynlzqy.com
@@ -65777,6 +65962,8 @@ payload:
   - +.lysk.net
   - +.lysksw.com
   - +.lyslsw.com
+  - +.lysol.cn
+  - +.lysol.com.cn
   - +.lysq.com
   - +.lysqzs.com
   - +.lysswjt.com
@@ -66137,6 +66324,8 @@ payload:
   - +.macaumonthly.net
   - +.macauo2o.com
   - +.macaupass.com
+  - +.macbookair.cn
+  - +.macbookair.com.cn
   - +.maccms.site
   - +.maccmsbox.com
   - +.maccura.com
@@ -66237,6 +66426,7 @@ payload:
   - +.magicwinmail.com
   - +.magireco.moe
   - +.magma.ink
+  - +.magnoliaav.com.cn
   - +.magnotel.com
   - +.magook.com
   - +.magpiepharma.com
@@ -66465,6 +66655,8 @@ payload:
   - +.mamsh.org
   - +.mamumall.com
   - +.man6.org
+  - +.management-azure-devices-provisioning.cn
+  - +.management-azure-devices.cn
   - +.managershare.com
   - +.manamana.net
   - +.manben.com
@@ -66749,6 +66941,8 @@ payload:
   - +.masszxyy.com
   - +.masteam.com
   - +.master-home.com
+  - +.mastercard.cn
+  - +.mastercard.com.cn
   - +.mastercardnucc.com
   - +.masterchefworks.com
   - +.masterfy.com
@@ -66966,10 +67160,13 @@ payload:
   - +.mcc460.pub.3gppnetwork.org
   - +.mccbim.com
   - +.mccchina.com
+  - +.mcchcdn.com
   - +.mccshhospital.com
   - +.mcd.cc
+  - +.mcd.cn
   - +.mcdchina.net
   - +.mcdemo.show
+  - +.mcdonalds.com.cn
   - +.mcdsusan.com
   - +.mcdvisa.com
   - +.mcearnmore.com
@@ -67101,6 +67298,7 @@ payload:
   - +.me361.com
   - +.me4399.com
   - +.meadin.com
+  - +.meadjohnson.com.cn
   - +.meaningfulcloud.com
   - +.meanwell.cc
   - +.meb.com
@@ -67774,6 +67972,7 @@ payload:
   - +.mgm255.com
   - +.mgmgrandsanya.com
   - +.mgmovie.net
+  - +.mgmt-azure-api.cn
   - +.mgmusic.vip
   - +.mgnav.com
   - +.mgobe-webattle.com
@@ -67990,7 +68189,23 @@ payload:
   - +.micronetpay.com
   - +.microrui.net
   - +.microsate.com
+  - +.microsoft-smb.cn
+  - +.microsoftazurestatus.cn
+  - +.microsoftmetrics.cn
+  - +.microsoftnews.cn
+  - +.microsoftonline-i.cn
+  - +.microsoftonline-m-i.cn
+  - +.microsoftonline-m.cn
+  - +.microsoftonline-p-i.cn
+  - +.microsoftonline-p-i.net.cn
+  - +.microsoftonline-p.cn
+  - +.microsoftonline-p.net.cn
+  - +.microsoftonline.cn
+  - +.microsoftreactor.cn
+  - +.microsoftreactor.com.cn
   - +.microsoftsa.com
+  - +.microsoftstore.com.cn
+  - +.microsofttranslator-int.cn
   - +.microstarsoft.com
   - +.microstern.com
   - +.microsword.net
@@ -68362,6 +68577,8 @@ payload:
   - +.minirizhi.com
   - +.minisforum.com
   - +.minishops.co
+  - +.miniso.cn
+  - +.minisohome.cn
   - +.minisoyo.com
   - +.ministudy.com
   - +.minitiao.com
@@ -68385,6 +68602,7 @@ payload:
   - +.minshengjob.com
   - +.minshenglife.com
   - +.minshop.com
+  - +.minsio.cn
   - +.minstrans.com
   - +.mintaibank.com
   - +.mintake.com
@@ -68757,6 +68975,7 @@ payload:
   - +.mnbvbqw.com
   - +.mnbvdfg.com
   - +.mnbvtgv.com
+  - +.mncmsidlab1.cn
   - +.mndqlib.net
   - +.mnengine.com
   - +.mnfqw.org
@@ -68808,6 +69027,7 @@ payload:
   - +.mobilebone.org
   - +.mobilegamebase.com
   - +.mobilegamecdn.com
+  - +.mobileinternational.com.cn
   - +.mobilelegends.com
   - +.mobilemgr-global.com
   - +.mobilemgr-global.net
@@ -69175,6 +69395,7 @@ payload:
   - +.morningwhistle.com
   - +.morong-elec.com
   - +.morstar.net
+  - +.mortein.cn
   - +.moschat.com
   - +.moseacg.com
   - +.moseeker.com
@@ -69230,6 +69451,7 @@ payload:
   - +.mova-tech.com
   - +.movcam.com
   - +.movebroad.com
+  - +.movefree.cn
   - +.movelaser.com
   - +.movesky.net
   - +.movie365.tv
@@ -69379,9 +69601,13 @@ payload:
   - +.ms6666111.com
   - +.ms7caryw5i48t.com
   - +.msanjia.com
+  - +.msappproxy.cn
+  - +.msauth.cn
+  - +.msauthimages.cn
   - +.msbank.com
   - +.mscbsc.com
   - +.mscdntrip.com
+  - +.mschcdn.com
   - +.mscland.org
   - +.mscodecloud.com
   - +.msd-facing.com
@@ -69395,6 +69621,9 @@ payload:
   - +.msdprc.com
   - +.msdprod-ad.download.prss.microsoft.com
   - +.msfpay.com
+  - +.msftauth.cn
+  - +.msftauthimages.cn
+  - +.msftcloudes.cn
   - +.msftonlinelab.com
   - +.msg.work
   - +.msgamego.com
@@ -69412,6 +69641,8 @@ payload:
   - +.mshouyou.com
   - +.mshw.net
   - +.mshxw.com
+  - +.msidentity.cn
+  - +.msidlabpbmc.cn
   - +.msits.com
   - +.msjingmi.com
   - +.msjpay.com
@@ -69425,13 +69656,16 @@ payload:
   - +.msmartlife.cn
   - +.msmartlife.com
   - +.msmbjp.com
+  - +.msn.cn
   - +.msndvr.com
   - +.msny.cc
   - +.msolok.com
   - +.mspace.cc
   - +.mspacecd.com
   - +.mspharm.com
+  - +.mspil.cn
   - +.msproduct.download.prss.microsoft.com
+  - +.msra.cn
   - +.msstatic.com
   - +.mst-jc.com
   - +.mstatik.com
@@ -69575,6 +69809,7 @@ payload:
   - +.muimg.com
   - +.muin.cc
   - +.muinsoft.com
+  - +.muji.com.cn
   - +.mujiangquan.com
   - +.mujihotel-beijing.com
   - +.mujin.net
@@ -69627,7 +69862,6 @@ payload:
   - +.musestudio.net
   - +.musetransfer.com
   - +.mushafa.net
-  - +.music.httpdns.c.163.com
   - +.music4x.com
   - +.musicchina-expo.com
   - +.musiccia.com
@@ -69972,6 +70206,7 @@ payload:
   - +.myie9.com
   - +.myilibrary.com
   - +.myimis.com
+  - +.myip.la
   - +.myiplay.com
   - +.myir-tech.com
   - +.myirtech.com
@@ -70060,6 +70295,7 @@ payload:
   - +.myqcloud.com
   - +.myqcloud.net
   - +.myqee.com
+  - +.myqnapcloud.cn
   - +.myqqdd.com
   - +.myqqjd.com
   - +.myr9.com
@@ -70994,6 +71230,7 @@ payload:
   - +.netswise.com
   - +.netsyq.com
   - +.netvp.net
+  - +.network-auth.cn
   - +.network-hk.com
   - +.networkesl.com
   - +.networklo.com
@@ -71413,7 +71650,26 @@ payload:
   - +.niiwoo.com
   - +.nikanpian.com
   - +.nike-inc.com.tw
+  - +.nike-shox.cn
+  - +.nike.cn
+  - +.nikebetterworld.cn
+  - +.nikebetterworld.com.cn
+  - +.nikechina.cn
   - +.nikefans.com
+  - +.nikegolf.cn
+  - +.nikeid.cn
+  - +.nikeid.com.cn
+  - +.nikeinc.com.cn
+  - +.nikelab.cn
+  - +.nikelab.com.cn
+  - +.nikeliuxiang.cn
+  - +.nikeliuxiang.com.cn
+  - +.nikemall.cn
+  - +.nikemall.com.cn
+  - +.nikerunclub.cn
+  - +.nikerunclub.com.cn
+  - +.nikerunning.com.cn
+  - +.nikestore.cn
   - +.nikkisoft.com
   - +.nikkiup2u2.com
   - +.nikkon-china.com
@@ -72564,6 +72820,7 @@ payload:
   - +.nokia-sbell.com
   - +.nokia.press
   - +.nokia88.com
+  - +.nokiantyres.cn
   - +.noknok.cn
   - +.nokurack.com
   - +.nolanchou.com
@@ -73006,6 +73263,8 @@ payload:
   - +.nuptec.com
   - +.nuqixi.com
   - +.nuqk.com
+  - +.nurofen.cn
+  - +.nurofen.com.cn
   - +.nurotron.com
   - +.nursesky.com
   - +.nusudia.org
@@ -73035,6 +73294,7 @@ payload:
   - +.nvhaiz.com
   - +.nvhuangmm.com
   - +.nvidia-china.com
+  - +.nvidia.cn
   - +.nvkan.com
   - +.nvpuse.com
   - +.nvpuwo.com
@@ -73195,6 +73455,8 @@ payload:
   - +.o2packs.com
   - +.o2pcn.com
   - +.o2ting.com
+  - +.o365cn.com
+  - +.o365files.cn
   - +.o37o.net
   - +.o3ndix.com
   - +.o571.com
@@ -73346,6 +73608,7 @@ payload:
   - +.oemresource.com
   - +.oemsoc.download.prss.microsoft.com
   - +.oemsocuat.download.prss.microsoft.com
+  - +.oemssl.cn
   - +.oemssl.cn.cdn.cloudflare.net
   - +.oeob.net
   - +.oepamvxq.com
@@ -73365,6 +73628,8 @@ payload:
   - +.office-cn.net
   - +.office-kagu1.com
   - +.office-peixun.com
+  - +.office365-net.cn
+  - +.office365.cn
   - +.office68.com
   - +.office8hour.com
   - +.officeaid.com
@@ -73375,8 +73640,10 @@ payload:
   - +.officectrl.com
   - +.officemkt.download.prss.microsoft.com
   - +.officemktuat.download.prss.microsoft.com
+  - +.officeplus.cn
   - +.officese.com
   - +.officeweb365.com
+  - +.officewebapps.cn
   - +.officezhushou.com
   - +.officezy.com
   - +.offodd.com
@@ -73738,6 +74005,7 @@ payload:
   - +.onlyrubberparts.com
   - +.onlystem.com
   - +.onlywem.com
+  - +.onmschina.cn
   - +.onnets1.xyz
   - +.ono-bbb.com
   - +.onochem.com
@@ -74270,6 +74538,7 @@ payload:
   - +.outfit7.net
   - +.outlets365.com
   - +.outletscn.com
+  - +.outlook.cn
   - +.outman.press
   - +.outsoo.com
   - +.ouvps.com
@@ -74553,6 +74822,7 @@ payload:
   - +.panaihua.com
   - +.panasiashipping.com
   - +.panasonic-door.com
+  - +.panasonic.cn
   - +.panasonicmall.com
   - +.panawincn.com
   - +.panbaidu.net
@@ -74813,6 +75083,12 @@ payload:
   - +.paylf.com
   - +.paympay.com
   - +.paynews.net
+  - +.paypal.com.cn
+  - +.paypal.net.cn
+  - +.paypal.org.cn
+  - +.paypalcommunity.cn
+  - +.paypalhere.cn
+  - +.paypalhere.com.cn
   - +.paypaytech.com
   - +.pb89.com
   - +.pbc-dcep.com
@@ -74822,6 +75098,7 @@ payload:
   - +.pbchizhou.com
   - +.pbdpw.com
   - +.pbiso.com
+  - +.pbiwebcontent.cn
   - +.pbkrs.com
   - +.pblie.com
   - +.pbqdhty.com
@@ -75505,6 +75782,7 @@ payload:
   - +.ping-qu.com
   - +.ping99.com
   - +.pingan.com
+  - +.pingan.com.hk
   - +.pingancdn.com
   - +.pinganfang.com
   - +.pinganfu.net
@@ -76092,8 +76370,12 @@ payload:
   - +.power86.com
   - +.power8t.com
   - +.powerapp.io
+  - +.powerapps.cn
+  - +.powerappsportals.cn
+  - +.powerautomate.cn
   - +.powerbeijing-ec.com
   - +.powerbeijing.com
+  - +.powerbi.cn
   - +.powerbibbs.com
   - +.powercdn.com
   - +.powerchina-intl.com
@@ -76284,6 +76566,8 @@ payload:
   - +.pr027.com
   - +.pr0771.com
   - +.pr1bg.com
+  - +.practicalmoneyskills.cn
+  - +.practicalmoneyskills.com.cn
   - +.pradabao.com
   - +.pratic-cnc.com
   - +.prayaya.com
@@ -76307,12 +76591,17 @@ payload:
   - +.prfc-cn.com
   - +.prfog.com
   - +.prhljt.com
+  - +.priceless.com.cn
+  - +.pricelessbeijing.cn
+  - +.pricelessbeijing.com.cn
   - +.pricl.com
   - +.primadiagnostic.com
   - +.primarychina.com
   - +.prime-care.com
   - +.prime-semi.com
   - +.prime3c.com
+  - +.primeday.cn
+  - +.primeday.com.cn
   - +.primegene.net
   - +.primerachina.com
   - +.primeton.com
@@ -76375,6 +76664,8 @@ payload:
   - +.pros-view.com
   - +.prositsole.com
   - +.prostar-cn.com
+  - +.prostores.cn
+  - +.prostores.com.cn
   - +.protect-file.com
   - +.protong.com
   - +.protontechcn.com
@@ -76899,6 +77190,7 @@ payload:
   - +.qcenglish.com
   - +.qcers.com
   - +.qcers.net
+  - +.qceventscenter.com.cn
   - +.qcgm.net
   - +.qcgq168.com
   - +.qchcm.com
@@ -78297,6 +78589,7 @@ payload:
   - +.qlhimalayantm.com
   - +.qlidc.com
   - +.qlife-lab.com
+  - +.qlinkto.cn
   - +.qlinyun.com
   - +.qlippie.com
   - +.qlisten.cn
@@ -78373,6 +78666,7 @@ payload:
   - +.qmzhibo.com
   - +.qmzs.com
   - +.qnali.com
+  - +.qnap.com.cn
   - +.qnapcn.com
   - +.qnbar.com
   - +.qncd.com
@@ -78780,6 +79074,7 @@ payload:
   - +.qua.com
   - +.quaita.com
   - +.qualcomm-challenge.com
+  - +.qualcomm.cn
   - +.qualcomm.cn.cdn.cloudflare.net
   - +.qualtekgz.com
   - +.quan.mx
@@ -79157,6 +79452,7 @@ payload:
   - +.quickbass.com
   - +.quickcan.com
   - +.quickcep.com
+  - +.quickconnect.cn
   - +.quickddns.com
   - +.quickdetection.com
   - +.quickingdata.com
@@ -79977,6 +80273,7 @@ payload:
   - +.reachwin.net
   - +.react-china.org
   - +.react.mobi
+  - +.reactorms.com.cn
   - +.read678.com
   - +.readboy.com
   - +.readceo.com
@@ -80040,6 +80337,8 @@ payload:
   - +.rechulishebei.com
   - +.recitymedia.com
   - +.reckfeng.com
+  - +.reckittbenckiser.cn
+  - +.reckittbenckiser.com.cn
   - +.recodeal.com
   - +.recolighting.com
   - +.reconova.com
@@ -80298,6 +80597,8 @@ payload:
   - +.reqable.com
   - +.reqgvheo.com
   - +.rergdfh.com
+  - +.researchkit.cn
+  - +.researchkit.com.cn
   - +.reseetech.com
   - +.resemi.com
   - +.reservehemu.com
@@ -80884,6 +81185,7 @@ payload:
   - +.rpaii.com
   - +.rpfieldcdn.com
   - +.rpg99.com
+  - +.rpglogs.cn
   - +.rpgmoba.com
   - +.rpo5156.com
   - +.rprnolz.com
@@ -81646,6 +81948,7 @@ payload:
   - +.samsunganycar.com
   - +.samsungcloudcn.com
   - +.samsungconnectivity.com
+  - +.samsungeshop.com.cn
   - +.samsunghealthcn.com
   - +.samsungroaming.com
   - +.samsungyx.com
@@ -81682,6 +81985,7 @@ payload:
   - +.sandeepin.com
   - +.sandegroup.com
   - +.sandinggas.com
+  - +.sandisk.cn
   - +.sandload.com
   - +.sanduoyun.com
   - +.sanen.online
@@ -84062,6 +84366,7 @@ payload:
   - +.sharelogis.com
   - +.sharemoon.club
   - +.shareoneplanet.org
+  - +.sharepoint.cn
   - +.sharesdk.cn
   - +.sharesdns.com
   - +.sharetome.com
@@ -85044,6 +85349,7 @@ payload:
   - +.shop2cn.com
   - +.shopbackdrop.com
   - +.shopchaoren.com
+  - +.shopee.cn
   - +.shopeesell.com
   - +.shopeesz.com
   - +.shopex123.com
@@ -87731,6 +88037,12 @@ payload:
   - +.sped-ssss-pppp-eeee-dddd.com
   - +.speechless.pw
   - +.speed-hz.com
+  - +.speed.neu6.edu.cn
+  - +.speed.nju.edu.cn
+  - +.speed.nuaa.edu.cn
+  - +.speed.qlu.edu.cn
+  - +.speed.ujs.edu.cn
+  - +.speed6.ujs.edu.cn
   - +.speedaf.com
   - +.speedcdns.com
   - +.speedcdns.info
@@ -87741,6 +88053,11 @@ payload:
   - +.speednt.com
   - +.speedpdf.com
   - +.speedsz.net
+  - +.speedtest.cn
+  - +.speedtest.mfcyun.com
+  - +.speedtest.shu.edu.cn
+  - +.speedtest.xaut.edu.cn
+  - +.speedtest6.shu.edu.cn
   - +.speedws.com
   - +.speedws.info
   - +.speedws.org
@@ -88029,6 +88346,7 @@ payload:
   - +.sslchaoshi.com
   - +.sslchina.com
   - +.sslcity.com
+  - +.sslcom.cn
   - +.ssldun.com
   - +.ssldun.vip
   - +.ssleye.com
@@ -88304,6 +88622,7 @@ payload:
   - +.stlb520.com
   - +.stmaoyi.com
   - +.stmbuy.com
+  - +.stmicroelectronics.com.cn
   - +.stmjsociety.com
   - +.stmybj.com
   - +.stnn.cc
@@ -88370,6 +88689,8 @@ payload:
   - +.streamcomputing.com
   - +.streamlakeapi.com
   - +.streffy.com
+  - +.strepsils.cn
+  - +.strepsils.com.cn
   - +.strinova.com
   - +.strong-light.com
   - +.strong-study.com
@@ -89124,6 +89445,8 @@ payload:
   - +.swifthumb.com
   - +.swiftjava.com
   - +.swiftlet.net
+  - +.swiftui.cn
+  - +.swiftui.com.cn
   - +.swijoy.com
   - +.swip.group
   - +.swirebev.com
@@ -89552,6 +89875,7 @@ payload:
   - +.synochip.com
   - +.synodc.com
   - +.synology-cn.com
+  - +.synology.cn
   - +.synologyssb.com
   - +.syntao.com
   - +.synyan.net
@@ -91509,6 +91833,7 @@ payload:
   - +.teamshub.com
   - +.teamtop.com
   - +.teamtopgame.com
+  - +.teamviewer.cn
   - +.teandy.com
   - +.teatreexy.com
   - +.tebaidu.com
@@ -91985,6 +92310,7 @@ payload:
   - +.tepin.hk
   - +.terabuy.com
   - +.terapark.com
+  - +.terapeak.cn
   - +.terapines.com
   - +.terencemusic.com
   - +.teridge.com
@@ -92004,9 +92330,17 @@ payload:
   - +.teshuzi.com
   - +.tesight.com
   - +.tesiro.com
+  - +.tesla.cn
+  - +.tesla.com.cn
+  - +.teslamotors.cn
+  - +.teslamotors.com.cn
   - +.tesolsh.com
   - +.tesoon.com
   - +.test-cignacmb.com
+  - +.test.nju.edu.cn
+  - +.test.ustc.edu.cn
+  - +.test6.nju.edu.cn
+  - +.test6.ustc.edu.cn
   - +.testbird.com
   - +.testcoo.com
   - +.testdemo.work
@@ -93977,6 +94311,7 @@ payload:
   - +.trae.cn
   - +.trae.com.cn
   - +.trae.guru
+  - +.trafficmanager.cn
   - +.traineexp.com
   - +.trainingipv6.com
   - +.trainnets.com
@@ -94019,6 +94354,7 @@ payload:
   - +.tratao.com
   - +.travel-x.cc
   - +.travel6.co.uk
+  - +.travelex.com.cn
   - +.travelgo.com
   - +.traveling-exhibitions.com
   - +.travellaureate.com
@@ -94162,9 +94498,11 @@ payload:
   - +.trusple.com
   - +.trust-mro.com
   - +.trust-one.com
+  - +.trust-provider.cn
   - +.trust400.com
   - +.trusta-lawyer.com
   - +.trustasia.com
+  - +.trustcenter.cn
   - +.trustcn.com
   - +.trustdecision.com
   - +.trustedsign.com
@@ -94802,6 +95140,7 @@ payload:
   - +.tvapk.com
   - +.tvapk.net
   - +.tvbbj.com
+  - +.tvbc.com.cn
   - +.tvblack.com
   - +.tvcbj.com
   - +.tvcbook.com
@@ -95269,6 +95608,8 @@ payload:
   - +.ublese.com
   - +.ubmconlinereg.com
   - +.ubmsinoexpo.com
+  - +.ubnt.com
+  - +.ubnt.com.cn
   - +.uboat100.com
   - +.uborn.net
   - +.uboxol.com
@@ -95489,6 +95830,7 @@ payload:
   - +.uhut.com
   - +.uhzcdn.com
   - +.ui-lab.com
+  - +.ui.com.cn
   - +.ui100day.com
   - +.ui63.com
   - +.uibep.com
@@ -95774,6 +96116,7 @@ payload:
   - +.unitweld.com
   - +.unitworld.net
   - +.unity.cn
+  - +.unity3dcloud.cn
   - +.unitychina.cn
   - +.unitymanual.com
   - +.univ-bio.com
@@ -96133,6 +96476,7 @@ payload:
   - +.uukkuu.com
   - +.uuliaoning.com
   - +.uulux.com
+  - +.uum.com.cn
   - +.uumachine.com
   - +.uume.com
   - +.uumeitu.com
@@ -96373,6 +96717,7 @@ payload:
   - +.vangotech.com
   - +.vanguardstars.com
   - +.vanho.cn
+  - +.vanish.cn
   - +.vanjoin.com
   - +.vankang.com
   - +.vanke-hotels.com
@@ -96527,6 +96872,8 @@ payload:
   - +.veeqi.net
   - +.veer.com
   - +.veervr.tv
+  - +.veet.cn
+  - +.veet.com.cn
   - +.veeteam.com
   - +.veevlink.com
   - +.veew-alb-cn1.com
@@ -96631,6 +96978,7 @@ payload:
   - +.vfe.cc
   - +.vfinemusic.com
   - +.vfocus.net
+  - +.vfsco.com.cn
   - +.vftfishing.com
   - +.vfuiov.sbs
   - +.vfuke.net
@@ -96881,6 +97229,8 @@ payload:
   - +.virtualworld.pub
   - +.virtupharmako.com
   - +.virusdefender.net
+  - +.visa.cn
+  - +.visa.com.cn
   - +.visa027.com
   - +.visa163.com
   - +.visa198.com
@@ -96898,8 +97248,12 @@ payload:
   - +.visaforkorea-sh.com
   - +.visaforkorea-wh.com
   - +.visahuanqiu.com
+  - +.visainfinite.cn
   - +.visajx.com
   - +.visanc.com
+  - +.visapay.cn
+  - +.visaplatinum.cn
+  - +.visaplatinum.com.cn
   - +.visas.to
   - +.visasoo.com
   - +.visaun.com
@@ -96959,6 +97313,7 @@ payload:
   - +.viviwin.com
   - +.vivo.com
   - +.vivo.xyz
+  - +.vivoglobal.com
   - +.vivojia.com
   - +.vivojrkj.com
   - +.vivokb.com
@@ -97198,7 +97553,12 @@ payload:
   - +.volleyballchina.com
   - +.volleychina.org
   - +.voltmemo.com
+  - +.volvo.cn
+  - +.volvo.com.cn
   - +.volvocars.com
+  - +.volvogroup.cn
+  - +.volvogroup.com.cn
+  - +.volvotrucks.com.cn
   - +.vomicer.com
   - +.voming.com
   - +.vommatec.com
@@ -97652,6 +98012,7 @@ payload:
   - +.wallswitch.com
   - +.walltu.com
   - +.wallyt.net
+  - +.walmart.cn
   - +.walre.com
   - +.walsongreenhouse.com
   - +.walton-xuzhou.com
@@ -98390,6 +98751,7 @@ payload:
   - +.webcamx666.com
   - +.webdns263.com
   - +.webetter-ad.com
+  - +.webex.com.cn
   - +.webfalse.com
   - +.webfont.com
   - +.webfoss.com
@@ -99936,6 +100298,8 @@ payload:
   - +.windows10zj.com
   - +.windows11.pro
   - +.windows7en.com
+  - +.windowsazure.cn
+  - +.windowsazurestatus.cn
   - +.windowstool.net
   - +.windowsupdate.microsoft.com
   - +.windowszj.com
@@ -100615,6 +100979,8 @@ payload:
   - +.wooffice.net
   - +.wooide.com
   - +.woola.net
+  - +.woolite.cn
+  - +.woolite.com.cn
   - +.wooltex.org
   - +.wooolab.com
   - +.wooomooo.com
@@ -104905,6 +105271,7 @@ payload:
   - +.xn--6rtq6phwfhva.com
   - +.xn--6xv710dola.net
   - +.xn--730-l44eu9iitvv9h.com
+  - +.xn--7hvy28f.cn
   - +.xn--7mqy6dj0brts55e.com
   - +.xn--7qvz7xssa.com
   - +.xn--88-9s0f59z.com
@@ -104924,6 +105291,7 @@ payload:
   - +.xn--b0tp7p3met2a.com
   - +.xn--b0tp7p3met2a.net
   - +.xn--b8qi619ujyk.com
+  - +.xn--bnq297cix3a.cn
   - +.xn--btvs3aw8fhtbms310k.com
   - +.xn--btvu9x9qgt8c.com
   - +.xn--bxyy83e.net
@@ -104938,6 +105306,7 @@ payload:
   - +.xn--czr694b
   - +.xn--czr93rxry.com
   - +.xn--czrs0t
+  - +.xn--czrs0t4phtr3a.cn
   - +.xn--czru2d
   - +.xn--czru2dx3eszw3lat53b.com
   - +.xn--dev407h.com
@@ -104970,6 +105339,7 @@ payload:
   - +.xn--fiqrtn9duw9e.cc
   - +.xn--fiqs8s
   - +.xn--fiqs8sr9ge7eb4b28vo92a.com
+  - +.xn--fiqs8sxootzz.cn
   - +.xn--fiqu59c0hf2sy.net
   - +.xn--fiqv94di0c54ipe.net
   - +.xn--fiqw8jl3h7xc25m753d.link
@@ -105011,6 +105381,7 @@ payload:
   - +.xn--ntsp37j.net
   - +.xn--nyqx2gbsm8u0b.com
   - +.xn--nyqy26a
+  - +.xn--ohq11k7pl25iyo8a.cn
   - +.xn--ohqn1dw64cf45c8l9a1ba.com
   - +.xn--omrvgz6er31au6f.com
   - +.xn--oorz70c56jtwb49x.net
@@ -105103,6 +105474,7 @@ payload:
   - +.xndxfz.com
   - +.xndyyljt.com
   - +.xnfyy.com
+  - +.xnfz.seu.edu.cn
   - +.xngjbus.com
   - +.xnh123.com
   - +.xnh98d9c32om.com
@@ -105144,6 +105516,7 @@ payload:
   - +.xoao.com
   - +.xogekfb.com
   - +.xoliao.com
+  - +.xoom.net.cn
   - +.xooooa.com
   - +.xopenbeta.com
   - +.xoqeyeti.com
@@ -105436,6 +105809,7 @@ payload:
   - +.xtongs.com
   - +.xtoobmo.xyz
   - +.xtqarzip.com
+  - +.xtracloud.cn
   - +.xtransfer.com
   - +.xtrapowercn.com
   - +.xtrc.net
@@ -106492,6 +106866,8 @@ payload:
   - +.yahanmr.com
   - +.yahboom.com
   - +.yahong-mold.com
+  - +.yahoo.cn
+  - +.yahoo.com.cn
   - +.yahoo001.com
   - +.yahuayunshu.com
   - +.yahuhost.com
@@ -106521,6 +106897,7 @@ payload:
   - +.yalongbay.net
   - +.yalqq8976.com
   - +.yamaijia.net
+  - +.yamaxun.cn
   - +.yameisj.com
   - +.yamibo.com
   - +.yan-grh.com
@@ -111655,6 +112032,7 @@ payload:
   - +.z-henergy.com
   - +.z-inn.com
   - +.z.ai
+  - +.z.cn
   - +.z.wiki
   - +.z0.cc
   - +.z01.com
@@ -116783,23 +117161,59 @@ payload:
   - a3.mzstatic.com
   - a4.mzstatic.com
   - a5.mzstatic.com
+  - activate.activation-v2.kaspersky.com
+  - activation-v2.geo.kaspersky.com
+  - activation-v2.kaspersky.com
   - adcdownload.apple.com
   - adcdownload.apple.com.akadns.net
+  - afcs.dell.com
   - ai.zhaomi.cn
+  - amp-api-edge-lb-cn.itunes-apple.com.akadns.net
+  - amp-api-edge-lb.itunes-apple.com.akadns.net
+  - amp-api-edge.apps.apple.com
+  - amp-api-search-edge.apps.apple.com
   - amp-api-updates.apps.apple.com
+  - amp-api.apps.apple.com
   - amp-api.media.apple.com
+  - amp-api.music.apple.com
+  - aod-ssl.itunes.apple.com
+  - aod.itunes.apple.com
+  - api-edge.apps.apple.com
   - app-site-association.cdn-apple.com
   - appldnld.apple.com
   - appldnld.g.aaplimg.com
   - appleid.cdn-apple.com
   - apps.apple.com
   - apps.mzstatic.com
+  - apptrailers.itunes.apple.com
+  - assets1.xboxlive.cn
+  - assets2.xboxlive.cn
+  - auth.music.apple.com
+  - b.c2r.ts.cdn.office.net
   - bag-cdn.itunes-apple.com.akadns.net
+  - bag.itunes.apple.com
+  - bg.v4.a.dl.ws.microsoft.com
+  - bg4.v4.a.dl.ws.microsoft.com
+  - blzdist-d3.necdn.leihuo.netease.com
+  - blzdist-di.necdn.leihuo.netease.com
+  - blzdist-hs.necdn.leihuo.netease.com
+  - blzdist-ow.necdn.leihuo.netease.com
+  - blzdist-phx.necdn.leihuo.netease.com
+  - blzdist-wow.necdn.leihuo.netease.com
+  - bookkeeper.itunes.apple.com
+  - build.microsoft.com
+  - cdn-ali.content.steamchina.com
+  - cdn-cn.apple-mapkit.com
   - cdn-cn1.apple-mapkit.com
   - cdn-cn2.apple-mapkit.com
   - cdn-cn3.apple-mapkit.com
   - cdn-cn4.apple-mapkit.com
+  - cdn-qc.content.steamchina.com
+  - cdn-ws.content.steamchina.com
+  - cdn.ampproject.org
   - cdn.apple-mapkit.com
+  - cdn.globalsigncdn.com.cdn.cloudflare.net
+  - cdn.marketplaceimages.windowsphone.com
   - cdn1.apple-mapkit.com
   - cdn2.apple-mapkit.com
   - cdn3.apple-mapkit.com
@@ -116808,9 +117222,11 @@ payload:
   - cds.apple.com
   - cds.apple.com.akadns.net
   - cdsassets.apple.com
+  - certs-lb.apple.com.akadns.net
   - certs.apple.com
   - cl1-cdn.origin-apple.com.akadns.net
   - cl1.apple.com
+  - cl2-cdn.origin-apple.com.akadns.net
   - cl2-cn.apple.com
   - cl2.apple.com
   - cl3-cdn.origin-apple.com.akadns.net
@@ -116820,22 +117236,75 @@ payload:
   - cl4.apple.com
   - cl5-cdn.origin-apple.com.akadns.net
   - cl5.apple.com
+  - client-api.itunes.apple.com
   - clientflow.apple.com
   - clientflow.apple.com.akadns.net
+  - clientperipherals.dell.com
+  - cma.itunes.apple.com
   - cn-smp-paymentservices.apple.com
+  - cn.download.nvidia.com
+  - communities.apple.com
   - configuration.apple.com
   - configuration.apple.com.akadns.net
+  - crl-lb.apple.com.akadns.net
   - crl.apple.com
   - cstat.apple.com
   - cstat.cdn-apple.com
+  - ctldl.windowsupdate.com
   - cueme-api.quark.cn
+  - customization-cdn.dell.com
+  - dc1-cert.ksn.kaspersky-labs.com
+  - dc1-file.ksn.kaspersky-labs.com
+  - dc1-pp.ksn.kaspersky-labs.com
+  - dc1-st.ksn.kaspersky-labs.com
+  - dc1.ksn.kaspersky-labs.com
   - dd-cdn.origin-apple.com.akadns.net
+  - dds.dell.com
   - dejavu.apple.com
   - devimages-cdn.apple.com
   - devstreaming-cdn.apple.com
+  - discussionschinese.apple.com
+  - dl.dell.com
+  - dnl-00.geo.kaspersky.com
+  - dnl-01.geo.kaspersky.com
+  - dnl-02.geo.kaspersky.com
+  - dnl-03.geo.kaspersky.com
+  - dnl-04.geo.kaspersky.com
+  - dnl-05.geo.kaspersky.com
+  - dnl-06.geo.kaspersky.com
+  - dnl-07.geo.kaspersky.com
+  - dnl-08.geo.kaspersky.com
+  - dnl-09.geo.kaspersky.com
+  - dnl-10.geo.kaspersky.com
+  - dnl-11.geo.kaspersky.com
+  - dnl-12.geo.kaspersky.com
+  - dnl-13.geo.kaspersky.com
+  - dnl-14.geo.kaspersky.com
+  - dnl-15.geo.kaspersky.com
+  - dnl-16.geo.kaspersky.com
+  - dnl-17.geo.kaspersky.com
+  - dnl-18.geo.kaspersky.com
+  - dnl-19.geo.kaspersky.com
+  - docs.microsoft.com
   - download.developer.apple.com
+  - downloaddispatch.itunes.apple.com
+  - ea2cn-dev-outlet.dell.com
+  - ea2cn-prod-outlet.dell.com
+  - ea2cn-staging-outlet.dell.com
+  - edge.geo.kaspersky.com
+  - emoi-cncdn.bing.com
   - enrichgw.10010.com
+  - epicgames-download1-1251447533.file.myqcloud.com
   - experiments.apple.com
+  - f.c2r.ts.cdn.office.net
+  - fcs.dell.com
+  - fides-pol.apple.com
+  - fta.dell.com
+  - ftaapj.dell.com
+  - ftaemea.dell.com
+  - ftasitapj.dell.com
+  - gbxgateway-dev.dell.com
+  - gbxgateway.dell.com
   - geetest.datasink.sensorsdata.cn
   - gs-loc-cn.apple.com
   - gs-loc.apple.com
@@ -116846,6 +117315,8 @@ payload:
   - gsp4-cn.ls.apple.com.edgekey.net.globalredir.akadns.net
   - gsp5-cn.ls.apple.com
   - gsp85-cn-ssl.ls.apple.com
+  - gspe11-2-cn-ssl.ls.apple.com
+  - gspe12-cn-ssl.ls.apple.com
   - gspe19-2-cn-ssl.ls-apple.com.akadns.net
   - gspe19-2-cn-ssl.ls.apple.com
   - gspe19-cn-ssl.ls.apple.com
@@ -116854,21 +117325,24 @@ payload:
   - gspe21-ssl.ls.apple.com
   - gspe35-ssl.ls.apple.com
   - gspe79-cn-ssl.ls.apple.com
+  - gspe85-cn-ssl.ls.apple.com
   - guzzoni-apple-com.v.aaplimg.com
   - guzzoni.apple.com
   - guzzoni.smoot.apple.com
-  - gvt1-cn.com
-  - gvt2-cn.com
   - hap.10010.com
   - hellofontpreview.oss-cn-beijing.aliyuncs.com
   - hellowebfonts.oss-cn-beijing.aliyuncs.com
   - hospital.pku.edu.cn
   - hs.wosms.cn
-  - iadsdk.apple.com
   - icloud-cdn.icloud.com.akadns.net
   - icloud.cdn-apple.com
   - id6.me
+  - images-cn-8.ssl-images-amazon.com
+  - images-cn.ssl-images-amazon.com
   - images.apple.com.edgekey.net.globalredir.akadns.net
+  - inappcheck-cn.itunes-apple.com.akadns.net
+  - inappcheck-lb.itunes-apple.com.akadns.net
+  - inappcheck.itunes.apple.com
   - init-kt.apple.com
   - init-p01md-lb.push-apple.com.akadns.net
   - init-p01md.apple.com
@@ -116877,6 +117351,10 @@ payload:
   - init-s01st-lb.push-apple.com.akadns.net
   - init-s01st.push.apple.com
   - init.ess.apple.com
+  - init.gc-lb.apple.com.akadns.net
+  - init.gc.apple.com
+  - init.itunes.apple.com
+  - iosapps.itunes.apple.com
   - iosapps.itunes.g.aaplimg.com
   - ipcdn.apple.com
   - iphone-ld.apple.com
@@ -116895,12 +117373,43 @@ payload:
   - itunes-apple.com.akadns.net
   - itunes.apple.com
   - itunesconnect.apple.com
+  - js-cdn.music.apple.com
+  - km.support.apple.com
+  - ksn-cinfo-geo.kaspersky-labs.com
+  - ksn-cinfo.geoksn.kaspersky.com
+  - ksn-crypto-info-geo.kaspersky-labs.com
+  - ksn-crypto-kas-geo.kaspersky-labs.com
+  - ksn-crypto-tcert-geo.kaspersky-labs.com
+  - ksn-crypto-url-geo.kaspersky-labs.com
+  - ksn-crypto-verdict-geo.kaspersky-labs.com
+  - ksn-crypto-wifiplus-geo.kaspersky-labs.com
+  - ksn-crypto-wifiplus.geoksn.kaspersky.com
+  - ksn-dc1-cert.geoksn.kaspersky.com
+  - ksn-dc1-file.geoksn.kaspersky.com
+  - ksn-dc1.geoksn.kaspersky.com
+  - ksn-file-geo.kaspersky-labs.com
+  - ksn-file.geoksn.kaspersky.com
+  - ksn-info-geo.kaspersky-labs.com
+  - ksn-info.geoksn.kaspersky.com
+  - ksn-kas.geoksn.kaspersky.com
+  - ksn-mdr.geoksn.kaspersky.com
+  - ksn-tcert-geo.kaspersky-labs.com
+  - ksn-tcert.geoksn.kaspersky.com
+  - ksn-url-geo.kaspersky-labs.com
+  - ksn-url.geoksn.kaspersky.com
+  - ksn-verdict-geo.kaspersky-labs.com
+  - ksn-verdict.geoksn.kaspersky.com
+  - learn.microsoft.com
+  - maps.apple.com
+  - mdr.ksn.kaspersky-labs.com
   - mesu-cdn.apple.com.akadns.net
   - mesu-china.apple.com.akadns.net
   - mesu.apple.com
+  - misc-assets.itunes.apple.com
   - ml.cdn-apple.com
   - moocs.unipus.cn
   - music.apple.com
+  - myapp.itunes.apple.com
   - ntp.aliyun.com
   - ntp.tencent.com
   - ntp1.aliyun.com
@@ -116923,8 +117432,29 @@ payload:
   - opencourse.pku.edu.cn
   - oscdn.apple.com
   - oscdn.origin-apple.com.akadns.net
+  - osxapps.itunes.apple.com
   - osxapps.itunes.g.aaplimg.com
+  - p00.upd.kaspersky.com
+  - p01.upd.kaspersky.com
+  - p02.upd.kaspersky.com
+  - p03.upd.kaspersky.com
+  - p04.upd.kaspersky.com
+  - p05.upd.kaspersky.com
+  - p06.upd.kaspersky.com
+  - p07.upd.kaspersky.com
+  - p08.upd.kaspersky.com
+  - p09.upd.kaspersky.com
   - p1-juejin.byteimg.com
+  - p10.upd.kaspersky.com
+  - p11.upd.kaspersky.com
+  - p12.upd.kaspersky.com
+  - p13.upd.kaspersky.com
+  - p14.upd.kaspersky.com
+  - p15.upd.kaspersky.com
+  - p16.upd.kaspersky.com
+  - p17.upd.kaspersky.com
+  - p18.upd.kaspersky.com
+  - p19.upd.kaspersky.com
   - p2-juejin.byteimg.com
   - p3-juejin.byteimg.com
   - p3-novel.byteimg.com
@@ -116938,20 +117468,65 @@ payload:
   - pancake.apple.com
   - pancake.cdn-apple.com.akadns.net
   - pba0.apple.com
+  - pd-nk.itunes.apple.com
+  - pd.itunes.apple.com
+  - play.itunes.apple.com
+  - play.music.apple.com
   - probe.siri.apple.com
   - prod-support.apple-support.akadns.net
   - publicassets.cdn-apple.com
+  - refresh-bkg.activation-v2.kaspersky.com
+  - res-1.cdn.office.net
+  - res.cdn.office.net
   - reserve-prime.apple.com
   - s.mzstatic.com
+  - s00.upd.kaspersky.com
+  - s01.upd.kaspersky.com
+  - s02.upd.kaspersky.com
+  - s03.upd.kaspersky.com
+  - s04.upd.kaspersky.com
+  - s05.upd.kaspersky.com
+  - s06.upd.kaspersky.com
+  - s07.upd.kaspersky.com
+  - s08.upd.kaspersky.com
+  - s09.upd.kaspersky.com
+  - s1.mzstatic.com
+  - s10.upd.kaspersky.com
+  - s11.upd.kaspersky.com
+  - s12.upd.kaspersky.com
+  - s13.upd.kaspersky.com
+  - s14.upd.kaspersky.com
+  - s15.upd.kaspersky.com
+  - s16.upd.kaspersky.com
+  - s17.upd.kaspersky.com
+  - s18.upd.kaspersky.com
+  - s19.upd.kaspersky.com
+  - s2.mzstatic.com
+  - s3.mzstatic.com
+  - s4.mzstatic.com
+  - s5.mzstatic.com
+  - scene7-cdn.dell.com
+  - se-edge.itunes.apple.com
+  - se2.itunes.apple.com
+  - search.itunes.apple.com
   - seed-sequoia.siri.apple.com
   - seed-swallow.siri.apple.com
   - seed.siri.apple.com
   - sequoia.apple.com
+  - sf-api-token-service.itunes.apple.com
   - sh-pod2-smp-device.apple.com
   - shazam-insights.cdn-apple.com
+  - shell.cdn.office.net
+  - si.cdn.dell.com
+  - sm.dell.com
   - smp-device-content.apple.com
+  - snp.cdn.dell.com
+  - snpi.dell.com
+  - sp.itunes.apple.com
   - ss.bjmu.edu.cn
+  - st-bak.viv.wanwang.space
   - static.gc.apple.com
+  - statics.teams.cdn.office.net
   - stocks-sparkline-lb.apple.com.akadns.net
   - stocks-sparkline.apple.com
   - store.apple.com
@@ -116959,9 +117534,13 @@ payload:
   - store.apple.com.edgekey.net.globalredir.akadns.net
   - store.storeimages.apple.com.akadns.net
   - store.storeimages.cdn-apple.com
+  - streamingaudio.itunes.apple.com
   - study.163.com
+  - su.itunes.apple.com
   - support-china.apple-support.akadns.net
   - support.apple.com
+  - supportassist.dell.com
+  - surface.downloads.prss.microsoft.com
   - swallow-apple-com.v.aaplimg.com
   - swallow.apple.com
   - swcatalog-cdn.apple.com.akadns.net
@@ -116973,13 +117552,21 @@ payload:
   - swscan-cdn.apple.com.akadns.net
   - swscan.apple.com
   - sylvan.apple.com
+  - sync.itunes.apple.com
+  - tf-feedback.itunes.apple.com
   - time.amazonaws.cn
   - time.izatcloud.net
   - time.xtracloud.net
   - tj-pod1-smp-device.apple.com
+  - tlu.dl.delivery.mp.microsoft.com
+  - tp.louisvuitton.com
+  - trts.baishancdnx.cn
+  - ubisoftconnect.eo-edgefunctions7.com
   - updates-http.cdn-apple.com
   - updates-http.cdn-apple.com.akadns.net
   - updates.cdn-apple.com
+  - uplaypc-s-ubisoft.cdn.ubionline.com.cn
+  - upp.itunes.apple.com
   - valid.apple.com
   - valid.origin-apple.com.akadns.net
   - weather-data.apple.com
@@ -116987,6 +117574,10 @@ payload:
   - weather-map.apple.com
   - weather-map2.apple.com
   - weatherkit.apple.com
+  - www-csb.dell.com
+  - www.amd.com
   - www.apple.com
   - www.apple.com.edgekey.net.globalredir.akadns.net
+  - www.entrust.cn
+  - www.support.apple.com
   - xp.apple.com
