@@ -1,4 +1,4 @@
-name: 规则集全量生成 (Sing-box & Mihomo)
+name: Sing-box-Mihomo规则集全量生成
 
 on:
   workflow_dispatch:
@@ -23,11 +23,11 @@ jobs:
 
       - name: Install Tools (Sing-box & Mihomo)
         run: |
-          # Install Sing-box
+          # 安装 Sing-box
           wget https://github.com/SagerNet/sing-box/releases/download/v1.12.17/sing-box-1.12.17-linux-amd64.tar.gz
           tar -xzf sing-box-1.12.17-linux-amd64.tar.gz
           mv sing-box-1.12.17-linux-amd64/sing-box /usr/local/bin/
-          # Install Mihomo
+          # 安装 Mihomo
           wget https://github.com/MetaCubeX/mihomo/releases/download/v1.19.17/mihomo-linux-amd64-v1.19.17.gz
           gunzip mihomo-linux-amd64-v1.19.17.gz
           mv mihomo-linux-amd64-v1.19.17 mihomo
@@ -37,47 +37,39 @@ jobs:
       - name: 1. Process Domain Rules (Sing-box & Mihomo)
         run: |
           set -euo pipefail
-          mkdir -p singbox-rules mihomo-rules temp_domains
+          mkdir -p singbox-rules mihomo-rules
           touch all_processed_domains.txt
           
-          # --- Helper: Build Domain Rules ---
           build_domain_all() {
             local name="$1"
             local exclude_list="$2"
             shift 2
-            local files=("$@") # Sing-box json sources
+            local files=("$@")
             
-            # Extract domains for Sing-box
             jq -r '.rules[].domain[]?' "${files[@]}" 2>/dev/null | sed 's/[[:space:]]//g; /^$/d' | sort -u > d_exact.txt || touch d_exact.txt
             jq -r '.rules[].domain_suffix[]?' "${files[@]}" 2>/dev/null | sed 's/[[:space:]]//g; /^$/d' | sort -u > d_suffix.txt || touch d_suffix.txt
 
-            # Deduplicate against previous categories
             if [ -f "$exclude_list" ] && [ -s "$exclude_list" ]; then
               comm -23 d_exact.txt "$exclude_list" > tmp && mv tmp d_exact.txt
               comm -23 d_suffix.txt "$exclude_list" > tmp && mv tmp d_suffix.txt
             fi
-            # Internal dedup: suffix covers exact
             comm -23 d_exact.txt d_suffix.txt > d_exact_final.txt
 
-            # Output Sing-box JSON
+            # Sing-box JSON
             jq -n --rawfile exact d_exact_final.txt --rawfile suffix d_suffix.txt \
               '{version: 2, rules: [{domain: ($exact | split("\n") | map(select(length > 0))), domain_suffix: ($suffix | split("\n") | map(select(length > 0)))}]}' \
               > "singbox-rules/${name}.json"
 
-            # Output Mihomo YAML
+            # Mihomo YAML
             echo "payload:" > "mihomo-rules/${name}.yaml"
             sed 's/^/  - +./' d_suffix.txt >> "mihomo-rules/${name}.yaml"
             sed 's/^/  - /' d_exact_final.txt >> "mihomo-rules/${name}.yaml"
 
-            # Update global exclude list
             cat d_exact_final.txt d_suffix.txt >> all_processed_domains.txt
             sort -u all_processed_domains.txt -o all_processed_domains.txt
           }
 
-          # --- Execution ---
           SRC_S="source-sing/geo/geosite"
-          EXACT_LIST=("gfw.json" "google.json" "youtube.json" "tiktok.json" "github.json" "telegram.json" "openai.json" "netflix.json") # 示例缩减，实际可补齐
-
           # ADS
           mapfile -t ADS_F < <(find "$SRC_S" -type f -name "*.json" | grep -E '(^|[^a-zA-Z0-9])ads([^a-zA-Z0-9]|\.json$)')
           build_domain_all "ads_domain" "none" "${ADS_F[@]}"
@@ -92,7 +84,6 @@ jobs:
         run: |
           set -euo pipefail
           SRC_IP_S="source-sing/geo/geoip"
-          SRC_IP_M="source-meta/geo/geoip"
           
           process_ip_all() {
             local name="$1"
@@ -100,7 +91,6 @@ jobs:
             shift 2
             local files=("$@")
             
-            # Get unique IPs
             jq -r '.rules[].ip_cidr[]?' "${files[@]}" | sed 's/[[:space:]]//g; /^$/d' | sort -u > ips.txt
             grep "\." ips.txt > v4.txt || touch v4.txt
             grep ":" ips.txt > v6.txt || touch v6.txt
@@ -119,7 +109,6 @@ jobs:
             [ "$v4_only" = "false" ] && sed 's/^/  - /' v6.txt >> "mihomo-rules/${name}.yaml"
           }
 
-          # Execution
           FOR_IPS=("$SRC_IP_S/google.json" "$SRC_IP_S/twitter.json" "$SRC_IP_S/facebook.json" "$SRC_IP_S/telegram.json")
           process_ip_all "foreign_ip4" "true" "${FOR_IPS[@]}"
           process_ip_all "foreign_ip" "false" "${FOR_IPS[@]}"
