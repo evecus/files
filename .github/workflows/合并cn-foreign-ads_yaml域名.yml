@@ -1,9 +1,7 @@
 name: 合并cn-foreign-ads_yaml域名
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "30 0 * * *"      # 支持手动触发
+  workflow_dispatch:      # 支持手动触发
 
 permissions:
   contents: write
