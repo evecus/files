@@ -2,6 +2,8 @@ name: 合并cn-foreign-ads_json域名
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "30 1 * * *"      # 支持手动触发
 
 permissions:
   contents: write
