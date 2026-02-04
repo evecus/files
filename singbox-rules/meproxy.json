@@ -1,0 +1,34 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain_suffix": [
+        "qichiyu.com",
+          "ping0.cc",
+          "speedtest.net",
+          "dns.google",
+          "1dot1dot1dot1.cloudflare-dns.com",
+          "dot.sb",
+          "dns.umbrella.com",
+          "dns.quad9.net",
+          "cloudflare-dns.com",
+          "doh.dns.sb",
+          "doh.opendns.com",
+          "hk-hkg.doh.sb"
+      ]
+    },
+    {
+      "domain_keyword": [
+        "googlevideo",
+        "host",
+        "panel",
+        "1e100",
+        "armbian",
+        "debian",
+        "docker",
+        "ubuntu",
+        "linux"
+      ]
+    }
+  ]
+}

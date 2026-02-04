@@ -1,0 +1,37 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain_suffix": [
+        "ryplay11.com",
+        "955500.xyz",
+        "668599.xyz",
+        "166001.xyz",
+        "dnshe.com",
+        "dash.cloudflare.com",
+        "dytt-cinema.com",
+        "tyyszywvod5.com",
+        "fengbao8.com",
+        "360xyz.vip",
+        "natchecker.com",
+        "bdzybf22.com",
+        "cdn.wicdn88.com",
+        "freecloud.ltd",
+        "acl4.ssr",
+        "freecloud.ltd",
+        "gstatic.com",
+        "ming8600.xyz",
+        "dnshe.com",
+        "fjmtop.dpdns.org"
+      ]
+    },
+    {
+      "domain": [
+        "dash.cloudflare.com",
+        "www.bing.com",
+        "cn.bing.com",
+        "pterodactyl.freecloud.ltd"
+      ] 
+    }
+  ]
+}
