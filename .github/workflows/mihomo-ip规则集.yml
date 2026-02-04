@@ -1,4 +1,4 @@
-name: mihomo_ip_mrs文件生成
+name: mihomo-ip规则集生成
 
 on:
   workflow_dispatch:
