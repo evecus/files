@@ -56,6 +56,7 @@ DOMAIN-SUFFIX,freecloud.ltd
 DOMAIN-SUFFIX,acl4.ssr
 DOMAIN-SUFFIX,dnshe.com
 DOMAIN-SUFFIX,dash.cloudflare.com
+DOMAIN,edge.microsoft.com
 DOMAIN,www.bing.com
 DOMAIN,dash.cloudflare.com
 DOMAIN,cn.bing.com
