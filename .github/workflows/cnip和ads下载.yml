@@ -3,7 +3,7 @@ name: cnip和ads下载
 on:
   schedule:
     # 每天 UTC 00:00（北京时间 08:00）
-    - cron: '0 0 * * *'
+    - cron: '0 1 * * *'
   workflow_dispatch:
 
 jobs:
@@ -14,51 +14,83 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Prepare directory
+      - name: Prepare directories
         run: |
           mkdir -p mihomo-rules
+          mkdir -p singbox-rules
 
-      # ===== CN IP rules =====
-      - name: Download cn.yaml
+      # =========================
+      # mihomo rules
+      # =========================
+
+      - name: Download mihomo cn.yaml
         run: |
           curl -L \
             https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/cn.yaml \
             -o mihomo-rules/cn_ip.yaml
 
-      - name: Download cn.mrs
+      - name: Download mihomo cn.mrs
         run: |
           curl -L \
             https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/cn.mrs \
             -o mihomo-rules/cn_ip.mrs
 
-      # ===== Ads rules =====
-      - name: Download ads.yaml
+      - name: Download mihomo ads.yaml
         run: |
           curl -L \
             https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/category-ads-all.yaml \
             -o mihomo-rules/ads.yaml
 
-      - name: Download ads.mrs
+      - name: Download mihomo ads.mrs
         run: |
           curl -L \
             https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/category-ads-all.mrs \
             -o mihomo-rules/ads.mrs
 
-      # ===== Commit =====
+      # =========================
+      # sing-box rules
+      # =========================
+
+      - name: Download sing-box cn.json
+        run: |
+          curl -L \
+            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geoip/cn.json \
+            -o singbox-rules/cn_ip.json
+
+      - name: Download sing-box cn.srs
+        run: |
+          curl -L \
+            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geoip/cn.srs \
+            -o singbox-rules/cn_ip.srs
+
+      - name: Download sing-box ads.json
+        run: |
+          curl -L \
+            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/sing/geosite/category-ads-all.json \
+            -o singbox-rules/ads.json
+
+      - name: Download sing-box ads.srs
+        run: |
+          curl -L \
+            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/sing/geosite/category-ads-all.srs \
+            -o singbox-rules/ads.srs
+
+      # =========================
+      # Commit
+      # =========================
+
       - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git add \
-            mihomo-rules/cn_ip.yaml \
-            mihomo-rules/cn_ip.mrs \
-            mihomo-rules/ads.yaml \
-            mihomo-rules/ads.mrs
+            mihomo-rules/* \
+            singbox-rules/*
 
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "chore: update CN IP & Ads rules"
+            git commit -m "chore: update CN IP & Ads rules (mihomo & sing-box)"
             git push
           fi
