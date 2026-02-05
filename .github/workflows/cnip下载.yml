@@ -1,0 +1,45 @@
+name: Update CN IP Rules
+
+on:
+  schedule:
+    # 每天 UTC 00:00（北京时间 08:00）
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare directory
+        run: |
+          mkdir -p mihomo-rules
+
+      - name: Download cn.yaml
+        run: |
+          curl -L \
+            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/cn.yaml \
+            -o mihomo-rules/cn_ip.yaml
+
+      - name: Download cn.mrs
+        run: |
+          curl -L \
+            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/cn.mrs \
+            -o mihomo-rules/cn_ip.mrs
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add mihomo-rules/cn_ip.yaml mihomo-rules/cn_ip.mrs
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: update CN IP rules"
+            git push
+          fi
