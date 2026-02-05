@@ -121,7 +121,7 @@ jobs:
           }
 
           FOR_IPS=()
-          for f in google.json telegram.json; do [ -f "$SRC_IP_S/$f" ] && FOR_IPS+=("$SRC_IP_S/$f"); done
+          for f in google.json twitter.json facebook.json telegram.json; do [ -f "$SRC_IP_S/$f" ] && FOR_IPS+=("$SRC_IP_S/$f"); done
           [ ${#FOR_IPS[@]} -gt 0 ] && process_ip_all "foreign_ip4" "true" "${FOR_IPS[@]}"
           [ ${#FOR_IPS[@]} -gt 0 ] && process_ip_all "foreign_ip" "false" "${FOR_IPS[@]}"
           [ -f "$SRC_IP_S/cn.json" ] && process_ip_all "cn_ip4" "true" "$SRC_IP_S/cn.json"
