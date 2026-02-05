@@ -3,7 +3,7 @@ name: cnip和ads下载
 on:
   schedule:
     # 每天 UTC 00:00（北京时间 08:00）
-    - cron: '0 1 * * *'
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
 jobs:
@@ -20,7 +20,7 @@ jobs:
           mkdir -p singbox-rules
 
       # =========================
-      # mihomo rules
+      # 1. mihomo rules
       # =========================
 
       - name: Download mihomo cn.yaml
@@ -48,35 +48,35 @@ jobs:
             -o mihomo-rules/ads.mrs
 
       # =========================
-      # sing-box rules
+      # 2. singbox rules
       # =========================
 
-      - name: Download sing-box cn.json
+      - name: Download singbox cn.json
         run: |
           curl -L \
-            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geoip/cn.json \
+            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.json \
             -o singbox-rules/cn_ip.json
 
-      - name: Download sing-box cn.srs
+      - name: Download singbox cn.srs
         run: |
           curl -L \
-            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geoip/cn.srs \
+            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs \
             -o singbox-rules/cn_ip.srs
 
-      - name: Download sing-box ads.json
+      - name: Download singbox ads.json
         run: |
           curl -L \
-            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/sing/geosite/category-ads-all.json \
+            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ads-all.json \
             -o singbox-rules/ads.json
 
-      - name: Download sing-box ads.srs
+      - name: Download singbox ads.srs
         run: |
           curl -L \
-            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/sing/geosite/category-ads-all.srs \
+            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ads-all.srs \
             -o singbox-rules/ads.srs
 
       # =========================
-      # Commit
+      # 3. Commit
       # =========================
 
       - name: Commit and push
@@ -91,6 +91,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "chore: update CN IP & Ads rules (mihomo & sing-box)"
+            git commit -m "chore: update CN IP & Ads rules (mihomo & singbox)"
             git push
           fi
