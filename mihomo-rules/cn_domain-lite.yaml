@@ -1257,6 +1257,7 @@ payload:
   - +.data.pharmacodia.com
   - +.dataeye.com
   - +.datasea.cn
+  - +.datayi.cn
   - +.daton.com.cn
   - +.dayainfo.com
   - +.dayin8.com
@@ -1298,6 +1299,7 @@ payload:
   - +.develenv.com
   - +.devui.design
   - +.dfham.com
+  - +.dfyun.com.cn
   - +.dfzq.com.cn
   - +.dginfo.com
   - +.dgjy.net
@@ -1328,6 +1330,7 @@ payload:
   - +.dji.ink
   - +.dji.net
   - +.djicdn.com
+  - +.djigate.com
   - +.djiits.com
   - +.djiops.com
   - +.djiservice.org
@@ -1562,6 +1565,7 @@ payload:
   - +.fadfunds.com
   - +.faloo.com
   - +.famulei.com
+  - +.fanfou.com
   - +.fang.com
   - +.fangxiaoer.com
   - +.fanli.com
@@ -1803,6 +1807,7 @@ payload:
   - +.gifshow.com
   - +.gigabyte.cn
   - +.gijsq.com
+  - +.gio.ren
   - +.giocdn.com
   - +.gitbook.cn
   - +.gitchat.cn
@@ -1871,6 +1876,8 @@ payload:
   - +.gree.com.cn
   - +.greenxiazai.com
   - +.greeyun.com
+  - +.growin.cn
+  - +.growingio.cn
   - +.growingio.com
   - +.grzq.com
   - +.gsctyiptv.cn
@@ -3270,6 +3277,7 @@ payload:
   - +.pc6.com
   - +.pcbeta.com
   - +.pchome.net
+  - +.pchpic.net
   - +.pconline.com.cn
   - +.pcpop.com
   - +.pddcdn.com
@@ -4321,6 +4329,7 @@ payload:
   - +.xbext.com
   - +.xbiao.com
   - +.xboxlive.cn
+  - +.xcc.cn
   - +.xcsc.com
   - +.xdqtech.com
   - +.xdtool.com
@@ -4364,6 +4373,7 @@ payload:
   - +.xiazaiba.com
   - +.xiezuocat.com
   - +.ximalaya.com
+  - +.xinchacha.com
   - +.xinchong.com
   - +.xinghuo.xfyun.cn
   - +.xingjiesj.com
