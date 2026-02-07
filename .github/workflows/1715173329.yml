@@ -1,0 +1,87 @@
+name: 批量规则集转换 (SRS -> JSON/YAML/MRS)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  batch-convert:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Install Tools
+        run: |
+          # 安装 Sing-box
+          wget https://github.com/SagerNet/sing-box/releases/download/v1.12.17/sing-box-1.12.17-linux-amd64.tar.gz
+          tar -xzf sing-box-1.12.17-linux-amd64.tar.gz
+          mv sing-box-1.12.17-linux-amd64/sing-box /usr/local/bin/
+          # 安装 Mihomo
+          wget https://github.com/MetaCubeX/mihomo/releases/download/v1.19.17/mihomo-linux-amd64-v1.19.17.gz
+          gunzip mihomo-linux-amd64-v1.19.17.gz
+          mv mihomo-linux-amd64-v1.19.17 mihomo
+          chmod +x mihomo
+          sudo mv mihomo /usr/local/bin/mihomo
+
+      - name: 1. 获取文件列表并处理
+        run: |
+          set -euo pipefail
+          OUT_DIR="1715173329"
+          mkdir -p "$OUT_DIR"
+          mkdir -p temp_srs
+          
+          # 通过 GitHub API 获取 rule-set-unstable 分支下的所有文件
+          # 这样可以精准定位所有的 .srs 文件
+          echo "正在从源仓库获取文件列表..."
+          FILE_LIST=$(curl -s "https://api.github.com/repos/1715173329/sing-geosite/contents/?ref=rule-set-unstable" | jq -r '.[] | select(.name | endswith(".srs")) | .name')
+          
+          for file_name in $FILE_LIST; do
+            base_name="${file_name%.srs}"
+            echo "------------------------------------------------"
+            echo "正在处理: $file_name"
+            
+            # A. 下载原始文件 (通过 jsDelivr 高速节点)
+            curl -L "https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/$file_name" -o "temp_srs/$file_name"
+            
+            # B. 反编译并清洗 JSON
+            # 逻辑：去除前导点，仅保留 domain 和 domain_suffix
+            sing-box rule-set decompile --output "temp_srs/raw.json" "temp_srs/$file_name"
+            jq '{
+              version: .version, 
+              rules: [
+                .rules[] | {
+                  domain: (.domain | map(sub("^\\.+"; ""))), 
+                  domain_suffix: (.domain_suffix | map(sub("^\\.+"; "")))
+                } | del(..|nulls)
+              ]
+            }' "temp_srs/raw.json" > "$OUT_DIR/$base_name.json"
+            
+            # C. 重新编译为新的 SRS
+            sing-box rule-set compile --output "$OUT_DIR/$base_name.srs" "$OUT_DIR/$base_name.json"
+            
+            # D. 转换为 Mihomo YAML
+            echo "payload:" > "$OUT_DIR/$base_name.yaml"
+            # 按照您的要求：domain_suffix -> - +.example.com
+            jq -r '.rules[].domain_suffix[]?' "$OUT_DIR/$base_name.json" | sed 's/^\.*//; s/^/  - +./' >> "$OUT_DIR/$base_name.yaml" || true
+            # 按照您的要求：domain -> - example.com
+            jq -r '.rules[].domain[]?' "$OUT_DIR/$base_name.json" | sed 's/^\.*//; s/^/  - /' >> "$OUT_DIR/$base_name.yaml" || true
+            
+            # E. 生成 Mihomo MRS
+            mihomo convert-ruleset domain yaml "$OUT_DIR/$base_name.yaml" "$OUT_DIR/$base_name.mrs"
+            
+            echo "完成处理: $base_name"
+          done
+
+      - name: Commit and Push
+        run: |
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+          git add 1715173329/
+          git commit -m "Batch update: Decompiled and transformed all Geosite SRS files" || echo "No changes"
+          git push origin main
