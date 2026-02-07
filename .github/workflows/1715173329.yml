@@ -64,7 +64,7 @@ jobs:
           mkdir -p "$SB_DIR" "$MH_DIR" temp_ip
           
           # 注意：这里改成了 main 分支，解决 404 问题
-          BASE_URL="https://raw.githubusercontent.com/1715173329/IPCIDR-CHINA/main"
+          BASE_URL="https://raw.githubusercontent.com/1715173329/IPCIDR-CHINA/master"
           FILES=("ip" "ip4" "ip6")
           
           for file in "${FILES[@]}"; do
