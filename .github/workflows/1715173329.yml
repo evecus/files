@@ -1,4 +1,4 @@
-name: 规则全量转换 (Geosite + CNIP 分类版)
+name: 规则全量转换 (稳定修复版)
 
 on:
   workflow_dispatch:
@@ -18,11 +18,9 @@ jobs:
 
       - name: Install Tools
         run: |
-          # 安装 sing-box
           wget https://github.com/SagerNet/sing-box/releases/download/v1.12.17/sing-box-1.12.17-linux-amd64.tar.gz
           tar -xzf sing-box-1.12.17-linux-amd64.tar.gz
           sudo mv sing-box-1.12.17-linux-amd64/sing-box /usr/local/bin/
-          # 安装 mihomo
           wget https://github.com/MetaCubeX/mihomo/releases/download/v1.19.17/mihomo-linux-amd64-v1.19.17.gz
           gunzip mihomo-linux-amd64-v1.19.17.gz
           chmod +x mihomo-linux-amd64-v1.19.17
@@ -44,8 +42,6 @@ jobs:
             [ $(stat -c%s "temp_srs/$file_name") -lt 100 ] && continue
             
             sing-box rule-set decompile --output "temp_srs/raw.json" "temp_srs/$file_name"
-            
-            # 清洗并移除空字段
             jq '{version: .version, rules: [.rules[] | {domain: (if (.domain | type == "array") then (.domain | map(sub("^\\.+"; "")) | select(length > 0)) else null end), domain_suffix: (if (.domain_suffix | type == "array") then (.domain_suffix | map(sub("^\\.+"; "")) | select(length > 0)) else null end)} | del(..|nulls)]}' "temp_srs/raw.json" > "$SB_DIR/$base_name.json"
             sing-box rule-set compile --output "$SB_DIR/$base_name.srs" "$SB_DIR/$base_name.json"
             
@@ -63,21 +59,49 @@ jobs:
           MH_DIR="$BASE_OUT/mihomo"
           mkdir -p "$SB_DIR" "$MH_DIR" temp_ip
           
-          # 注意：这里改成了 main 分支，解决 404 问题
-          BASE_URL="https://raw.githubusercontent.com/1715173329/IPCIDR-CHINA/master"
           FILES=("ip" "ip4" "ip6")
           
           for file in "${FILES[@]}"; do
-            if curl -fL "$BASE_URL/$file.txt" -o "temp_ip/$file.txt"; then
-              grep -E '^[0-9a-fA-F:./]+$' "temp_ip/$file.txt" > "temp_ip/${file}_clean.txt" || true
-              [ ! -s "temp_ip/${file}_clean.txt" ] && continue
+            echo "--------------------------------"
+            echo "正在下载: $file.txt"
+            
+            # 尝试两个源，确保万无一失
+            SUCCESS=false
+            URLS=(
+              "https://raw.githubusercontent.com/1715173329/IPCIDR-CHINA/master/$file.txt"
+              "https://fastly.jsdelivr.net/gh/1715173329/IPCIDR-CHINA@master/$file.txt"
+            )
+            
+            for url in "${URLS[@]}"; do
+              if curl -fLs "$url" -o "temp_ip/$file.txt"; then
+                FILE_SIZE=$(stat -c%s "temp_ip/$file.txt")
+                if [ "$FILE_SIZE" -gt 10 ]; then
+                  echo "下载成功 ($url), 大小: $FILE_SIZE 字节"
+                  SUCCESS=true
+                  break
+                fi
+              fi
+            done
+            
+            if [ "$SUCCESS" = "true" ]; then
+              # 清洗数据：只保留包含数字、点、冒号、斜杠的行
+              grep -E '^[0-9a-fA-F:./]+' "temp_ip/$file.txt" | tr -d '\r' > "temp_ip/${file}_clean.txt" || true
               
-              jq -n --rawfile ips "temp_ip/${file}_clean.txt" '{version: 1, rules: [{ip_cidr: ($ips | split("\n") | map(select(length > 0)))}] }' > "$SB_DIR/$file.json"
-              sing-box rule-set compile --output "$SB_DIR/$file.srs" "$SB_DIR/$file.json"
-              
-              echo "payload:" > "$MH_DIR/$file.yaml"
-              sed 's/^/  - /' "temp_ip/${file}_clean.txt" >> "$MH_DIR/$file.yaml"
-              mihomo convert-ruleset ipcidr yaml "$MH_DIR/$file.yaml" "$MH_DIR/$file.mrs"
+              if [ -s "temp_ip/${file}_clean.txt" ]; then
+                # 生成 Sing-box 格式
+                jq -n --rawfile ips "temp_ip/${file}_clean.txt" '{version: 1, rules: [{ip_cidr: ($ips | split("\n") | map(select(length > 0)))}] }' > "$SB_DIR/$file.json"
+                sing-box rule-set compile --output "$SB_DIR/$file.srs" "$SB_DIR/$file.json"
+                
+                # 生成 Mihomo 格式
+                echo "payload:" > "$MH_DIR/$file.yaml"
+                sed 's/^/  - /' "temp_ip/${file}_clean.txt" >> "$MH_DIR/$file.yaml"
+                mihomo convert-ruleset ipcidr yaml "$MH_DIR/$file.yaml" "$MH_DIR/$file.mrs"
+                echo "$file 处理完成"
+              else
+                echo "警告: $file 清洗后无有效内容"
+              fi
+            else
+              echo "严重错误: $file 下载失败"
             fi
           done
 
@@ -87,8 +111,4 @@ jobs:
           git config user.email "action@github.com"
           git add 1715173329/
           if git diff --staged --quiet; then
-            echo "No changes"
-          else
-            git commit -m "Update Geosite and CNIP with organized structure"
-            git push origin main
-          fi
+            echo "没有检测到任何文件变
