@@ -51,59 +51,71 @@ jobs:
             [ -s "$MH_DIR/$base_name.yaml" ] && mihomo convert-ruleset domain yaml "$MH_DIR/$base_name.yaml" "$MH_DIR/$base_name.mrs" || true
           done
 
-      - name: 2. 处理 CNIP (IP段)
+      - name: 2. 从 ip.txt 提取并生成 IP 规则集
         run: |
           set -euo pipefail
-          BASE_OUT="1715173329/cnip"
-          SB_DIR="$BASE_OUT/sing-box"
-          MH_DIR="$BASE_OUT/mihomo"
+          SB_DIR="1715173329/cnip/sing-box"
+          MH_DIR="1715173329/cnip/mihomo"
           mkdir -p "$SB_DIR" "$MH_DIR" temp_ip
           
-          FILES=("ip" "ip4" "ip6")
+          echo "--------------------------------"
+          echo "正在下载原始文件: ip.txt"
           
-          for file in "${FILES[@]}"; do
-            echo "--------------------------------"
-            echo "正在下载: $file.txt"
-            
-            # 尝试两个源，确保万无一失
-            SUCCESS=false
-            URLS=(
-              "https://raw.githubusercontent.com/1715173329/IPCIDR-CHINA/master/$file.txt"
-              "https://fastly.jsdelivr.net/gh/1715173329/IPCIDR-CHINA@master/$file.txt"
-            )
-            
-            for url in "${URLS[@]}"; do
-              if curl -fLs "$url" -o "temp_ip/$file.txt"; then
-                FILE_SIZE=$(stat -c%s "temp_ip/$file.txt")
-                if [ "$FILE_SIZE" -gt 10 ]; then
-                  echo "下载成功 ($url), 大小: $FILE_SIZE 字节"
-                  SUCCESS=true
-                  break
-                fi
+          SUCCESS=false
+          URLS=(
+            "https://raw.githubusercontent.com/1715173329/IPCIDR-CHINA/master/ip.txt"
+            "https://fastly.jsdelivr.net/gh/1715173329/IPCIDR-CHINA@master/ip.txt"
+          )
+          
+          for url in "${URLS[@]}"; do
+            if curl -fLs "$url" -o "temp_ip/ip_raw.txt"; then
+              if [ $(stat -c%s "temp_ip/ip_raw.txt") -gt 100 ]; then
+                echo "下载成功 ($url)"
+                SUCCESS=true
+                break
               fi
-            done
-            
-            if [ "$SUCCESS" = "true" ]; then
-              # 清洗数据：只保留包含数字、点、冒号、斜杠的行
-              grep -E '^[0-9a-fA-F:./]+' "temp_ip/$file.txt" | tr -d '\r' > "temp_ip/${file}_clean.txt" || true
-              
-              if [ -s "temp_ip/${file}_clean.txt" ]; then
-                # 生成 Sing-box 格式
-                jq -n --rawfile ips "temp_ip/${file}_clean.txt" '{version: 1, rules: [{ip_cidr: ($ips | split("\n") | map(select(length > 0)))}] }' > "$SB_DIR/$file.json"
-                sing-box rule-set compile --output "$SB_DIR/$file.srs" "$SB_DIR/$file.json"
-                
-                # 生成 Mihomo 格式
-                echo "payload:" > "$MH_DIR/$file.yaml"
-                sed 's/^/  - /' "temp_ip/${file}_clean.txt" >> "$MH_DIR/$file.yaml"
-                mihomo convert-ruleset ipcidr yaml "$MH_DIR/$file.yaml" "$MH_DIR/$file.mrs"
-                echo "$file 处理完成"
-              else
-                echo "警告: $file 清洗后无有效内容"
-              fi
-            else
-              echo "严重错误: $file 下载失败"
             fi
           done
+          
+          if [ "$SUCCESS" = "true" ]; then
+            # 1. 清洗原始数据
+            grep -E '^[0-9a-fA-F:./]+' "temp_ip/ip_raw.txt" | tr -d '\r' > "temp_ip/ip.txt"
+            
+            # 2. 逻辑拆分 (关键步骤)
+            # 提取 IPv4 (匹配包含点的行)
+            grep "\." "temp_ip/ip.txt" > "temp_ip/ip4.txt" || true
+            # 提取 IPv6 (匹配包含冒号的行)
+            grep ":" "temp_ip/ip.txt" > "temp_ip/ip6.txt" || true
+            
+            # 3. 循环处理三组文件
+            FILES=("ip" "ip4" "ip6")
+            for file in "${FILES[@]}"; do
+              if [ -s "temp_ip/$file.txt" ]; then
+                echo "正在生成 $file 规则集..."
+                
+                # 生成 Sing-box JSON
+                jq -n --rawfile ips "temp_ip/$file.txt" \
+                  '{version: 1, rules: [{ip_cidr: ($ips | split("\n") | map(select(length > 0)))}] }' > "$SB_DIR/$file.json"
+                
+                # 编译 Sing-box SRS
+                sing-box rule-set compile --output "$SB_DIR/$file.srs" "$SB_DIR/$file.json"
+                
+                # 生成 Mihomo YAML
+                echo "payload:" > "$MH_DIR/$file.yaml"
+                sed 's/^/  - /' "temp_ip/$file.txt" >> "$MH_DIR/$file.yaml"
+                
+                # 编译 Mihomo MRS
+                mihomo convert-ruleset ipcidr yaml "$MH_DIR/$file.yaml" "$MH_DIR/$file.mrs"
+                
+                echo "$file 处理完成"
+              else
+                echo "警告: $file 内容为空，跳过"
+              fi
+            done
+          else
+            echo "错误: 原始 ip.txt 下载失败，无法继续"
+            exit 1
+          fi
 
       - name: 3. 统一上传
         run: |
