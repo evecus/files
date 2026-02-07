@@ -1,0 +1,73 @@
+name: Geosite-!cn格式化转换
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 0 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  convert-rules:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Install Tools
+        run: |
+          wget https://github.com/SagerNet/sing-box/releases/download/v1.12.17/sing-box-1.12.17-linux-amd64.tar.gz
+          tar -xzf sing-box-1.12.17-linux-amd64.tar.gz
+          mv sing-box-1.12.17-linux-amd64/sing-box /usr/local/bin/
+          wget https://github.com/MetaCubeX/mihomo/releases/download/v1.19.17/mihomo-linux-amd64-v1.19.17.gz
+          gunzip mihomo-linux-amd64-v1.19.17.gz
+          mv mihomo-linux-amd64-v1.19.17 mihomo
+          chmod +x mihomo
+          sudo mv mihomo /usr/local/bin/mihomo
+
+      - name: 1. 反编译与 JSON 清洗 (Sing-box)
+        run: |
+          set -euo pipefail
+          mkdir -p singbox-rules mihomo-rules temp_work
+          
+          # 下载原始文件
+          curl -L "https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-!cn.srs" -o temp_work/raw.srs
+          
+          # 反编译并清洗点号 (JSON 规范)
+          sing-box rule-set decompile --output temp_work/decompiled.json temp_work/raw.srs
+          jq '{
+            version: .version, 
+            rules: [
+              .rules[] | {
+                domain: (.domain | map(sub("^\\.+"; ""))), 
+                domain_suffix: (.domain_suffix | map(sub("^\\.+"; "")))
+              } | del(..|nulls)
+            ]
+          }' temp_work/decompiled.json > singbox-rules/geosite-!cn.json
+
+      - name: 2. 精准生成 YAML (Mihomo)
+        run: |
+          set -euo pipefail
+          echo "payload:" > mihomo-rules/geosite-!cn.yaml
+          
+          # A. 处理 domain_suffix ->  - +.example.com
+          jq -r '.rules[].domain_suffix[]?' singbox-rules/geosite-!cn.json | sed 's/^\.*//; s/^/  - +./' >> mihomo-rules/geosite-!cn.yaml || true
+          
+          # B. 处理 domain ->  - example.com
+          jq -r '.rules[].domain[]?' singbox-rules/geosite-!cn.json | sed 's/^\.*//; s/^/  - /' >> mihomo-rules/geosite-!cn.yaml || true
+
+      - name: 3. 编译二进制 (SRS & MRS)
+        run: |
+          set -euo pipefail
+          sing-box rule-set compile --output singbox-rules/geosite-!cn.srs singbox-rules/geosite-!cn.json
+          mihomo convert-ruleset domain yaml mihomo-rules/geosite-!cn.yaml mihomo-rules/geosite-!cn.mrs
+
+      - name: Commit and Push
+        run: |
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+          git add singbox-rules/geosite-!cn.* mihomo-rules/geosite-!cn.*
+          git commit -m "Update geosite-!cn: Correct domain and suffix format" || echo "No changes"
+          git push origin main
