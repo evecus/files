@@ -1,4 +1,4 @@
-name: 批量规则集转换 (兼容性增强版)
+name: 批量转换1715173329规则集
 
 on:
   workflow_dispatch:
@@ -27,14 +27,14 @@ jobs:
           chmod +x mihomo
           sudo mv mihomo /usr/local/bin/mihomo
 
-      - name: 1. 获取列表并执行高兼容转换
+      - name: 1. 获取列表并执行极致精简转换
         run: |
           set -euo pipefail
           OUT_DIR="1715173329"
           mkdir -p "$OUT_DIR"
           mkdir -p temp_srs
           
-          echo "获取文件列表..."
+          echo "正在获取源仓库文件列表..."
           FILE_LIST=$(curl -s "https://api.github.com/repos/1715173329/sing-geosite/contents/?ref=rule-set-unstable" | jq -r '.[] | select(.name | endswith(".srs")) | .name')
           
           for file_name in $FILE_LIST; do
@@ -42,41 +42,44 @@ jobs:
             echo "------------------------------------------------"
             echo "正在处理: $file_name"
             
-            # A. 下载并校验大小
+            # A. 下载校验
             curl -L "https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/$file_name" -o "temp_srs/$file_name"
             if [ $(stat -c%s "temp_srs/$file_name") -lt 100 ]; then
-              echo "跳过: $file_name (无效文件)"
+              echo "跳过无效文件: $file_name"
               continue
             fi
             
             # B. 反编译
             sing-box rule-set decompile --output "temp_srs/raw.json" "temp_srs/$file_name"
             
-            # C. 高兼容清洗：判断字段类型，防止 Cannot iterate over string 报错
+            # C. 精简清洗：移除前导点 + 自动剔除空数组字段
             jq '{
               version: .version, 
               rules: [
                 .rules[] | {
-                  domain: (if (.domain | type == "array") then (.domain | map(sub("^\\.+"; ""))) else [] end),
-                  domain_suffix: (if (.domain_suffix | type == "array") then (.domain_suffix | map(sub("^\\.+"; ""))) else [] end)
+                  domain: (if (.domain | type == "array") then (.domain | map(sub("^\\.+"; "")) | select(length > 0)) else null end),
+                  domain_suffix: (if (.domain_suffix | type == "array") then (.domain_suffix | map(sub("^\\.+"; "")) | select(length > 0)) else null end)
                 } | del(..|nulls)
               ]
             }' "temp_srs/raw.json" > "$OUT_DIR/$base_name.json"
             
-            # D. 编译 SRS
-            sing-box rule-set compile --output "$OUT_DIR/$base_name.srs" "$OUT_DIR/$base_name.json"
+            # D. 编译 SRS (仅在 JSON 有效时)
+            if [ -s "$OUT_DIR/$base_name.json" ]; then
+              sing-box rule-set compile --output "$OUT_DIR/$base_name.srs" "$OUT_DIR/$base_name.json"
+            fi
             
-            # E. 生成 YAML (只提取数组内容)
+            # E. 生成 Mihomo YAML (遵循特定格式)
             echo "payload:" > "$OUT_DIR/$base_name.yaml"
+            # 使用 .domain_suffix[]? 安全迭代，即使字段不存在也不会报错
             jq -r '.rules[].domain_suffix[]?' "$OUT_DIR/$base_name.json" 2>/dev/null | grep -v '^$' | sed 's/^\.*//; s/^/  - +./' >> "$OUT_DIR/$base_name.yaml" || true
             jq -r '.rules[].domain[]?' "$OUT_DIR/$base_name.json" 2>/dev/null | grep -v '^$' | sed 's/^\.*//; s/^/  - /' >> "$OUT_DIR/$base_name.yaml" || true
             
-            # F. 生成 MRS
+            # F. 生成 Mihomo MRS
             if grep -q "  - " "$OUT_DIR/$base_name.yaml"; then
               mihomo convert-ruleset domain yaml "$OUT_DIR/$base_name.yaml" "$OUT_DIR/$base_name.mrs"
             fi
             
-            echo "成功完成: $base_name"
+            echo "成功处理: $base_name"
           done
 
       - name: Commit and Push
@@ -84,5 +87,5 @@ jobs:
           git config user.name "GitHub Action"
           git config user.email "action@github.com"
           git add 1715173329/
-          git commit -m "Fix: handled non-array fields in rulesets" || echo "No changes"
+          git commit -m "Update rulesets: Cleaned up empty fields and normalized domain formats" || echo "No changes"
           git push origin main
