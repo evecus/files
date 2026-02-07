@@ -1,4 +1,4 @@
-name: 批量规则集转换 (最终修复版)
+name: 批量规则集转换 (兼容性增强版)
 
 on:
   workflow_dispatch:
@@ -18,25 +18,23 @@ jobs:
 
       - name: Install Tools
         run: |
-          # 安装 Sing-box
           wget https://github.com/SagerNet/sing-box/releases/download/v1.12.17/sing-box-1.12.17-linux-amd64.tar.gz
           tar -xzf sing-box-1.12.17-linux-amd64.tar.gz
           mv sing-box-1.12.17-linux-amd64/sing-box /usr/local/bin/
-          # 安装 Mihomo
           wget https://github.com/MetaCubeX/mihomo/releases/download/v1.19.17/mihomo-linux-amd64-v1.19.17.gz
           gunzip mihomo-linux-amd64-v1.19.17.gz
           mv mihomo-linux-amd64-v1.19.17 mihomo
           chmod +x mihomo
           sudo mv mihomo /usr/local/bin/mihomo
 
-      - name: 1. 获取列表、下载并精准转换
+      - name: 1. 获取列表并执行高兼容转换
         run: |
           set -euo pipefail
           OUT_DIR="1715173329"
           mkdir -p "$OUT_DIR"
           mkdir -p temp_srs
           
-          echo "正在从源仓库获取文件列表..."
+          echo "获取文件列表..."
           FILE_LIST=$(curl -s "https://api.github.com/repos/1715173329/sing-geosite/contents/?ref=rule-set-unstable" | jq -r '.[] | select(.name | endswith(".srs")) | .name')
           
           for file_name in $FILE_LIST; do
@@ -44,47 +42,41 @@ jobs:
             echo "------------------------------------------------"
             echo "正在处理: $file_name"
             
-            # A. 下载并校验文件大小 (防止下载到 jsDelivr 的错误页面)
+            # A. 下载并校验大小
             curl -L "https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/$file_name" -o "temp_srs/$file_name"
             if [ $(stat -c%s "temp_srs/$file_name") -lt 100 ]; then
-              echo "跳过: $file_name (文件过小或下载失败)"
+              echo "跳过: $file_name (无效文件)"
               continue
             fi
             
-            # B. 反编译为 JSON
+            # B. 反编译
             sing-box rule-set decompile --output "temp_srs/raw.json" "temp_srs/$file_name"
             
-            # C. 清洗 JSON (修复 null 迭代错误 + 清除前导点)
-            # 使用 (.field // []) 确保字段不存在时不会报错
+            # C. 高兼容清洗：判断字段类型，防止 Cannot iterate over string 报错
             jq '{
               version: .version, 
               rules: [
                 .rules[] | {
-                  domain: ((.domain // []) | map(sub("^\\.+"; ""))), 
-                  domain_suffix: ((.domain_suffix // []) | map(sub("^\\.+"; "")))
+                  domain: (if (.domain | type == "array") then (.domain | map(sub("^\\.+"; ""))) else [] end),
+                  domain_suffix: (if (.domain_suffix | type == "array") then (.domain_suffix | map(sub("^\\.+"; ""))) else [] end)
                 } | del(..|nulls)
               ]
             }' "temp_srs/raw.json" > "$OUT_DIR/$base_name.json"
             
-            # D. 重新编译 SRS
+            # D. 编译 SRS
             sing-box rule-set compile --output "$OUT_DIR/$base_name.srs" "$OUT_DIR/$base_name.json"
             
-            # E. 生成 Mihomo YAML (遵循特定格式要求)
+            # E. 生成 YAML (只提取数组内容)
             echo "payload:" > "$OUT_DIR/$base_name.yaml"
+            jq -r '.rules[].domain_suffix[]?' "$OUT_DIR/$base_name.json" 2>/dev/null | grep -v '^$' | sed 's/^\.*//; s/^/  - +./' >> "$OUT_DIR/$base_name.yaml" || true
+            jq -r '.rules[].domain[]?' "$OUT_DIR/$base_name.json" 2>/dev/null | grep -v '^$' | sed 's/^\.*//; s/^/  - /' >> "$OUT_DIR/$base_name.yaml" || true
             
-            # 处理 domain_suffix -> - +.example.com
-            jq -r '.rules[].domain_suffix[]?' "$OUT_DIR/$base_name.json" | grep -v '^$' | sed 's/^\.*//; s/^/  - +./' >> "$OUT_DIR/$base_name.yaml" || true
-            
-            # 处理 domain -> - example.com
-            jq -r '.rules[].domain[]?' "$OUT_DIR/$base_name.json" | sed 's/^\.*//; s/^/  - /' >> "$OUT_DIR/$base_name.yaml" || true
-            
-            # F. 生成 Mihomo MRS
-            # 只有当 yaml 有实际规则条目时才转换
+            # F. 生成 MRS
             if grep -q "  - " "$OUT_DIR/$base_name.yaml"; then
               mihomo convert-ruleset domain yaml "$OUT_DIR/$base_name.yaml" "$OUT_DIR/$base_name.mrs"
             fi
             
-            echo "成功处理: $base_name"
+            echo "成功完成: $base_name"
           done
 
       - name: Commit and Push
@@ -92,5 +84,5 @@ jobs:
           git config user.name "GitHub Action"
           git config user.email "action@github.com"
           git add 1715173329/
-          git commit -m "Batch update all geosite rules: enhanced format and stability" || echo "No changes"
+          git commit -m "Fix: handled non-array fields in rulesets" || echo "No changes"
           git push origin main
