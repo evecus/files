@@ -1,96 +1,94 @@
-name: 批量转换1715173329规则集
+name: 规则全量转换 (Geosite + CNIP 分类版)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "0 8 * * *"
 
 permissions:
   contents: write
 
 jobs:
-  batch-convert:
+  convert-all:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout current repo
         uses: actions/checkout@v4
 
-      - name: Cache Tools
-        id: cache-tools
-        uses: actions/cache@v4
-        with:
-          path: |
-            /usr/local/bin/sing-box
-            /usr/local/bin/mihomo
-          key: ${{ runner.os }}-tools-v1
-
-      - name: Install Tools (if not cached)
-        if: steps.cache-tools.outputs.cache-hit != 'true'
+      - name: Install Tools
         run: |
+          # 安装 sing-box
           wget https://github.com/SagerNet/sing-box/releases/download/v1.12.17/sing-box-1.12.17-linux-amd64.tar.gz
           tar -xzf sing-box-1.12.17-linux-amd64.tar.gz
           sudo mv sing-box-1.12.17-linux-amd64/sing-box /usr/local/bin/
-          
+          # 安装 mihomo
           wget https://github.com/MetaCubeX/mihomo/releases/download/v1.19.17/mihomo-linux-amd64-v1.19.17.gz
           gunzip mihomo-linux-amd64-v1.19.17.gz
           chmod +x mihomo-linux-amd64-v1.19.17
           sudo mv mihomo-linux-amd64-v1.19.17 /usr/local/bin/mihomo
 
-      - name: 1. 执行分类转换与上传
+      - name: 1. 处理 Geosite (域名)
         run: |
           set -euo pipefail
+          BASE_OUT="1715173329/geosite"
+          SB_DIR="$BASE_OUT/sing-box"
+          MH_DIR="$BASE_OUT/mihomo"
+          mkdir -p "$SB_DIR" "$MH_DIR" temp_srs
           
-          # 定义目录结构
-          SB_DIR="1715173329/geosite/sing-box"
-          MH_DIR="1715173329/geosite/mihomo"
-          mkdir -p "$SB_DIR" "$MH_DIR"
-          mkdir -p temp_srs
-          
-          echo "获取文件列表..."
           FILE_LIST=$(curl -s "https://api.github.com/repos/1715173329/sing-geosite/contents/?ref=rule-set-unstable" | jq -r '.[] | select(.name | endswith(".srs")) | .name')
           
           for file_name in $FILE_LIST; do
             base_name="${file_name%.srs}"
-            echo "Processing: $file_name"
-            
-            # A. 下载并校验
             curl -L "https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/$file_name" -o "temp_srs/$file_name"
-            if [ $(stat -c%s "temp_srs/$file_name") -lt 100 ]; then continue; fi
+            [ $(stat -c%s "temp_srs/$file_name") -lt 100 ] && continue
             
-            # B. 反编译并执行精简清洗
             sing-box rule-set decompile --output "temp_srs/raw.json" "temp_srs/$file_name"
             
-            jq '{
-              version: .version, 
-              rules: [
-                .rules[] | {
-                  domain: (if (.domain | type == "array") then (.domain | map(sub("^\\.+"; "")) | select(length > 0)) else null end),
-                  domain_suffix: (if (.domain_suffix | type == "array") then (.domain_suffix | map(sub("^\\.+"; "")) | select(length > 0)) else null end)
-                } | del(..|nulls)
-              ]
-            }' "temp_srs/raw.json" > "$SB_DIR/$base_name.json"
+            # 清洗并移除空字段
+            jq '{version: .version, rules: [.rules[] | {domain: (if (.domain | type == "array") then (.domain | map(sub("^\\.+"; "")) | select(length > 0)) else null end), domain_suffix: (if (.domain_suffix | type == "array") then (.domain_suffix | map(sub("^\\.+"; "")) | select(length > 0)) else null end)} | del(..|nulls)]}' "temp_srs/raw.json" > "$SB_DIR/$base_name.json"
+            sing-box rule-set compile --output "$SB_DIR/$base_name.srs" "$SB_DIR/$base_name.json"
             
-            # C. 编译并分发到 sing-box 目录
-            if [ -s "$SB_DIR/$base_name.json" ]; then
-              sing-box rule-set compile --output "$SB_DIR/$base_name.srs" "$SB_DIR/$base_name.json"
-            fi
-            
-            # D. 转换 YAML 到 mihomo 目录
             echo "payload:" > "$MH_DIR/$base_name.yaml"
-            jq -r '.rules[].domain_suffix[]?' "$SB_DIR/$base_name.json" 2>/dev/null | grep -v '^$' | sed 's/^\.*//; s/^/  - +./' >> "$MH_DIR/$base_name.yaml" || true
-            jq -r '.rules[].domain[]?' "$SB_DIR/$base_name.json" 2>/dev/null | grep -v '^$' | sed 's/^\.*//; s/^/  - /' >> "$MH_DIR/$base_name.yaml" || true
-            
-            # E. 编译 MRS 到 mihomo 目录
-            if grep -q "  - " "$MH_DIR/$base_name.yaml"; then
-              mihomo convert-ruleset domain yaml "$MH_DIR/$base_name.yaml" "$MH_DIR/$base_name.mrs"
+            jq -r '.rules[].domain_suffix[]?' "$SB_DIR/$base_name.json" 2>/dev/null | sed 's/^\.*//; s/^/  - +./' >> "$MH_DIR/$base_name.yaml" || true
+            jq -r '.rules[].domain[]?' "$SB_DIR/$base_name.json" 2>/dev/null | sed 's/^\.*//; s/^/  - /' >> "$MH_DIR/$base_name.yaml" || true
+            [ -s "$MH_DIR/$base_name.yaml" ] && mihomo convert-ruleset domain yaml "$MH_DIR/$base_name.yaml" "$MH_DIR/$base_name.mrs" || true
+          done
+
+      - name: 2. 处理 CNIP (IP段)
+        run: |
+          set -euo pipefail
+          BASE_OUT="1715173329/cnip"
+          SB_DIR="$BASE_OUT/sing-box"
+          MH_DIR="$BASE_OUT/mihomo"
+          mkdir -p "$SB_DIR" "$MH_DIR" temp_ip
+          
+          # 注意：这里改成了 main 分支，解决 404 问题
+          BASE_URL="https://raw.githubusercontent.com/1715173329/IPCIDR-CHINA/main"
+          FILES=("ip" "ip4" "ip6")
+          
+          for file in "${FILES[@]}"; do
+            if curl -fL "$BASE_URL/$file.txt" -o "temp_ip/$file.txt"; then
+              grep -E '^[0-9a-fA-F:./]+$' "temp_ip/$file.txt" > "temp_ip/${file}_clean.txt" || true
+              [ ! -s "temp_ip/${file}_clean.txt" ] && continue
+              
+              jq -n --rawfile ips "temp_ip/${file}_clean.txt" '{version: 1, rules: [{ip_cidr: ($ips | split("\n") | map(select(length > 0)))}] }' > "$SB_DIR/$file.json"
+              sing-box rule-set compile --output "$SB_DIR/$file.srs" "$SB_DIR/$file.json"
+              
+              echo "payload:" > "$MH_DIR/$file.yaml"
+              sed 's/^/  - /' "temp_ip/${file}_clean.txt" >> "$MH_DIR/$file.yaml"
+              mihomo convert-ruleset ipcidr yaml "$MH_DIR/$file.yaml" "$MH_DIR/$file.mrs"
             fi
           done
 
-      - name: Commit and Push
+      - name: 3. 统一上传
         run: |
           git config user.name "GitHub Action"
           git config user.email "action@github.com"
           git add 1715173329/
-          git commit -m "Organized update: sing-box and mihomo subdirectories" || echo "No changes"
-          git push origin main
+          if git diff --staged --quiet; then
+            echo "No changes"
+          else
+            git commit -m "Update Geosite and CNIP with organized structure"
+            git push origin main
+          fi
