@@ -1,4 +1,4 @@
-name: 中国 IP 规则转换 (彻底修复 404 及格式错误)
+name: 中国 IP 规则转换 (强制分类目录版)
 
 on:
   workflow_dispatch:
@@ -16,17 +16,7 @@ jobs:
       - name: Checkout current repo
         uses: actions/checkout@v4
 
-      - name: Cache Tools
-        id: cache-tools
-        uses: actions/cache@v4
-        with:
-          path: |
-            /usr/local/bin/sing-box
-            /usr/local/bin/mihomo
-          key: ${{ runner.os }}-tools-v1
-
       - name: Install Tools
-        if: steps.cache-tools.outputs.cache-hit != 'true'
         run: |
           wget https://github.com/SagerNet/sing-box/releases/download/v1.12.17/sing-box-1.12.17-linux-amd64.tar.gz
           tar -xzf sing-box-1.12.17-linux-amd64.tar.gz
@@ -37,65 +27,58 @@ jobs:
           chmod +x mihomo-linux-amd64-v1.19.17
           sudo mv mihomo-linux-amd64-v1.19.17 /usr/local/bin/mihomo
 
-      - name: 1. 下载并多重校验转换 IP 规则
+      - name: 1. 下载并转换 IP 规则 (强制目录生成)
         run: |
-          set -euo pipefail
-          
+          # 建立层级目录：这一步会确保 1715173329/cnip/ 下的子目录存在
           SB_DIR="1715173329/cnip/sing-box"
           MH_DIR="1715173329/cnip/mihomo"
           mkdir -p "$SB_DIR" "$MH_DIR"
           mkdir -p temp_ip
           
-          FILES=("ip" "ip4" "ip6")
-          # 修复点 1：更换为 main 分支，并使用通用的 raw 链接
+          # 修复下载链接：将之前的 master 改为目前的正确分支 main
           BASE_URL="https://raw.githubusercontent.com/1715173329/IPCIDR-CHINA/main"
+          FILES=("ip" "ip4" "ip6")
           
           for file in "${FILES[@]}"; do
-            echo "------------------------------------------------"
             echo "正在处理: $file.txt"
             
-            # 修复点 2：使用 -f 参数，若遇到 404 直接让 curl 报错，配合 retry 增加稳定性
+            # 使用 -fL 下载，404 时不会下载错误文本，避免后续编译器报错
             if ! curl -fL "$BASE_URL/$file.txt" -o "temp_ip/$file.txt"; then
-              echo "错误: $file.txt 下载失败 (可能是分支名变更或文件不存在)，跳过。"
+              echo "跳过 $file.txt: 远程文件不存在或链接错误。"
               continue
             fi
 
-            # 修复点 3：过滤非 IP 格式的行，确保只有包含数字和点的行进入处理流程
+            # 过滤脏数据：只保留包含数字、点、冒号、斜杠的 IP 行
             grep -E '^[0-9a-fA-F:./]+$' "temp_ip/$file.txt" > "temp_ip/${file}_clean.txt" || true
             
             if [ ! -s "temp_ip/${file}_clean.txt" ]; then
-              echo "警告: $file 提取后为空，跳过内容处理。"
+              echo "跳过 $file: 内容为空。"
               continue
             fi
 
-            # B. 生成 Sing-box JSON
+            # 生成并编译 Sing-box 格式
             jq -n --rawfile ips "temp_ip/${file}_clean.txt" \
-              '{
-                version: 1,
-                rules: [
-                  {
-                    ip_cidr: ($ips | split("\n") | map(select(length > 0)))
-                  }
-                ]
-              }' > "$SB_DIR/$file.json"
-            
-            # C. 编译为 Sing-box SRS
+              '{ version: 1, rules: [{ ip_cidr: ($ips | split("\n") | map(select(length > 0))) }] }' > "$SB_DIR/$file.json"
             sing-box rule-set compile --output "$SB_DIR/$file.srs" "$SB_DIR/$file.json"
             
-            # D. 生成 Mihomo YAML
+            # 生成并编译 Mihomo 格式
             echo "payload:" > "$MH_DIR/$file.yaml"
             sed 's/^/  - /' "temp_ip/${file}_clean.txt" >> "$MH_DIR/$file.yaml"
-            
-            # E. 编译为 Mihomo MRS
             mihomo convert-ruleset ipcidr yaml "$MH_DIR/$file.yaml" "$MH_DIR/$file.mrs"
             
             echo "成功完成: $file"
           done
 
-      - name: Commit and Push
+      - name: 2. 强制提交并上传
         run: |
           git config user.name "GitHub Action"
           git config user.email "action@github.com"
-          git add 1715173329/cnip/
-          git commit -m "Fix: handled 404 and branch name change for CN IP rules" || echo "No changes"
-          git push origin main
+          # 关键点：使用 git add . 包含所有新创建的目录和文件
+          git add 1715173329/
+          # 检查是否有文件变动，有则提交，无则跳过
+          if git diff --staged --quiet; then
+            echo "没有发现文件更新。"
+          else
+            git commit -m "Update CNIP rules: New directory structure and files"
+            git push origin main
+          fi
