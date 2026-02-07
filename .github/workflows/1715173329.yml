@@ -1,4 +1,4 @@
-name: 规则全量转换 (稳定修复版)
+name: 1715173329规则转换
 
 on:
   workflow_dispatch:
