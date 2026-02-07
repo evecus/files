@@ -3739,6 +3739,7 @@ payload:
   - +.bitstamp.net
   - +.bitstream.com
   - +.bitterwinter.org
+  - +.bittorrent.com
   - +.bittrex.com
   - +.bitvise.com
   - +.bitwarden.com
@@ -11180,6 +11181,7 @@ payload:
   - +.helpster.de
   - +.helpzhuling.org
   - +.helsinki
+  - +.hembed.com
   - +.hentai-ani.me
   - +.hentai-archive.com
   - +.hentai-books.com
@@ -15028,6 +15030,8 @@ payload:
   - +.mantan-web.jp
   - +.mantochichi.com
   - +.manurefetish.com
+  - +.manus.im
+  - +.manuscdn.com
   - +.manytoon.com
   - +.manyvids.com
   - +.manyvoices.news
@@ -21293,6 +21297,7 @@ payload:
   - +.sketchbooknews.com
   - +.sketchbookpro.com
   - +.sketchfab.com
+  - +.skills.sh
   - +.skillshare.com
   - +.skimtube.com
   - +.skinstrip.net
@@ -23919,6 +23924,7 @@ payload:
   - +.v-has.com
   - +.v.gd
   - +.v2.help
+  - +.v2.hysteria.network
   - +.v2ex.com
   - +.v2fly.org
   - +.v2ph.com
