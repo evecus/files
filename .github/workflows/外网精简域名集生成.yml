@@ -33,7 +33,7 @@ jobs:
           mkdir -p temp_source temp_build singbox-rules mihomo-rules
           
           FILES=(
-            "category-ai-!cn.yaml" "discord.yaml" "facebook.yaml" "github.yaml" 
+            "category-ai-!cn.yaml" "discord.yaml" "facebook.yaml" "github.yaml" "netflix.yaml" 
             "google.yaml" "instagram.yaml" "paypal.yaml" "reddit.yaml" "grok.yaml" 
             "spotify.yaml" "tiktok.yaml" "twitter.yaml" "whatsapp.yaml" "openai.yaml" 
             "youtube.yaml" "geogle-gemini.yaml" "telegram.yaml" "claude.yaml" 
