@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain": [],
+      "domain_suffix": [
+        "aamgame.com",
+        "aamgame.mobi",
+        "aamgame.net",
+        "aamsmart.com",
+        "singworld.net"
+      ]
+    }
+  ]
+}

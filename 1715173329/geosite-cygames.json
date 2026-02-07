@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain": [],
+      "domain_suffix": [
+        "cygames.co.jp",
+        "cygames.jp",
+        "umamusume.akamaized.net",
+        "worldflipper.akamaized.net",
+        "worldflipper.jp"
+      ]
+    }
+  ]
+}

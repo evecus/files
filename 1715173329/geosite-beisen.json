@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain": [],
+      "domain_suffix": [
+        "beisen.cn",
+        "beisen.com",
+        "beisenapp.com",
+        "beisencloud.com",
+        "beisenpaas.com",
+        "bsurl.cc",
+        "bsurl.cn",
+        "zhiye.com"
+      ]
+    }
+  ]
+}

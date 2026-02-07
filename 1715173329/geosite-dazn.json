@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain": [],
+      "domain_suffix": [
+        "dazn-api.com",
+        "dazn.com",
+        "dazndn.com",
+        "daznfeeds.com",
+        "daznplayer.com",
+        "daznservices.com",
+        "indazn.com",
+        "indaznlab.com"
+      ]
+    }
+  ]
+}

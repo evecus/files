@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain": [],
+      "domain_suffix": [
+        "lg.com",
+        "lgappstv.com",
+        "lge.co.kr",
+        "lge.com",
+        "lgecareers.com",
+        "lghvac.com",
+        "lghvacstory.com",
+        "lgrecyclingprogram.com",
+        "lgsalesportal.com"
+      ]
+    }
+  ]
+}

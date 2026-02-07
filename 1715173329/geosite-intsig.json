@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain": [],
+      "domain_suffix": [
+        "camcard.com",
+        "camscanner.com",
+        "intsig.com",
+        "intsig.net",
+        "qixin.com"
+      ]
+    }
+  ]
+}

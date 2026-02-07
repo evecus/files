@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain": [],
+      "domain_suffix": [
+        "matters.news",
+        "matters.one",
+        "matters.town",
+        "mattersprotocol.io"
+      ]
+    }
+  ]
+}

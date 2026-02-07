@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain": [],
+      "domain_suffix": [
+        "fontbook.com",
+        "fontshop.com",
+        "fstopimages.com"
+      ]
+    }
+  ]
+}

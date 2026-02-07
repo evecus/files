@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain": [],
+      "domain_suffix": [
+        "beth.games",
+        "bethesda.net",
+        "bethesdagamestudios.com",
+        "bethsoft.com",
+        "doom.com",
+        "elderscrolls.com"
+      ]
+    }
+  ]
+}

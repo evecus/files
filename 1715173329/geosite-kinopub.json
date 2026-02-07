@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain": [],
+      "domain_suffix": [
+        "cdn-service.space",
+        "cdn2cdn.com",
+        "cdn2site.com",
+        "gfw.ovh",
+        "kino.pub",
+        "kinopub.online",
+        "mos-gorsud.co",
+        "pushbr.com"
+      ]
+    }
+  ]
+}
