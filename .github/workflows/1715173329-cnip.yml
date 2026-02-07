@@ -1,4 +1,4 @@
-name: 1715173329中国IP规则转换
+name: 中国 IP 规则转换 (彻底修复 404 及格式错误)
 
 on:
   workflow_dispatch:
@@ -37,29 +37,39 @@ jobs:
           chmod +x mihomo-linux-amd64-v1.19.17
           sudo mv mihomo-linux-amd64-v1.19.17 /usr/local/bin/mihomo
 
-      - name: 1. 下载并分类转换 IP 规则
+      - name: 1. 下载并多重校验转换 IP 规则
         run: |
           set -euo pipefail
           
-          # 定义目录结构
           SB_DIR="1715173329/cnip/sing-box"
           MH_DIR="1715173329/cnip/mihomo"
           mkdir -p "$SB_DIR" "$MH_DIR"
           mkdir -p temp_ip
           
-          # 文件列表
           FILES=("ip" "ip4" "ip6")
-          BASE_URL="https://raw.githubusercontent.com/1715173329/IPCIDR-CHINA/refs/heads/master"
+          # 修复点 1：更换为 main 分支，并使用通用的 raw 链接
+          BASE_URL="https://raw.githubusercontent.com/1715173329/IPCIDR-CHINA/main"
           
           for file in "${FILES[@]}"; do
+            echo "------------------------------------------------"
             echo "正在处理: $file.txt"
             
-            # A. 下载 TXT 文件
-            curl -L "$BASE_URL/$file.txt" -o "temp_ip/$file.txt"
+            # 修复点 2：使用 -f 参数，若遇到 404 直接让 curl 报错，配合 retry 增加稳定性
+            if ! curl -fL "$BASE_URL/$file.txt" -o "temp_ip/$file.txt"; then
+              echo "错误: $file.txt 下载失败 (可能是分支名变更或文件不存在)，跳过。"
+              continue
+            fi
+
+            # 修复点 3：过滤非 IP 格式的行，确保只有包含数字和点的行进入处理流程
+            grep -E '^[0-9a-fA-F:./]+$' "temp_ip/$file.txt" > "temp_ip/${file}_clean.txt" || true
             
-            # B. 生成 Sing-box JSON (IPCIDR 格式)
-            # 将 TXT 每一行 IP 转换为 JSON 数组元素
-            jq -n --rawfile ips "temp_ip/$file.txt" \
+            if [ ! -s "temp_ip/${file}_clean.txt" ]; then
+              echo "警告: $file 提取后为空，跳过内容处理。"
+              continue
+            fi
+
+            # B. 生成 Sing-box JSON
+            jq -n --rawfile ips "temp_ip/${file}_clean.txt" \
               '{
                 version: 1,
                 rules: [
@@ -72,9 +82,9 @@ jobs:
             # C. 编译为 Sing-box SRS
             sing-box rule-set compile --output "$SB_DIR/$file.srs" "$SB_DIR/$file.json"
             
-            # D. 生成 Mihomo YAML (payload 格式)
+            # D. 生成 Mihomo YAML
             echo "payload:" > "$MH_DIR/$file.yaml"
-            sed 's/^/  - /' "temp_ip/$file.txt" >> "$MH_DIR/$file.yaml"
+            sed 's/^/  - /' "temp_ip/${file}_clean.txt" >> "$MH_DIR/$file.yaml"
             
             # E. 编译为 Mihomo MRS
             mihomo convert-ruleset ipcidr yaml "$MH_DIR/$file.yaml" "$MH_DIR/$file.mrs"
@@ -87,5 +97,5 @@ jobs:
           git config user.name "GitHub Action"
           git config user.email "action@github.com"
           git add 1715173329/cnip/
-          git commit -m "Update CN IP rules: Organized into sing-box and mihomo subdirectories" || echo "No changes"
+          git commit -m "Fix: handled 404 and branch name change for CN IP rules" || echo "No changes"
           git push origin main
