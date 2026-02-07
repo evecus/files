@@ -2,7 +2,6 @@
   "version": 2,
   "rules": [
     {
-      "domain": [],
       "domain_suffix": [
         "ats1.e-timing.ne.jp",
         "ntp-os01.ocn.ad.jp",

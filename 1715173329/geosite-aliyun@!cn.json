@@ -2,7 +2,6 @@
   "version": 2,
   "rules": [
     {
-      "domain": [],
       "domain_suffix": [
         "oss-ap-northeast-1.aliyuncs.com",
         "oss-ap-northeast-2.aliyuncs.com",

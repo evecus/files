@@ -2,7 +2,6 @@
   "version": 2,
   "rules": [
     {
-      "domain": [],
       "domain_suffix": [
         "ads-union.jd.com",
         "ads.union.jd.com",

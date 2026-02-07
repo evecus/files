@@ -2,7 +2,6 @@
   "version": 2,
   "rules": [
     {
-      "domain": [],
       "domain_suffix": [
         "5ifund.com",
         "99fund.com",

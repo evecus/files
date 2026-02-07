@@ -2,7 +2,6 @@
   "version": 2,
   "rules": [
     {
-      "domain": [],
       "domain_suffix": [
         "adobe-crl.verisign.com",
         "certipath-aia.verisign.com",

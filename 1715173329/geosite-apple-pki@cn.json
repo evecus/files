@@ -13,8 +13,7 @@
         "ocsp2.apple.com",
         "valid.apple.com",
         "valid.origin-apple.com.akadns.net"
-      ],
-      "domain_suffix": []
+      ]
     }
   ]
 }

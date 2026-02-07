@@ -2,7 +2,6 @@
   "version": 2,
   "rules": [
     {
-      "domain": [],
       "domain_suffix": [
         "frontier-lark-lb-v3.lf.bytelb.net",
         "lark-passport-qa-sg.net",

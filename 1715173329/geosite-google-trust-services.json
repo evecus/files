@@ -14,8 +14,7 @@
         "pki.google.com",
         "preprod-publicca.googleapis.com",
         "publicca.googleapis.com"
-      ],
-      "domain_suffix": []
+      ]
     }
   ]
 }

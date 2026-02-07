@@ -2,7 +2,6 @@
   "version": 2,
   "rules": [
     {
-      "domain": [],
       "domain_suffix": [
         "ae-ad-1.myhuaweicloud.com",
         "af-east-201.myhuaweicloud.com",

@@ -2,7 +2,6 @@
   "version": 2,
   "rules": [
     {
-      "domain": [],
       "domain_suffix": [
         "cnspeedtest.cn",
         "speed.neu6.edu.cn",
