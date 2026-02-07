@@ -1,4 +1,4 @@
-name: 外网精简域名集生成
+name: 代理精简域名集生成
 
 on:
   workflow_dispatch:
@@ -36,7 +36,7 @@ jobs:
             "category-ai-!cn.yaml" "discord.yaml" "facebook.yaml" "github.yaml" 
             "google.yaml" "instagram.yaml" "paypal.yaml" "reddit.yaml" 
             "spotify.yaml" "tiktok.yaml" "twitter.yaml" "whatsapp.yaml" 
-            "youtube.yaml" "geogle-gemini.yaml" "telegram.yaml"
+            "youtube.yaml" "geogle-gemini.yaml" "telegram.yaml" "claude.yaml"
           )
           
           BASE_URL="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite"
