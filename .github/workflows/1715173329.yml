@@ -111,4 +111,8 @@ jobs:
           git config user.email "action@github.com"
           git add 1715173329/
           if git diff --staged --quiet; then
-            echo "没有检测到任何文件变
+            echo "没有检测到任何文件变动"
+          else
+            git commit -m "Update: 全量同步 Geosite 与 CNIP"
+            git push origin main
+          fi
