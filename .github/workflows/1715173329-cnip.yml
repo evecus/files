@@ -1,0 +1,91 @@
+name: 1715173329中国IP规则转换
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  convert-cnip:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Cache Tools
+        id: cache-tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/bin/sing-box
+            /usr/local/bin/mihomo
+          key: ${{ runner.os }}-tools-v1
+
+      - name: Install Tools
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        run: |
+          wget https://github.com/SagerNet/sing-box/releases/download/v1.12.17/sing-box-1.12.17-linux-amd64.tar.gz
+          tar -xzf sing-box-1.12.17-linux-amd64.tar.gz
+          sudo mv sing-box-1.12.17-linux-amd64/sing-box /usr/local/bin/
+          
+          wget https://github.com/MetaCubeX/mihomo/releases/download/v1.19.17/mihomo-linux-amd64-v1.19.17.gz
+          gunzip mihomo-linux-amd64-v1.19.17.gz
+          chmod +x mihomo-linux-amd64-v1.19.17
+          sudo mv mihomo-linux-amd64-v1.19.17 /usr/local/bin/mihomo
+
+      - name: 1. 下载并分类转换 IP 规则
+        run: |
+          set -euo pipefail
+          
+          # 定义目录结构
+          SB_DIR="1715173329/cnip/sing-box"
+          MH_DIR="1715173329/cnip/mihomo"
+          mkdir -p "$SB_DIR" "$MH_DIR"
+          mkdir -p temp_ip
+          
+          # 文件列表
+          FILES=("ip" "ip4" "ip6")
+          BASE_URL="https://raw.githubusercontent.com/1715173329/IPCIDR-CHINA/refs/heads/master"
+          
+          for file in "${FILES[@]}"; do
+            echo "正在处理: $file.txt"
+            
+            # A. 下载 TXT 文件
+            curl -L "$BASE_URL/$file.txt" -o "temp_ip/$file.txt"
+            
+            # B. 生成 Sing-box JSON (IPCIDR 格式)
+            # 将 TXT 每一行 IP 转换为 JSON 数组元素
+            jq -n --rawfile ips "temp_ip/$file.txt" \
+              '{
+                version: 1,
+                rules: [
+                  {
+                    ip_cidr: ($ips | split("\n") | map(select(length > 0)))
+                  }
+                ]
+              }' > "$SB_DIR/$file.json"
+            
+            # C. 编译为 Sing-box SRS
+            sing-box rule-set compile --output "$SB_DIR/$file.srs" "$SB_DIR/$file.json"
+            
+            # D. 生成 Mihomo YAML (payload 格式)
+            echo "payload:" > "$MH_DIR/$file.yaml"
+            sed 's/^/  - /' "temp_ip/$file.txt" >> "$MH_DIR/$file.yaml"
+            
+            # E. 编译为 Mihomo MRS
+            mihomo convert-ruleset ipcidr yaml "$MH_DIR/$file.yaml" "$MH_DIR/$file.mrs"
+            
+            echo "成功完成: $file"
+          done
+
+      - name: Commit and Push
+        run: |
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+          git add 1715173329/cnip/
+          git commit -m "Update CN IP rules: Organized into sing-box and mihomo subdirectories" || echo "No changes"
+          git push origin main
