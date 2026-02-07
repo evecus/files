@@ -16,43 +16,51 @@ jobs:
       - name: Checkout current repo
         uses: actions/checkout@v4
 
-      - name: Install Tools
+      - name: Cache Tools
+        id: cache-tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/bin/sing-box
+            /usr/local/bin/mihomo
+          key: ${{ runner.os }}-tools-v1
+
+      - name: Install Tools (if not cached)
+        if: steps.cache-tools.outputs.cache-hit != 'true'
         run: |
           wget https://github.com/SagerNet/sing-box/releases/download/v1.12.17/sing-box-1.12.17-linux-amd64.tar.gz
           tar -xzf sing-box-1.12.17-linux-amd64.tar.gz
-          mv sing-box-1.12.17-linux-amd64/sing-box /usr/local/bin/
+          sudo mv sing-box-1.12.17-linux-amd64/sing-box /usr/local/bin/
+          
           wget https://github.com/MetaCubeX/mihomo/releases/download/v1.19.17/mihomo-linux-amd64-v1.19.17.gz
           gunzip mihomo-linux-amd64-v1.19.17.gz
-          mv mihomo-linux-amd64-v1.19.17 mihomo
-          chmod +x mihomo
-          sudo mv mihomo /usr/local/bin/mihomo
+          chmod +x mihomo-linux-amd64-v1.19.17
+          sudo mv mihomo-linux-amd64-v1.19.17 /usr/local/bin/mihomo
 
-      - name: 1. 获取列表并执行极致精简转换
+      - name: 1. 执行分类转换与上传
         run: |
           set -euo pipefail
-          OUT_DIR="1715173329"
-          mkdir -p "$OUT_DIR"
+          
+          # 定义目录结构
+          SB_DIR="1715173329/geosite/sing-box"
+          MH_DIR="1715173329/geosite/mihomo"
+          mkdir -p "$SB_DIR" "$MH_DIR"
           mkdir -p temp_srs
           
-          echo "正在获取源仓库文件列表..."
+          echo "获取文件列表..."
           FILE_LIST=$(curl -s "https://api.github.com/repos/1715173329/sing-geosite/contents/?ref=rule-set-unstable" | jq -r '.[] | select(.name | endswith(".srs")) | .name')
           
           for file_name in $FILE_LIST; do
             base_name="${file_name%.srs}"
-            echo "------------------------------------------------"
-            echo "正在处理: $file_name"
+            echo "Processing: $file_name"
             
-            # A. 下载校验
+            # A. 下载并校验
             curl -L "https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/$file_name" -o "temp_srs/$file_name"
-            if [ $(stat -c%s "temp_srs/$file_name") -lt 100 ]; then
-              echo "跳过无效文件: $file_name"
-              continue
-            fi
+            if [ $(stat -c%s "temp_srs/$file_name") -lt 100 ]; then continue; fi
             
-            # B. 反编译
+            # B. 反编译并执行精简清洗
             sing-box rule-set decompile --output "temp_srs/raw.json" "temp_srs/$file_name"
             
-            # C. 精简清洗：移除前导点 + 自动剔除空数组字段
             jq '{
               version: .version, 
               rules: [
@@ -61,25 +69,22 @@ jobs:
                   domain_suffix: (if (.domain_suffix | type == "array") then (.domain_suffix | map(sub("^\\.+"; "")) | select(length > 0)) else null end)
                 } | del(..|nulls)
               ]
-            }' "temp_srs/raw.json" > "$OUT_DIR/$base_name.json"
+            }' "temp_srs/raw.json" > "$SB_DIR/$base_name.json"
             
-            # D. 编译 SRS (仅在 JSON 有效时)
-            if [ -s "$OUT_DIR/$base_name.json" ]; then
-              sing-box rule-set compile --output "$OUT_DIR/$base_name.srs" "$OUT_DIR/$base_name.json"
+            # C. 编译并分发到 sing-box 目录
+            if [ -s "$SB_DIR/$base_name.json" ]; then
+              sing-box rule-set compile --output "$SB_DIR/$base_name.srs" "$SB_DIR/$base_name.json"
             fi
             
-            # E. 生成 Mihomo YAML (遵循特定格式)
-            echo "payload:" > "$OUT_DIR/$base_name.yaml"
-            # 使用 .domain_suffix[]? 安全迭代，即使字段不存在也不会报错
-            jq -r '.rules[].domain_suffix[]?' "$OUT_DIR/$base_name.json" 2>/dev/null | grep -v '^$' | sed 's/^\.*//; s/^/  - +./' >> "$OUT_DIR/$base_name.yaml" || true
-            jq -r '.rules[].domain[]?' "$OUT_DIR/$base_name.json" 2>/dev/null | grep -v '^$' | sed 's/^\.*//; s/^/  - /' >> "$OUT_DIR/$base_name.yaml" || true
+            # D. 转换 YAML 到 mihomo 目录
+            echo "payload:" > "$MH_DIR/$base_name.yaml"
+            jq -r '.rules[].domain_suffix[]?' "$SB_DIR/$base_name.json" 2>/dev/null | grep -v '^$' | sed 's/^\.*//; s/^/  - +./' >> "$MH_DIR/$base_name.yaml" || true
+            jq -r '.rules[].domain[]?' "$SB_DIR/$base_name.json" 2>/dev/null | grep -v '^$' | sed 's/^\.*//; s/^/  - /' >> "$MH_DIR/$base_name.yaml" || true
             
-            # F. 生成 Mihomo MRS
-            if grep -q "  - " "$OUT_DIR/$base_name.yaml"; then
-              mihomo convert-ruleset domain yaml "$OUT_DIR/$base_name.yaml" "$OUT_DIR/$base_name.mrs"
+            # E. 编译 MRS 到 mihomo 目录
+            if grep -q "  - " "$MH_DIR/$base_name.yaml"; then
+              mihomo convert-ruleset domain yaml "$MH_DIR/$base_name.yaml" "$MH_DIR/$base_name.mrs"
             fi
-            
-            echo "成功处理: $base_name"
           done
 
       - name: Commit and Push
@@ -87,5 +92,5 @@ jobs:
           git config user.name "GitHub Action"
           git config user.email "action@github.com"
           git add 1715173329/
-          git commit -m "Update rulesets: Cleaned up empty fields and normalized domain formats" || echo "No changes"
+          git commit -m "Organized update: sing-box and mihomo subdirectories" || echo "No changes"
           git push origin main
