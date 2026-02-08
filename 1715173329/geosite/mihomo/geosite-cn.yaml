@@ -1,6 +1,7 @@
 payload:
   - +.baidu
   - +.sohu
+  - +.0033.cn
   - +.00cdn.com
   - +.0123456789.com
   - +.0379home.com
@@ -47,22 +48,8 @@ payload:
   - +.123pan.com
   - +.123panpay.com
   - +.123u.com
-  - +.126.com
-  - +.126.link
-  - +.126.net
-  - +.127.com
-  - +.127.net
   - +.13a.com
-  - +.163.com
   - +.1637.com
-  - +.163cn.tv
-  - +.163industry.com
-  - +.163jiasu.com
-  - +.163mail.com
-  - +.163qiyukf.com
-  - +.163yun.com
-  - +.166.com
-  - +.166.net
   - +.16888.com
   - +.16q.cn
   - +.16rd.com
@@ -82,7 +69,6 @@ payload:
   - +.17zuoye.com
   - +.17zuoye.net
   - +.18183.com
-  - +.188.com
   - +.1905.com
   - +.19yxw.com
   - +.1hai.cn
@@ -108,7 +94,6 @@ payload:
   - +.310win.com
   - +.315che.com
   - +.315dian.com
-  - +.321fenx.com
   - +.3234.com
   - +.32r.com
   - +.3304399.com
@@ -1965,7 +1950,6 @@ payload:
   - +.haosou.com.cn
   - +.haosou.net
   - +.haote.com
-  - +.haowu.link
   - +.haoyouyinxiang.com
   - +.hapjs.org
   - +.happyhlddz.com
@@ -1998,6 +1982,8 @@ payload:
   - +.herogame.com
   - +.herostart.com
   - +.heweather.net
+  - +.hexin.cn
+  - +.hexin.com.cn
   - +.hexun.com
   - +.heytea.com
   - +.hf-aw.cn
@@ -2393,6 +2379,7 @@ payload:
   - +.jikeiot.cloud
   - +.jikexueyuan.com
   - +.jikipedia.com
+  - +.jin10.com
   - +.jindidata.com
   - +.jinglingbiaozhu.com
   - +.jinianbi.com
@@ -2751,8 +2738,6 @@ payload:
   - +.letv.com
   - +.letvcdn.com
   - +.letvimg.com
-  - +.lf126.net
-  - +.lf127.net
   - +.lgstatic.com
   - +.lhzq.com
   - +.lianjia.com
@@ -2803,7 +2788,6 @@ payload:
   - +.llscdn.com
   - +.llsserver.com
   - +.lnlib.net
-  - +.lofter.com
   - +.lofter.httpdns.c.163.com
   - +.log.hunantv.com
   - +.log.v2.hunantv.com
@@ -3107,7 +3091,6 @@ payload:
   - +.nbd.com.cn
   - +.ncss.cn
   - +.ncss.org.cn
-  - +.nease.net
   - +.neea.cn
   - +.neixin.cn
   - +.nellit.cn
@@ -3122,10 +3105,6 @@ payload:
   - +.neoschool.com
   - +.nesc.cn
   - +.netbian.com
-  - +.netease-inc.com
-  - +.netease.com
-  - +.netease.im
-  - +.netstatic.net
   - +.network-auth.cn
   - +.netzz.net
   - +.newasp.net
@@ -3438,9 +3417,6 @@ payload:
   - +.qiuwenbaike.cn
   - +.qixin.com
   - +.qiyou.cn
-  - +.qiyukf.com
-  - +.qiyukf.net
-  - +.qiyukf.net.cn
   - +.qizuang.com
   - +.ql1d.com
   - +.qlinkto.cn
@@ -3774,7 +3750,6 @@ payload:
   - +.starbaby.cc
   - +.starbaby.com
   - +.starworldgames.com
-  - +.static163.net
   - +.staticfile.net
   - +.staticfile.org
   - +.statickksmg.com
@@ -4472,9 +4447,7 @@ payload:
   - +.yctdyy.com
   - +.ydamc.com
   - +.ydsc.com.cn
-  - +.ydstatic.com
   - +.ydsys.cn
-  - +.yeah.net
   - +.yebaojiasu.com
   - +.yeepay.com
   - +.yeshen.com
@@ -4541,7 +4514,6 @@ payload:
   - +.yoojia.com
   - +.youba.com
   - +.youboy.com
-  - +.youdao.com
   - +.youhua.com
   - +.youjiao.com
   - +.youke.co
@@ -4629,7 +4601,6 @@ payload:
   - +.yunqishi.net
   - +.yunshipei.com
   - +.yunxiao.com
-  - +.yunxinfw.com
   - +.yunzhijia.com
   - +.yunzhuxue.com
   - +.yupoo.com
@@ -4745,7 +4716,6 @@ payload:
   - +.zhuanspirit.com
   - +.zhuanstatic.com
   - +.zhuanyewanjia.com
-  - +.zhuanzfx.com
   - +.zhuanzhuan.com
   - +.zhuayoukong.com
   - +.zhubajie.com
