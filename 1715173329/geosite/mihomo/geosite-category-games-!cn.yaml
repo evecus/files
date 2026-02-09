@@ -4,9 +4,14 @@ payload:
   - +.100classicbooks.com
   - +.2k.com
   - +.2kcoretech.online
+  - +.2kct.onl
   - +.2kgames.com
+  - +.2ksports.com
+  - +.2kweb.online
   - +.3lateral.com
   - +.ac-pocketcamp.com
+  - +.acesofthunder.net
+  - +.activematter.game
   - +.amiibo.com
   - +.anthemgame.com
   - +.anthemthegame.com
@@ -15,6 +20,7 @@ payload:
   - +.arma3.com
   - +.armaplatform.com
   - +.artstation.com
+  - +.artstorm.com
   - +.asobostudio.com
   - +.awayoutgame.com
   - +.ayudanintendo.com
@@ -68,8 +74,11 @@ payload:
   - +.commandandconquer.com
   - +.conquerwithcharacter.com
   - +.convrgencegame.com
+  - +.crossout.net
+  - +.crsed.net
   - +.crysis.jp
   - +.cubicmotion.com
+  - +.cubicodyssey.game
   - +.curseforge.com
   - +.cygames.co.jp
   - +.cygames.jp
@@ -136,6 +145,7 @@ payload:
   - +.embark.games
   - +.eneba.com
   - +.eneba.games
+  - +.enlisted.net
   - +.epicgames.com
   - +.epicgames.dev
   - +.epicgamescdn.com
@@ -163,6 +173,8 @@ payload:
   - +.frostbite.com
   - +.futpromos.com
   - +.futunited.com
+  - +.gaijin.net
+  - +.gaijinent.com
   - +.game-repack.site
   - +.gamepass.com
   - +.gamesfirsthelsinki.com
@@ -268,6 +280,7 @@ payload:
   - +.mirrorsedge2d.com
   - +.mo.co
   - +.mobimon.com.tw
+  - +.modernwarships.com
   - +.modrinth.com
   - +.mojang.com
   - +.molesports.com
@@ -467,6 +480,7 @@ payload:
   - +.robloxlabs.com
   - +.roborecall.com
   - +.rockstargames.com
+  - +.rockstarnorth.com
   - +.rowblocks.com
   - +.rowblox.com
   - +.rsg.sc
@@ -497,6 +511,7 @@ payload:
   - +.spyjinx.com
   - +.squadbusters.com
   - +.ssx3.com
+  - +.star-conflict.com
   - +.starcraft.com
   - +.starcraft2.com
   - +.starfox.com
@@ -585,6 +600,7 @@ payload:
   - +.wariolandshakeit.com
   - +.wariowarediy.com
   - +.warnerbrosgames.com
+  - +.warthunder.com
   - +.wbagora.com
   - +.wbgames.com
   - +.wbinsights.com
@@ -599,6 +615,7 @@ payload:
   - +.worldflipper.akamaized.net
   - +.worldflipper.jp
   - +.worldofwarcraft.com
+  - +.wtmobile.com
   - +.xbox.co
   - +.xbox.com
   - +.xbox.eu
@@ -626,6 +643,9 @@ payload:
   - +.yogify.com
   - +.yoshisnewisland.com
   - +.zenlesszonezero.com
+  - +.zynga.com
+  - +.zyngaplayersupport.com
+  - +.zyngapoker.com
   - a.ppy.sh
   - a4e8s8k3.map2.ssl.hwcdn.net
   - assets.ppy.sh

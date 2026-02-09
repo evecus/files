@@ -12,7 +12,10 @@ payload:
   - +.20thcenturystudios.jp
   - +.2k.com
   - +.2kcoretech.online
+  - +.2kct.onl
   - +.2kgames.com
+  - +.2ksports.com
+  - +.2kweb.online
   - +.3lateral.com
   - +.4gamer.net
   - +.4gamers.com.tw
@@ -31,6 +34,8 @@ payload:
   - +.abematv.co.jp
   - +.abow.jp
   - +.ac-pocketcamp.com
+  - +.acesofthunder.net
+  - +.activematter.game
   - +.ads-pixiv.net
   - +.adventuresbydisney.com
   - +.adx.promo
@@ -75,6 +80,7 @@ payload:
   - +.arma3.com
   - +.armaplatform.com
   - +.artstation.com
+  - +.artstorm.com
   - +.asobostudio.com
   - +.att.tv
   - +.atttvnow.com
@@ -189,11 +195,14 @@ payload:
   - +.copy-manga.com
   - +.copy20.com
   - +.copy2000.online
+  - +.crossout.net
+  - +.crsed.net
   - +.crunchyroll.com
   - +.crypton.co.jp
   - +.crysis.jp
   - +.csgo.wmsj.cn
   - +.cubicmotion.com
+  - +.cubicodyssey.game
   - +.curseforge.com
   - +.cxacg.com
   - +.cygames.co.jp
@@ -392,6 +401,7 @@ payload:
   - +.embark.games
   - +.eneba.com
   - +.eneba.games
+  - +.enlisted.net
   - +.epicgames.com
   - +.epicgames.dev
   - +.epicgamescdn.com
@@ -438,6 +448,8 @@ payload:
   - +.funimation.com
   - +.futpromos.com
   - +.futunited.com
+  - +.gaijin.net
+  - +.gaijinent.com
   - +.game-repack.site
   - +.gameapps.hk
   - +.gamebase.com.tw
@@ -748,6 +760,7 @@ payload:
   - +.mirrorsedge2d.com
   - +.mo.co
   - +.mobimon.com.tw
+  - +.modernwarships.com
   - +.modrinth.com
   - +.moedigi.com
   - +.moepedia.net
@@ -1080,6 +1093,7 @@ payload:
   - +.robloxlabs.com
   - +.roborecall.com
   - +.rockstargames.com
+  - +.rockstarnorth.com
   - +.roku.com
   - +.rokutime.com
   - +.rowblocks.com
@@ -1156,6 +1170,7 @@ payload:
   - +.st.dl.eccdnx.com
   - +.st.dl.pinyuncloud.com
   - +.star-brasil.com
+  - +.star-conflict.com
   - +.star-latam.com
   - +.starcraft.com
   - +.starcraft2.com
@@ -1333,6 +1348,7 @@ payload:
   - +.wariolandshakeit.com
   - +.wariowarediy.com
   - +.warnerbrosgames.com
+  - +.warthunder.com
   - +.watchdisneyfe.com
   - +.watchespn.com
   - +.wbagora.com
@@ -1362,6 +1378,7 @@ payload:
   - +.worldofwarcraft.com
   - +.ws-blau.com
   - +.ws-tcg.com
+  - +.wtmobile.com
   - +.wwe.com
   - +.wwe9.com
   - +.wwr-stardom.com
@@ -1579,6 +1596,9 @@ payload:
   - +.zeetv.com
   - +.zeeuk.com
   - +.zenlesszonezero.com
+  - +.zynga.com
+  - +.zyngaplayersupport.com
+  - +.zyngapoker.com
   - a.ppy.sh
   - a4e8s8k3.map2.ssl.hwcdn.net
   - abematv.akamaized.net
