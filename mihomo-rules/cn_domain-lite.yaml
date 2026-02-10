@@ -8,6 +8,7 @@ payload:
   - +.055110.com
   - +.05sun.com
   - +.0759job.com
+  - +.100.me
   - +.10044.cn
   - +.10099.com.cn
   - +.100bt.com
@@ -789,6 +790,7 @@ payload:
   - +.bohejiasuqi.com
   - +.bojianger.com
   - +.bokecc.com
+  - +.boohee.com
   - +.booking.cn
   - +.boosj.com
   - +.bootcdn.cn
@@ -1263,9 +1265,16 @@ payload:
   - +.dcloud.net.cn
   - +.dcocsp.cn
   - +.dd373.com
+  - +.ddcorp.net
+  - +.ddfresh.net
   - +.ddimg.cn
+  - +.ddimg.mobi
+  - +.ddmaicai.net
+  - +.ddmc.mobi
   - +.ddmogo.com
   - +.ddooo.com
+  - +.dduser.mobi
+  - +.ddxq.mobi
   - +.dearedu.com
   - +.debugmode.cn
   - +.dedecms.com
@@ -1940,6 +1949,7 @@ payload:
   - +.hao123.com
   - +.hao123img.com
   - +.hao222.com
+  - +.haodf.com
   - +.haofenshu.com
   - +.haohaowan.net
   - +.haokan.com
@@ -1958,6 +1968,7 @@ payload:
   - +.hbhk.com.cn
   - +.hbooker.com
   - +.hczq.com
+  - +.hdfimg.com
   - +.hdinsightservices.cn
   - +.hdns.ksyun.com
   - +.hdyxgame.com
@@ -2246,6 +2257,7 @@ payload:
   - +.im-cc.com
   - +.im2maker.com
   - +.imacos.top
+  - +.imaicai.mobi
   - +.imcome.net
   - +.imcoming.com
   - +.imedao.com
@@ -2547,6 +2559,7 @@ payload:
   - +.kijijidns.cn
   - +.kijijidns.com.cn
   - +.kimg.cn
+  - +.kimi.com
   - +.kimiss.com
   - +.kindle.cn
   - +.kindleoasis.cn
@@ -2836,6 +2849,8 @@ payload:
   - +.ly.com
   - +.lync.cn
   - +.m.aty.sohu.com
+  - +.m1905.cn
+  - +.m1905.com
   - +.macbookair.cn
   - +.macbookair.com.cn
   - +.mafengwo.cn
@@ -3010,6 +3025,7 @@ payload:
   - +.moleecel.com
   - +.mooc.cn
   - +.moocollege.com
+  - +.moonshot.ai
   - +.moonshot.cn
   - +.moonvy.com
   - +.moonvy.cool
@@ -3047,6 +3063,8 @@ payload:
   - +.mszdld.net
   - +.mszq.com
   - +.mti100.com
+  - +.mtime.cn
+  - +.mtime.com
   - +.mtyun.com
   - +.muji.com.cn
   - +.mukewang.com
@@ -3285,6 +3303,7 @@ payload:
   - +.pinduoduo.net
   - +.pingcap.cn
   - +.pingcap.com
+  - +.pingcode.com
   - +.pingplusplus.com
   - +.pingwest.com
   - +.pingxx.com
@@ -3809,6 +3828,7 @@ payload:
   - +.sxgou.cn
   - +.sxl.cn
   - +.sxlcdn.cn
+  - +.sxsimg.com
   - +.sydw8.com
   - +.synology.cn
   - +.sys321.com
@@ -4344,11 +4364,13 @@ payload:
   - +.xiaopeng.com
   - +.xiaoxiongxitong.com
   - +.xiaoyuankousuan.com
+  - +.xiaoyuanzhao.com
   - +.xiaoyuxitong.com
   - +.xiaoyuzhoufm.com
   - +.xiayx.com
   - +.xiazaiba.com
   - +.xiezuocat.com
+  - +.xilu.com
   - +.ximalaya.com
   - +.xinchacha.com
   - +.xinchong.com
