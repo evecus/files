@@ -20,6 +20,7 @@ payload:
   - +.adwordsexpress.com
   - +.amazon-adsystem.com
   - +.analytics-alv.google.com
+  - +.analytics.facebook.com
   - +.analytics.vpc.duolingo.com
   - +.api-adservices.apple.com
   - +.app-analytics-services-att.com
@@ -36,6 +37,7 @@ payload:
   - +.doubleclick.cn
   - +.doubleclick.com
   - +.doubleclick.net
+  - +.facebookads.com
   - +.fcmatch.google.com
   - +.gemini.yahoo.com
   - +.google-analytics-cn.com
@@ -74,6 +76,7 @@ payload:
   - +.nelreports.net
   - +.pagead.l.google.com
   - +.partnerad.l.google.com
+  - +.pixel.facebook.com
   - +.qwapi.com
   - +.samsungads.com
   - +.serving-sys.com

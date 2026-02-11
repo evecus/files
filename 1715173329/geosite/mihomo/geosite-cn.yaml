@@ -352,7 +352,12 @@ payload:
   - +.activity-zhendingtech.com
   - +.acwifi.net
   - +.acwing.com
+  - +.ad.api.3g.youku.com
+  - +.ad.api.mobile.youku.com
   - +.ad.cctv.com
+  - +.ad.mobile.youku.com
+  - +.adashx.ut.youku.com
+  - +.adbehavior.ximalaya.com
   - +.adbkwai.com
   - +.adcommerce.cn
   - +.adidas.cn
@@ -365,6 +370,8 @@ payload:
   - +.ads.service.kugou.com
   - +.ads.sohu.com
   - +.ads.unitychina.cn
+  - +.adse.wsa.ximalaya.com
+  - +.adse.ximalaya.com
   - +.adserviceretry.kglink.cn
   - +.adserviceretry.kugou.com
   - +.adukwai.com
@@ -545,6 +552,7 @@ payload:
   - +.assp.sohu.com
   - +.astral-vector.com
   - +.asus.com.cn
+  - +.atm.youku.com
   - +.att.cn
   - +.attcorp.cn
   - +.aurorapush.cn
@@ -622,6 +630,7 @@ payload:
   - +.b3logfile.com
   - +.babytree.com
   - +.babytreeimg.com
+  - +.badjs.weixinbridge.com
   - +.baichuan-ai.com
   - +.baicizhan.com
   - +.baicizhan.org
@@ -804,6 +813,7 @@ payload:
   - +.bouffalolab.com
   - +.boxdouyin.com
   - +.brawlstars.cn
+  - +.browser.events.data.msn.cn
   - +.bsb.com.cn
   - +.bsbsb.top
   - +.bsclink.cn
@@ -1455,6 +1465,7 @@ payload:
   - +.dzwww.com
   - +.e.kuaishou.cn
   - +.e.kuaishou.com
+  - +.e.stat.ykimg.com
   - +.e0n.cn
   - +.easec.com.cn
   - +.easesale.com
@@ -1520,6 +1531,7 @@ payload:
   - +.elongstatic.com
   - +.emarbox.com
   - +.emoriko.com
+  - +.ems.youku.com
   - +.emumax.com
   - +.engkoo.com
   - +.enterdesk.com
@@ -1891,6 +1903,7 @@ payload:
   - +.guaiguai.com
   - +.guaiku.com
   - +.guanaitong.com
+  - +.guanggaoad.youku.com
   - +.guanggaotongapp.cn
   - +.guanhaobio.com
   - +.guanyierp.com
@@ -1925,6 +1938,7 @@ payload:
   - +.gzctyiptv.cn
   - +.gzurl.cn
   - +.gzwanju.com
+  - +.h-adashx.ut.youku.com
   - +.h5uc.com
   - +.hack520.com
   - +.hackhome.com
@@ -2055,7 +2069,6 @@ payload:
   - +.hongsanban.com
   - +.hongshu.com
   - +.hongtastock.com
-  - +.hongxiu.com
   - +.hongyuanqh.com
   - +.honor.cn
   - +.honor.com
@@ -2802,6 +2815,7 @@ payload:
   - +.llsserver.com
   - +.lnlib.net
   - +.lofter.httpdns.c.163.com
+  - +.log-upload.mihoyo.com
   - +.log.hunantv.com
   - +.log.v2.hunantv.com
   - +.longhoo.net
@@ -2816,8 +2830,8 @@ payload:
   - +.lpl.com.cn
   - +.lppz.com
   - +.lppzimg.com
-  - +.lrts.me
   - +.lsplayer.com
+  - +.lstat.youku.com
   - +.lu.com
   - +.lu.sogou.com
   - +.lu.sogoucdn.com
@@ -3008,6 +3022,7 @@ payload:
   - +.mndqlib.net
   - +.mob.com
   - +.mobileinternational.com.cn
+  - +.mobilemsg.youku.com
   - +.mobsdks.com
   - +.modelers.cn
   - +.modex.com.cn
@@ -3050,6 +3065,7 @@ payload:
   - +.msftauth.cn
   - +.msftauthimages.cn
   - +.msftcloudes.cn
+  - +.msg.youku.com
   - +.msidentity.cn
   - +.msidlabpbmc.cn
   - +.msjyfund.com.cn
@@ -3079,6 +3095,7 @@ payload:
   - +.mwcdns.com
   - +.mwcloudcdn.com
   - +.my4399.com
+  - +.my7v.com
   - +.mybank.cn
   - +.mydown.com
   - +.mydrivers.com
@@ -3260,6 +3277,7 @@ payload:
   - +.owsgo.com
   - +.ozonabc.com
   - +.ozonbigsell.com
+  - +.p-log.ykimg.com
   - +.p.aty.sohu.com
   - +.p2cdn.com
   - +.p2peye.com
@@ -3271,6 +3289,7 @@ payload:
   - +.panasonic.cn
   - +.paopaoche.net
   - +.papocket.com
+  - +.passport-log.youku.com
   - +.paydxm.com
   - +.pb.i.sogou.com
   - +.pbiwebcontent.cn
@@ -3318,6 +3337,7 @@ payload:
   - +.pkoplink.com
   - +.pkuh6.cn
   - +.pkulaw.com
+  - +.pl.youku.com
   - +.platform.dell.com
   - +.pmphmooc.com
   - +.podcast.xyz
@@ -3368,7 +3388,6 @@ payload:
   - +.qd-metro.com
   - +.qd.ink
   - +.qd8.com
-  - +.qdmm.com
   - +.qftexpay.cn
   - +.qgzb.com.cn
   - +.qgzb.gov.cn
@@ -3399,7 +3418,6 @@ payload:
   - +.qiaobutang.com
   - +.qichacha.com
   - +.qichamao.com
-  - +.qidian.com
   - +.qie.tv
   - +.qifeiye.com
   - +.qihoo.com
@@ -3496,8 +3514,8 @@ payload:
   - +.rdfybk.com
   - +.rdnsdb.com
   - +.reactorms.com.cn
-  - +.readnovel.com
   - +.realcybertron.com
+  - +.redelight.cn
   - +.redmagic.com
   - +.rednotecdn.com
   - +.reke.at.sohu.com
@@ -3520,7 +3538,6 @@ payload:
   - +.roco.qq.com
   - +.rong360.com
   - +.rongechain.com
-  - +.rongshuxia.com
   - +.roomeet.cn
   - +.route53.cn
   - +.routewize.com
@@ -3539,6 +3556,7 @@ payload:
   - +.rwkv.cn
   - +.rwkv.com
   - +.rzrc114.com
+  - +.s-adashx.ut.youku.com
   - +.s0n.cn
   - +.saasops.tech
   - +.saayaa.com
@@ -3769,9 +3787,11 @@ payload:
   - +.starbaby.cc
   - +.starbaby.com
   - +.starworldgames.com
+  - +.stat.youku.com
   - +.staticfile.net
   - +.staticfile.org
   - +.statickksmg.com
+  - +.statis.api.3g.youku.com
   - +.stcn.com
   - +.steam302.xyz
   - +.steamchina.com
@@ -3948,7 +3968,6 @@ payload:
   - +.tikv.org
   - +.timedoo.com
   - +.timibase.com
-  - +.tingbook.com
   - +.tingyun.com
   - +.tipdm.org
   - +.titanar.com
@@ -4125,6 +4144,8 @@ payload:
   - +.uzero.cn
   - +.uzzf.com
   - +.v5875.com
+  - +.v6-adashx.ut.cainiao.com
+  - +.v6-adashx.ut.youku.com
   - +.value500.com
   - +.vamaker.com
   - +.vancl.com
@@ -4341,6 +4362,7 @@ payload:
   - +.xhscdn.com
   - +.xhscdn.net
   - +.xhslink.com
+  - +.xhsrcdn.com
   - +.xiachufang.com
   - +.xiamai.net
   - +.xiamenair.com
@@ -4419,8 +4441,6 @@ payload:
   - +.xoyocdn.com
   - +.xpgod.com
   - +.xqfunds.com
-  - +.xs.cn
-  - +.xs8.cn
   - +.xsa239.com
   - +.xsbapp.cn
   - +.xsdzq.cn
@@ -4442,7 +4462,6 @@ payload:
   - +.xunyou.com
   - +.xunyou.mobi
   - +.xwbank.com
-  - +.xxsy.net
   - +.xxtmail.com
   - +.xycdn.com
   - +.xycloud.com
@@ -4515,6 +4534,8 @@ payload:
   - +.yiyouliao.com
   - +.yizhibo.com
   - +.yjbys.com
+  - +.yk-ssp.ad.youku.com
+  - +.ykad-data.youku.com
   - +.ykimg.com
   - +.yksdks.com
   - +.ykzq.com
@@ -4601,7 +4622,6 @@ payload:
   - +.yuanzhiyijiantong.com
   - +.yudou.cn
   - +.yuelun.com
-  - +.yuewen.com
   - +.yuketang.cn
   - +.yun.139.com
   - +.yunaq.com
@@ -4647,6 +4667,7 @@ payload:
   - +.yzcdn.cn
   - +.yzyxgame.com
   - +.z-bank.com
+  - +.z.ai
   - +.z.cn
   - +.z28j.com
   - +.zaifan.com
@@ -4721,6 +4742,7 @@ payload:
   - +.zhimg.com
   - +.zhipin.com
   - +.zhipuai.cn
+  - +.zhipucn.com
   - +.zhixue.com
   - +.zhiye.com
   - +.zhiyuanhe.cn

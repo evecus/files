@@ -37,6 +37,7 @@ payload:
   - +.acesofthunder.net
   - +.activematter.game
   - +.ads-pixiv.net
+  - +.ads.youtube.com
   - +.adventuresbydisney.com
   - +.adx.promo
   - +.age.tv
@@ -63,6 +64,7 @@ payload:
   - +.ameblo.jp
   - +.amiibo.com
   - +.amp-api.podcast.apple.com
+  - +.analytics.tiktok.com
   - +.angelbeats.jp
   - +.anigema.jp
   - +.animedao-tv.com
@@ -688,6 +690,7 @@ payload:
   - +.litvfreepc.akamaized.net
   - +.live-video.net
   - +.livestream.com
+  - +.log-upload-os.hoyoverse.com
   - +.lol-europe.com
   - +.lolclub.org
   - +.lolespor.com
@@ -1602,6 +1605,8 @@ payload:
   - a.ppy.sh
   - a4e8s8k3.map2.ssl.hwcdn.net
   - abematv.akamaized.net
+  - adeventtracker.spotify.com
+  - adstudio-assets.scdn.co
   - alibaba.cdn.steampipe.steamcontent.com
   - api.viu.now.com
   - apl-hamivideo.cdn.hinet.net
@@ -1612,6 +1617,7 @@ payload:
   - avatargarenanow-a.akamaihd.net
   - blizzard.nefficient.co.kr
   - blizzcon-a.akamaihd.net
+  - bloodhound.spotify.com
   - blzddist1-a.akamaihd.net
   - blzddistkr1-a.akamaihd.net
   - blzmedia-a.akamaihd.net

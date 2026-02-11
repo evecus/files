@@ -452,6 +452,7 @@ payload:
   - +.amzndns.org
   - +.amznl.com
   - +.analytics-alv.google.com
+  - +.analytics.facebook.com
   - +.analytics.vpc.duolingo.com
   - +.android.com
   - +.androidify.com
@@ -2657,6 +2658,7 @@ payload:
   - +.facebook30.net
   - +.facebook30.org
   - +.facebook4business.com
+  - +.facebookads.com
   - +.facebookadvertisingsecrets.com
   - +.facebookappcenter.info
   - +.facebookappcenter.net
@@ -5283,6 +5285,7 @@ payload:
   - +.pivotalinitiative.com
   - +.pixapp.net
   - +.pixate.com
+  - +.pixel.facebook.com
   - +.pixlr-o-matic.com
   - +.pixlromatic.com
   - +.pixtronix.com

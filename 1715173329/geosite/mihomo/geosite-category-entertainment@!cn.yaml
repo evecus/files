@@ -1,4 +1,5 @@
 payload:
+  - +.analytics.tiktok.com
   - +.bytedapm.com
   - +.byteoversea.com
   - +.muscdn.com
@@ -29,6 +30,7 @@ payload:
   - +.ttlivecdn.com
   - +.ttoverseaus.net
   - +.ttwstatic.com
+  - +.webnovel.com
   - p16-tiktokcdn-com.akamaized.net
   - roovza-launches.appsflyersdk.com
   - roovza.inapps.appsflyersdk.com

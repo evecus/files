@@ -185,9 +185,13 @@ payload:
   - +.cdndns1.com
   - +.cdndns2.com
   - +.changdunovel.com
+  - +.cici.com
+  - +.ciciai.com
+  - +.ciciaicdn.com
   - +.cloudendpoint.cn
   - +.cookicut.com
   - +.coze.cn
+  - +.coze.com
   - +.coze.site
   - +.cozebaas.cn
   - +.cozefn.cn
@@ -200,6 +204,7 @@ payload:
   - +.dcarvod.com
   - +.dcdapp.com
   - +.dig.bdurl.net
+  - +.dola.com
   - +.dongchedi.com
   - +.dongchediapp.com
   - +.doubao.com
@@ -392,6 +397,7 @@ payload:
   - +.luckysf.net
   - +.maoxiangai.com
   - +.marscode.cn
+  - +.marscode.com
   - +.marscode.com.cn
   - +.mcbaas.work
   - +.mcdemo.show
@@ -553,6 +559,7 @@ payload:
   - +.tr-test-ali.net
   - +.tr-test.net
   - +.tr-testboe.net
+  - +.trae.ai
   - +.trae.cn
   - +.trae.com.cn
   - +.trae.guru

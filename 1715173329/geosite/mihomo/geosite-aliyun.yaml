@@ -1,4 +1,7 @@
 payload:
+  - +.acjs.aliyun.com
+  - +.adash-emas.cn-hangzhou.aliyuncs.com
+  - +.adash.man.aliyuncs.com
   - +.alibabadns.com
   - +.alicdn.com
   - +.alicloudapi.com
@@ -7,6 +10,7 @@ payload:
   - +.aligfwaf.com
   - +.alikunlun.com
   - +.alikunlun.net
+  - +.alimama.alicdn.com
   - +.aliyun-inc.com
   - +.aliyun-iot-share.com
   - +.aliyun.com
@@ -14,6 +18,9 @@ payload:
   - +.aliyuncdn.net
   - +.aliyunfile.com
   - +.aliyunpds.com
+  - +.atanx.alicdn.com
+  - +.atanx2.alicdn.com
+  - +.baichuan-sdk.alicdn.com
   - +.cdngslb.com
   - +.fcapp.run
   - +.hichina.com
@@ -40,6 +47,7 @@ payload:
   - +.kunlunwe.com
   - +.mxhichina.com
   - +.myalicdn.com
+  - +.nbsdk-baichuan.alicdn.com
   - +.oss-ap-northeast-1.aliyuncs.com
   - +.oss-ap-northeast-2.aliyuncs.com
   - +.oss-ap-south-1.aliyuncs.com
@@ -67,3 +75,4 @@ payload:
   - +.oss-me-east-1.aliyuncs.com
   - +.oss-us-east-1.aliyuncs.com
   - +.oss-us-west-1.aliyuncs.com
+  - +.tce.alicdn.com
