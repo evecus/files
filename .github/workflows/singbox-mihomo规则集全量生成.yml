@@ -2,8 +2,8 @@ name: singbox-mihomo规则集全量生成
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "30 0 * * *"
+  #schedule:
+    #- cron: "30 0 * * *"
 
 permissions:
   contents: write
