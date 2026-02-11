@@ -50,14 +50,26 @@ jobs:
       - name: Download mihomo ads.yaml
         run: |
           curl -L \
-            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/category-ads-all.yaml \
+            https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockmihomo.yaml \
             -o mihomo-rules/ads_domain.yaml
 
       - name: Download mihomo ads.mrs
         run: |
           curl -L \
-            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/category-ads-all.mrs \
+            https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockmihomo.mrs \
             -o mihomo-rules/ads_domain.mrs
+
+      - name: Download mihomo ads-lite.yaml
+        run: |
+          curl -L \
+            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/category-ads-all.yaml \
+            -o mihomo-rules/ads_domain-lite.yaml
+
+      - name: Download mihomo ads-lite.mrs
+        run: |
+          curl -L \
+            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/category-ads-all.mrs \
+            -o mihomo-rules/ads_domain-lite.mrs
 
       # =========================
       # 2. singbox rules
@@ -87,17 +99,30 @@ jobs:
             https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs \
             -o singbox-rules/cn_domain.srs
 
-      - name: Download singbox ads.json
+      - name: Download singbox ads-lite.json
         run: |
           curl -L \
             https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ads-all.json \
+            -o singbox-rules/ads_domain-lite.json
+
+      - name: Download singbox ads-lite.srs
+        run: |
+          curl -L \
+            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ads-all.srs \
+            -o singbox-rules/ads_domain-lite.srs
+
+      - name: Download singbox ads.json
+        run: |
+          curl -L \
+            https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblocksingbox.json \
             -o singbox-rules/ads_domain.json
 
       - name: Download singbox ads.srs
         run: |
           curl -L \
-            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/category-ads-all.srs \
+            https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblocksingbox.srs \
             -o singbox-rules/ads_domain.srs
+
 
       # =========================
       # 3. Commit
