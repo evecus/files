@@ -3,7 +3,7 @@ name: 精简版cn规则集生成
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 2 * * *"
+    - cron: "18 1 * * *"
 
 permissions:
   contents: write
