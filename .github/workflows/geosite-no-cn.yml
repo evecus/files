@@ -1,4 +1,4 @@
-name: Geosite-!cn格式化转换
+name: foreign-domain格式化转换生成
 
 on:
   workflow_dispatch:
@@ -45,29 +45,29 @@ jobs:
                 domain_suffix: (.domain_suffix | map(sub("^\\.+"; "")))
               } | del(..|nulls)
             ]
-          }' temp_work/decompiled.json > singbox-rules/geosite-!cn.json
+          }' temp_work/decompiled.json > singbox-rules/foreign_domain.json
 
       - name: 2. 精准生成 YAML (Mihomo)
         run: |
           set -euo pipefail
-          echo "payload:" > mihomo-rules/geosite-!cn.yaml
+          echo "payload:" > mihomo-rules/foreign_domain.yaml
           
           # A. 处理 domain_suffix ->  - +.example.com
-          jq -r '.rules[].domain_suffix[]?' singbox-rules/geosite-!cn.json | sed 's/^\.*//; s/^/  - +./' >> mihomo-rules/geosite-!cn.yaml || true
+          jq -r '.rules[].domain_suffix[]?' singbox-rules/foreign_domain.json | sed 's/^\.*//; s/^/  - +./' >> mihomo-rules/foreign_domain.yaml || true
           
           # B. 处理 domain ->  - example.com
-          jq -r '.rules[].domain[]?' singbox-rules/geosite-!cn.json | sed 's/^\.*//; s/^/  - /' >> mihomo-rules/geosite-!cn.yaml || true
+          jq -r '.rules[].domain[]?' singbox-rules/foreign_domain.json | sed 's/^\.*//; s/^/  - /' >> mihomo-rules/foreign_domain.yaml || true
 
       - name: 3. 编译二进制 (SRS & MRS)
         run: |
           set -euo pipefail
-          sing-box rule-set compile --output singbox-rules/geosite-!cn.srs singbox-rules/geosite-!cn.json
-          mihomo convert-ruleset domain yaml mihomo-rules/geosite-!cn.yaml mihomo-rules/geosite-!cn.mrs
+          sing-box rule-set compile --output singbox-rules/foreign_domain.srs singbox-rules/foreign_domain.json
+          mihomo convert-ruleset domain yaml mihomo-rules/foreign_domain.yaml mihomo-rules/foreign_domain.mrs
 
       - name: Commit and Push
         run: |
           git config user.name "GitHub Action"
           git config user.email "action@github.com"
-          git add singbox-rules/geosite-!cn.* mihomo-rules/geosite-!cn.*
-          git commit -m "Update geosite-!cn: Correct domain and suffix format" || echo "No changes"
+          git add singbox-rules/foreign_domain.* mihomo-rules/foreign_domain.*
+          git commit -m "Update foreign_domain: Correct domain and suffix format" || echo "No changes"
           git push origin main
