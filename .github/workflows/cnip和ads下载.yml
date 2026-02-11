@@ -23,17 +23,29 @@ jobs:
       # 1. mihomo rules
       # =========================
 
-      - name: Download mihomo cn.yaml
+      - name: Download mihomo cn-ip.yaml
         run: |
           curl -L \
             https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/cn.yaml \
             -o mihomo-rules/cn_ip.yaml
 
-      - name: Download mihomo cn.mrs
+      - name: Download mihomo cn-ip.mrs
         run: |
           curl -L \
             https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/cn.mrs \
             -o mihomo-rules/cn_ip.mrs
+            
+      - name: Download mihomo cn-site.yaml
+        run: |
+          curl -L \
+            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/cn.yaml \
+            -o mihomo-rules/cn_domain-meta.yaml
+
+      - name: Download mihomo cn-site.mrs
+        run: |
+          curl -L \
+            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/cn.mrs \
+            -o mihomo-rules/cn_domain-meta.mrs
 
       - name: Download mihomo ads.yaml
         run: |
@@ -62,6 +74,18 @@ jobs:
           curl -L \
             https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs \
             -o singbox-rules/cn_ip.srs
+            
+      - name: Download singbox cn-domain.json
+        run: |
+          curl -L \
+            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.json \
+            -o singbox-rules/cn_domain-meta.json
+
+      - name: Download singbox cn-domain.srs
+        run: |
+          curl -L \
+            https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs \
+            -o singbox-rules/cn_domain-meta.srs
 
       - name: Download singbox ads.json
         run: |
