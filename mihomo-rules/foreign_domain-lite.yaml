@@ -44,6 +44,8 @@ payload:
   - +.aisandbox-pa.googleapis.com
   - +.aistudio.google.com
   - +.analytics-alv.google.com
+  - +.analytics.facebook.com
+  - +.analytics.tiktok.com
   - +.android
   - +.android.com
   - +.androidify.com
@@ -412,6 +414,7 @@ payload:
   - +.facebook30.net
   - +.facebook30.org
   - +.facebook4business.com
+  - +.facebookads.com
   - +.facebookadvertisingsecrets.com
   - +.facebookatschool.com
   - +.facebookawards.com
@@ -1402,6 +1405,7 @@ payload:
   - +.picnik.com
   - +.pittpatt.com
   - +.pixate.com
+  - +.pixel.facebook.com
   - +.poe.com
   - +.poecdn.net
   - +.polymer-project.org
@@ -1845,8 +1849,10 @@ payload:
   - 265.com
   - 2mdn-cn.net
   - 2mdn.net
+  - adeventtracker.spotify.com
   - admob-cn.com
   - adservice.google.com
+  - adstudio-assets.scdn.co
   - ai.google.dev
   - alkalicore-pa.clients6.google.com
   - alkalimakersuite-pa.clients6.google.com
@@ -1873,6 +1879,7 @@ payload:
   - beacons.gvt2.com
   - beacons2.gvt2.com
   - beacons3.gvt2.com
+  - bloodhound.spotify.com
   - browser-intake-datadoghq.com
   - c.admob.com
   - c.android.clients.google.com
