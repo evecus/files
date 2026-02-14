@@ -2,8 +2,8 @@ name: 代理精简域名集生成
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 1 * * *"
+  #schedule:
+    #- cron: "0 1 * * *"
 
 permissions:
   contents: write
