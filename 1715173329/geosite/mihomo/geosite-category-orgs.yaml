@@ -1,6 +1,7 @@
 payload:
   - +.acousticbrainz.org
   - +.aomedia.org
+  - +.attestation.app
   - +.atypi.org
   - +.bookbrainz.org
   - +.ccstatic.org
@@ -22,6 +23,19 @@ payload:
   - +.fdroid.org
   - +.globalsecurity.org
   - +.globalspec.com
+  - +.grapheneos.app
+  - +.grapheneos.ca
+  - +.grapheneos.com
+  - +.grapheneos.dev
+  - +.grapheneos.foundation
+  - +.grapheneos.info
+  - +.grapheneos.net
+  - +.grapheneos.network
+  - +.grapheneos.online
+  - +.grapheneos.org
+  - +.grapheneos.ovh
+  - +.grapheneos.page
+  - +.grapheneos.social
   - +.grss-ieee.org
   - +.iana.org
   - +.ieee-aess.org
@@ -85,6 +99,7 @@ payload:
   - +.ppy.sh
   - +.rolfoundation.org
   - +.rolsociety.org
+  - +.seamlessupdate.app
   - +.signalprocessingsociety.org
   - +.smpte.org
   - +.standardsuniversity.org
@@ -95,6 +110,7 @@ payload:
   - +.time.gov
   - +.tryengineering.org
   - +.un.org
+  - +.vanadium.app
   - +.vtsociety.org
   - +.w3.org
   - +.who.int
