@@ -3,7 +3,7 @@ name: 1715173329规则转换
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 1 * * *"
+    - cron: "35 22 * * *"
 
 permissions:
   contents: write
