@@ -1,9 +1,9 @@
-name: 统一规jjs则集维护中心
+name: 统一规则集维护中心
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 2 * * *" # 每天北京时间 10:30 自动运行
+    - cron: "30 0 * * *"
 
 permissions:
   contents: write
