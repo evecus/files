@@ -112,16 +112,18 @@ jobs:
           curl -L "https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblocksingbox.json" -o singbox-rules/ads_domain.json
 
       # =============================================================
-      # 4. 统一编译并上传
+      # 4. 强制编译与推送 (确保最新)
       # =============================================================
-      - name: 编译与提交
+      - name: 编译并同步到仓库
         run: |
+          # 编译二进制
           for f in singbox-rules/*.json; do sing-box rule-set compile --output "${f%.json}.srs" "$f"; done
           for f in mihomo-rules/*.yaml; do
             TYPE=$([[ "$f" == *"ip"* ]] && echo "ipcidr" || echo "domain")
             mihomo convert-ruleset "$TYPE" yaml "$f" "${f%.yaml}.mrs"
           done
+          # 推送
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add singbox-rules/* mihomo-rules/*
-          git diff --cached --quiet || (git commit -m "chore: 完整同步全量/精简 IP 及域名规则 $(date +'%Y-%m-%d %H:%M')" && git push)
+          git diff --cached --quiet || (git commit -m "chore: 强制全量覆盖更新规则集 $(date +'%Y-%m-%d %H:%M')" && git push)
