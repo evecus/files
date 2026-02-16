@@ -1,10 +1,10 @@
 payload:
     - +.sohu
-    - +.ynet.cn
+    - +.sohucs.com
     - +.cqnews.net
     - +.anzhuo.cn
     - +.bianews.com
-    - +.wfdata.club
+    - +.zuihuimai.com
     - +.cailianpress.com
     - +.cls.cn
     - +.caixin.com
@@ -18,17 +18,17 @@ payload:
     - +.cqcb.com
     - +.cqhlw.cn
     - +.cqliving.com
-    - +.fengimg.com
+    - +.yidianliulan.cn
     - +.cqsjb.com
-    - +.feng.com
+    - +.win8china.com
     - +.cyzone.cn
     - +.cztv.com
-    - +.36dianping.com
+    - +.ggowan.com
     - +.cztvcloud.com
     - +.zjstv.com
     - +.dutenews.com
-    - +.zuihuimai.com
-    - +.win8china.com
+    - +.win7china.com
+    - +.saayaa.com
     - +.yundzh.com
     - +.dgtle.com
     - +.donews.com
@@ -40,9 +40,9 @@ payload:
     - +.gmw.com
     - +.guigu.org
     - +.0033.cn
-    - +.win7china.com
+    - +.ruanmei.com
     - +.hexin.cn
-    - +.saayaa.com
+    - +.lapin365.com
     - +.ths123.com
     - +.thsi.cn
     - +.hexun.com
@@ -64,7 +64,7 @@ payload:
     - +.jfdaily.com
     - +.shobserver.com
     - +.jiqizhixin.com
-    - +.ruanmei.com
+    - +.ithome.com
     - +.jrjimg.cn
     - +.jsbc.com
     - +.jstv.com
@@ -78,7 +78,7 @@ payload:
     - +.miercn.com
     - +.mydrivers.com
     - +.nanyuenews.com
-    - +.lapin365.com
+    - +.cooldock.com
     - +.news.cn
     - +.xinhuanet.com
     - +.xinhuaxmt.com
@@ -86,10 +86,10 @@ payload:
     - +.pchome.net
     - +.pchpic.net
     - +.3conline.com
-    - +.ithome.com
+    - +.6655.com
     - +.pcpop.com
     - +.people.cn
-    - +.cooldock.com
+    - +.ifengweekly.com
     - +.pingwest.com
     - +.qbitai.com
     - +.qiluyidian.net
@@ -112,92 +112,27 @@ payload:
     - +.sznews.com
     - +.szpgm.com
     - +.takungpao.com
-    - +.6655.com
+    - +.fengedu.com
     - +.thecover.cn
     - +.thepaper.cn
     - +.woshipm.com
     - +.xilu.com
-    - +.jiemian.com
+    - +.phoenixcenter.cn
     - +.yicai.com
     - +.zealer.com
     - +.zhichanli.com
-    - +.minapp.com
-    - +.ifanrx.com
-    - +.zqrb.cn
-    - +.aiganggu.com
-    - +.danjuanfunds.com
-    - +.imedao.com
-    - +.snowballsecurities.com
-    - +.xueqiu.com
-    - +.21jingji.com
-    - +.chinaepg.cn
-    - +.anhuinews.com
-    - +.cztvcdn.com
-    - +.36kr.com
-    - +.36krcdn.com
-    - +.36krcnd.com
-    - +.icntvcdn.com
-    - +.cctvpro.cn
-    - +.cctvlib.cn
-    - +.cctv.cn
-    - +.cctvlibrary.cn
-    - +.ipanda.com
-    - +.cctvpic.com
-    - +.ipanda.cn
-    - +.zggbdszt.cn
-    - +.ynet.com
-    - +.chinalive.com
-    - +.chinaott.com
-    - +.yangshipin.cn
-    - +.xn--kprv4ewxfr9cpxcc7joo6apn8a.xn--fiqs8s
-    - +.cntv.cn
-    - +.xn--kprv4ewxfr9cpxcc7joo6apn8a.cn
-    - +.cntvwb.cn
-    - +.gjgbdszt.cn
-    - +.xn--fiq53l90et9fpncc7joo6apn8a.cn
-    - +.xn--fiq53l6wcx3kp9bc7joo6apn8a.xn--fiqs8s
-    - +.xn--fiq53l6wcx3kp9bc7joo6apn8a.cn
-    - +.cctv.com
-    - +.tvcc.cn
-    - +.ottcn.com
-    - +.ipanda.net
-    - +.livechina.cn
-    - +.livechina.com
-    - +.olympicchannelchina.cn
-    - +.ifanrusercontent.com
-    - +.ifanr.in
-    - +.ifanr.com
-    - +.ifanr.cn
-    - +.coolbuy.com
-    - +.inewsweek.cn
-    - +.ecns.cn
-    - +.chinanews.com
-    - +.tmtsmartrun.com
-    - +.tmtsmartlife.com
-    - +.tivitv.com
-    - +.checkzeit.com
-    - +.72whys.com
-    - +.lancdn.com
-    - +.landiannews.com
-    - +.landian.vip
-    - +.landian.xyz
-    - +.ourl.co
-    - +.wsoso.com
-    - +.fengcx.com
-    - +.ifeng.com
     - +.ifengimg.com
-    - +.phoenixcenter.cn
-    - +.fengedu.com
-    - +.ifengweekly.com
+    - +.ifeng.com
+    - +.zqrb.cn
     - +.admin5.com
     - +.focus-img.cn
     - +.focus.cn
     - +.itc.cn
     - +.sohu.com
-    - +.sohucs.com
-    - +.sogoucdndl.com
-    - +.yidianliulan.cn
-    - +.ggowan.com
+    - +.21jingji.com
+    - +.ggoplay.com
+    - +.anhuinews.com
+    - +.cztvcdn.com
     - +.go2map.com
     - +.pinyin.cn
     - +.qd.ink
@@ -210,7 +145,7 @@ payload:
     - +.sogou.com
     - +.sogou.net
     - +.yuweikuijianzhan.com
-    - +.ggoplay.com
+    - +.sogoucdndl.com
     - +.sg.cn
     - +.sogouimecdn.com
     - +.sogou-inc.com
@@ -225,30 +160,96 @@ payload:
     - +.xinyan.cn
     - +.yeyousg.com
     - +.sogoucdn.com
-    - +.chaindd.com
+    - +.fengcx.com
+    - +.jiemian.com
     - +.tmtpost.com
+    - +.chaindd.com
+    - +.72whys.com
+    - +.checkzeit.com
+    - +.tivitv.com
+    - +.tmtsmartlife.com
+    - +.tmtsmartrun.com
+    - +.olympicchannelchina.cn
+    - +.feng.com
+    - +.fengimg.com
+    - +.wfdata.club
+    - +.aiganggu.com
+    - +.danjuanfunds.com
+    - +.imedao.com
+    - +.snowballsecurities.com
+    - +.xueqiu.com
+    - +.36dianping.com
+    - +.36kr.com
+    - +.36krcdn.com
+    - +.36krcnd.com
+    - +.chinanews.com
+    - +.ecns.cn
+    - +.inewsweek.cn
+    - +.livechina.com
+    - +.livechina.cn
+    - +.coolbuy.com
+    - +.ifanr.cn
+    - +.ifanr.com
+    - +.ifanr.in
+    - +.ifanrusercontent.com
+    - +.ifanrx.com
+    - +.minapp.com
+    - +.lancdn.com
+    - +.landiannews.com
+    - +.landian.vip
+    - +.landian.xyz
+    - +.ourl.co
+    - +.wsoso.com
+    - +.ynet.cn
+    - +.ynet.com
+    - +.ipanda.net
+    - +.icntvcdn.com
+    - +.cctvpro.cn
+    - +.cctvlib.cn
+    - +.cctv.cn
+    - +.cctvlibrary.cn
+    - +.ipanda.com
+    - +.cctvpic.com
+    - +.ipanda.cn
+    - +.zggbdszt.cn
+    - +.chinaepg.cn
+    - +.chinalive.com
+    - +.chinaott.com
+    - +.yangshipin.cn
+    - +.xn--kprv4ewxfr9cpxcc7joo6apn8a.xn--fiqs8s
+    - +.cntv.cn
+    - +.xn--kprv4ewxfr9cpxcc7joo6apn8a.cn
+    - +.cntvwb.cn
+    - +.gjgbdszt.cn
+    - +.xn--fiq53l90et9fpncc7joo6apn8a.cn
+    - +.xn--fiq53l6wcx3kp9bc7joo6apn8a.xn--fiqs8s
+    - +.xn--fiq53l6wcx3kp9bc7joo6apn8a.cn
+    - +.cctv.com
+    - +.tvcc.cn
+    - +.ottcn.com
+    - +.chinanews.com.cn
+    - +.cctvlib.com.cn
     - +.zygbdszt.net.cn
     - +.tigeek.net.cn
-    - +.cctvlibrary.com.cn
-    - +.zggbdszt.net.cn
-    - +.sogou.com.cn
-    - +.cnms.net.cn
-    - +.citv.net.cn
-    - +.zggbdszt.com.cn
-    - +.cctvpro.com.cn
-    - +.zol.com.cn
-    - +.ipanda.com.cn
-    - +.chinanews.com.cn
-    - +.cns.com.cn
-    - +.gjgbdszt.net.cn
-    - +.cctvlib.com.cn
     - +.ynet.com.cn
+    - +.cctvlibrary.com.cn
+    - +.tvcc.com.cn
     - +.gjgbdszt.com.cn
-    - +.soso.com.cn
+    - +.gjgbdszt.net.cn
+    - +.jiemian.com.cn
     - +.cntv.com.cn
+    - +.cctvpro.com.cn
+    - +.citv.net.cn
+    - +.cnms.net.cn
+    - +.zggbdszt.com.cn
+    - +.cs.com.cn
+    - +.sogou.com.cn
+    - +.cns.com.cn
+    - +.ipanda.com.cn
+    - +.soso.com.cn
+    - +.zol.com.cn
     - +.zol-img.com.cn
     - +.xkb.com.cn
-    - +.jiemian.com.cn
     - +.techweb.com.cn
     - +.people.com.cn
     - +.pconline.com.cn
@@ -258,10 +259,8 @@ payload:
     - +.10jqka.com.cn
     - +.gw.com.cn
     - +.dzh.com.cn
-    - +.cs.com.cn
-    - +.tvcc.com.cn
+    - +.zggbdszt.net.cn
     - +.caijing.com.cn
-    - +.ad.cctv.com
     - +.adnet.sohu.com
     - +.ads.sohu.com
     - +.adv-sv-show.focus.cn
@@ -286,3 +285,4 @@ payload:
     - +.theta.sogoucdn.com
     - +.uranus.sogou.com
     - +.wuliao.epro.sogou.com
+    - +.ad.cctv.com
