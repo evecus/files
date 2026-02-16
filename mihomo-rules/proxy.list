@@ -9,7 +9,7 @@ IP-CIDR,208.67.220.220/32,no-resolve
 DOMAIN-SUFFIX,docker.io
 DOMAIN-SUFFIX,ping0.cc
 DOMAIN-SUFFIX,speedtest.net
-DOMAIN-SUFFIX,zeabur.com
+DOMAIN,zeabur.com
 # 域名关键字匹配
 DOMAIN-KEYWORD,1e100
 DOMAIN-KEYWORD,googlevideo
