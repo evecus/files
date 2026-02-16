@@ -98,6 +98,7 @@ payload:
   - +.gateio.live
   - +.gateio.services
   - +.gemini.com
+  - +.gmgn.ai
   - +.guardarian.com
   - +.hashflow.com
   - +.hbabit.com
@@ -159,6 +160,8 @@ payload:
   - +.unisat.io
   - +.uniswap.org
   - +.walletconnect.com
+  - +.walletconnect.org
+  - +.web3modal.org
   - +.wintermute.com
   - +.wisecoin.com
   - +.wiseid.com
