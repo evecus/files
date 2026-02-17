@@ -14,15 +14,10 @@ payload:
     - +.safechat.com
     - +.sis001.com
     - +.v2ex.com
-    - +.2ch.net
-    - +.5ch.net
-    - +.broadbandreports.com
-    - +.dslr.net
-    - +.dslreports.com
-    - +.hkgolden.com
-    - +.hkgolden.media
-    - +.linux.do
-    - +.ldstatic.com
+    - +.dzen.ru
+    - +.dzeninfra.ru
+    - +.habr.com
+    - +.habrastorage.org
     - +.ptt.cc
     - +.ptt2.cc
     - +.ptt3.cc
@@ -36,9 +31,6 @@ payload:
     - +.redditspace.com
     - +.redditstatic.com
     - +.redditstatus.com
-    - +.4cdn.org
-    - +.4chan.org
-    - +.4channel.org
     - +.6park.com
     - +.6parkbbs.com
     - +.6parknews.com
@@ -46,11 +38,13 @@ payload:
     - +.popo8.com
     - +.parkvv.com
     - +.xwbo.com
-    - +.lih.kg
-    - +.lihkg.com
     - +.ck101.com
     - +.ckcdn.com
     - +.ckck.fun
+    - +.dcard.cc
+    - +.dcard.io
+    - +.dcard.link
+    - +.dcard.tw
     - +.maintracker.org
     - +.rutracker.cc
     - +.rutracker.cr
@@ -59,6 +53,16 @@ payload:
     - +.rutracker.nl
     - +.rutracker.org
     - +.rutrk.org
+    - +.4cdn.org
+    - +.4chan.org
+    - +.4channel.org
+    - +.2ch.net
+    - +.5ch.net
+    - +.broadbandreports.com
+    - +.dslr.net
+    - +.dslreports.com
+    - +.linux.do
+    - +.ldstatic.com
     - +.5i01.com
     - +.mobile01.com
     - +.22112211.xyz
@@ -66,6 +70,21 @@ payload:
     - +.nodeimage.com
     - +.nodequality.com
     - +.nodeseek.com
+    - +.qr.ae
+    - +.quora.com
+    - +.quoracdn.net
+    - +.poe.com
+    - +.poecdn.net
+    - +.soyjak.party
+    - +.soyjak.st
+    - +.xda-cdn.com
+    - +.xda-developers.com
+    - +.xdaforums.com
+    - +.xdaimages.com
+    - +.hkgolden.com
+    - +.hkgolden.media
+    - +.lih.kg
+    - +.lihkg.com
     - +.pimg.tw
     - +.pixanalytics.com
     - +.pixfs.net
@@ -74,25 +93,6 @@ payload:
     - +.pixnet.pro
     - +.pixnet.tw
     - +.pixplug.in
-    - +.qr.ae
-    - +.quora.com
-    - +.quoracdn.net
-    - +.poe.com
-    - +.poecdn.net
-    - +.soyjak.party
-    - +.soyjak.st
-    - +.dcard.cc
-    - +.dcard.io
-    - +.dcard.link
-    - +.dcard.tw
-    - +.dzen.ru
-    - +.dzeninfra.ru
-    - +.habr.com
-    - +.habrastorage.org
-    - +.xda-cdn.com
-    - +.xda-developers.com
-    - +.xdaforums.com
-    - +.xdaimages.com
     - +.reddit.app.link
     - +.pixinsight.com.tw
     - +.reddit.map.fastly.net

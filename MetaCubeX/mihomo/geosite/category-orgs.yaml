@@ -1,5 +1,4 @@
 payload:
-    - csis-prod.s3.amazonaws.com
     - a.ppy.sh
     - assets.ppy.sh
     - c.ppy.sh
@@ -9,6 +8,7 @@ payload:
     - notify.ppy.sh
     - sentry.ppy.sh
     - spectator.ppy.sh
+    - csis-prod.s3.amazonaws.com
     - +.aomedia.org
     - +.atypi.org
     - +.change.org
@@ -23,7 +23,9 @@ payload:
     - +.who.int
     - +.wi-fi.org
     - +.wto.org
-    - +.csis.org
+    - +.ppy.sh
+    - +.rolfoundation.org
+    - +.rolsociety.org
     - +.emojipedia.org
     - +.worldemojiawards.com
     - +.worldemojiday.com
@@ -56,12 +58,20 @@ payload:
     - +.messybrainz.org
     - +.metabrainz.org
     - +.musicbrainz.org
-    - +.rolfoundation.org
-    - +.rolsociety.org
+    - +.openmaps.org
+    - +.openstreetmap.com
+    - +.openstreetmap.net
+    - +.openstreetmap.org
+    - +.openstreetmaps.org
+    - +.osm.org
+    - +.osmfoundation.org
+    - +.stateofthemap.com
+    - +.stateofthemap.org
     - +.ccstatic.org
     - +.creativecommons.org
     - +.creativecommons.engineering
     - +.licensebuttons.net
+    - +.csis.org
     - +.ieee.org
     - +.ieee.tv
     - +.tryengineering.org
@@ -118,14 +128,4 @@ payload:
     - +.vtsociety.org
     - +.nist.gov
     - +.time.gov
-    - +.openmaps.org
-    - +.openstreetmap.com
-    - +.openstreetmap.net
-    - +.openstreetmap.org
-    - +.openstreetmaps.org
-    - +.osm.org
-    - +.osmfoundation.org
-    - +.stateofthemap.com
-    - +.stateofthemap.org
     - +.paskoocheh.com
-    - +.ppy.sh
