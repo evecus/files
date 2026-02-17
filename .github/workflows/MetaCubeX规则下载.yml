@@ -3,7 +3,7 @@ name: MetaCubeX规则下载
 on:
   schedule:
     # 每天凌晨 0:00 (UTC) 运行一次
-    - cron: '20 1 * * *'
+    - cron: '30 23 * * *'
   workflow_dispatch: # 允许手动触发
 
 jobs:
