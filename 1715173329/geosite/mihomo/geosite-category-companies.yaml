@@ -5596,6 +5596,8 @@ payload:
   - +.second-ns.com
   - +.second-ns.de
   - +.secondns.at
+  - +.securecloudtransformation.com
+  - +.securitypreview.com
   - +.sena.co.kr
   - +.sensorynetworks.com
   - +.sequence.com
@@ -5957,6 +5959,7 @@ payload:
   - +.threadingbuildingblocks.org
   - +.threads.com
   - +.threads.net
+  - +.threatlabz.com
   - +.thumbzilla.com
   - +.thunderbird.net
   - +.thunderbolttechnology.net
@@ -6836,8 +6839,22 @@ payload:
   - +.ytimg.com
   - +.yusercontent.com
   - +.z.cn
+  - +.zdxbeta.net
+  - +.zdxcloud.net
   - +.zigzag.kr
   - +.zipcine.com
+  - +.zpagov.net
+  - +.zpath.com
+  - +.zscaler.com
+  - +.zscaler.jp
+  - +.zscaler.net
+  - +.zscalerbeta.net
+  - +.zscalergov.net
+  - +.zscalerone.net
+  - +.zscalershift.com
+  - +.zscalerthree.net
+  - +.zscalertwo.net
+  - +.zscloud.net
   - +.zuckerberg.com
   - +.zuckerberg.net
   - +.zukunftswerkstatt.de

@@ -516,6 +516,7 @@ payload:
   - +.starcraft.com
   - +.starcraft2.com
   - +.starfox.com
+  - +.stargazer-games.com
   - +.starwarsbattlefront.com
   - +.starwarsbattlefront2.com
   - +.starwarsfallenorder.com
@@ -543,6 +544,8 @@ payload:
   - +.steamstatic.com
   - +.steamunlocked.net
   - +.steamusercontent.com
+  - +.stellasora.global
+  - +.stellasora.jp
   - +.supercell.com
   - +.supercell.helpshift.com
   - +.supercell.net
@@ -641,8 +644,13 @@ payload:
   - +.xn--mts47c3w9b1qr.net
   - +.ylands.com
   - +.ynoproject.net
+  - +.yo-star.com
   - +.yogify.com
   - +.yoshisnewisland.com
+  - +.yostar-pictures.co.jp
+  - +.yostar.co.jp
+  - +.yostar.net
+  - +.yostarplat.com
   - +.zenlesszonezero.com
   - +.zynga.com
   - +.zyngaplayersupport.com
