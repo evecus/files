@@ -1,7 +1,4 @@
 payload:
-    - +.ozon.ru
-    - +.ozone.ru
-    - +.ozonusercontent.com
     - +.geobasket.ru
     - +.paywb.com
     - +.rwb.ru
@@ -11,3 +8,6 @@ payload:
     - +.wbpay.ru
     - +.wibes.ru
     - +.wildberries.ru
+    - +.ozon.ru
+    - +.ozone.ru
+    - +.ozonusercontent.com
