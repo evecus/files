@@ -1,13 +1,19 @@
 payload:
     - +.psk
-    - +.belgorod.ru
-    - +.chel.ru
+    - +.arkhangelsk.ru
+    - +.marine.ru
     - +.gu-st.ru
     - +.emias.info
     - +.mgfoms.ru
     - +.edu.ru
     - +.cbr.ru
+    - +.cikrf.ru
+    - +.ebs.ru
+    - +.goskey.ru
+    - +.izbirkom.ru
+    - +.kremlin.ru
     - +.nalog.ru
+    - +.xn--80ajghhoc2aj1c8b.xn--p1ai
     - +.mos.ru
     - +.mosreg.ru
     - +.spb.ru
@@ -22,10 +28,10 @@ payload:
     - +.grozny.ru
     - +.i-ola.ru
     - +.izhevsk.ru
-    - +.kalmykia.ru
+    - +.astrakhan.ru
     - +.karelia.ru
     - +.kazan.ru
-    - +.kchr.ru
+    - +.bir.ru
     - +.khakassia.ru
     - +.mari-el.ru
     - +.mari.ru
@@ -48,20 +54,20 @@ payload:
     - +.krasnodar.su
     - +.krasnoyarsk.ru
     - +.kuban.ru
-    - +.marine.ru
+    - +.belgorod.ru
     - +.perm.ru
     - +.stavropol.ru
-    - +.bir.ru
+    - +.stv.ru
     - +.vl.ru
     - +.vladivostok.ru
     - +.amur.ru
-    - +.arkhangelsk.ru
-    - +.astrakhan.ru
     - +.government.ru
-    - +.stv.ru
+    - +.kalmykia.ru
     - +.gosuslugi.ru
-    - +.surgut.ru
+    - +.kchr.ru
     - +.bryansk.ru
+    - +.cbg.ru
+    - +.chel.ru
     - +.chelyabinsk.ru
     - +.ekburg.ru
     - +.xn--80acgfbsl1azdqr.xn--p1ai
@@ -116,5 +122,6 @@ payload:
     - +.yuzhno-sakhalinsk.ru
     - +.chukotka.ru
     - +.jamal.ru
-    - +.cbg.ru
+    - +.surgut.ru
     - +.yamal.ru
+    - +.zdrav10.ru

@@ -16,13 +16,17 @@ payload:
     - ocsp2.apple.com
     - valid.apple.com
     - valid.origin-apple.com.akadns.net
+    - +.sslcom.cn
+    - +.yahoo.cn
+    - +.yahoo.com.cn
+    - www.entrust.cn
+    - +.dcocsp.cn
+    - +.digicert.cn
     - +.oemssl.cn
     - +.oemssl.cn.cdn.cloudflare.net
     - +.sectigochina.com
     - +.sectigochina.com.cdn.cloudflare.net
     - +.trust-provider.cn
-    - +.dcocsp.cn
-    - +.digicert.cn
     - +.alphassl.com
     - +.easy-signing.com
     - +.globalsign.cn
@@ -30,8 +34,4 @@ payload:
     - +.globalsigncdn.com
     - cdn.globalsigncdn.com.cdn.cloudflare.net
     - crl.globalsign.net
-    - +.yahoo.cn
-    - +.yahoo.com.cn
-    - www.entrust.cn
-    - +.sslcom.cn
     - www.microsoft.com
