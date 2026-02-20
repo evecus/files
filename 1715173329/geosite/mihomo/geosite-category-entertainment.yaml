@@ -10,6 +10,7 @@ payload:
   - +.20thcenturystudios.com.au
   - +.20thcenturystudios.com.br
   - +.20thcenturystudios.jp
+  - +.24h.tv
   - +.2k.com
   - +.2kcoretech.online
   - +.2kct.onl
@@ -62,6 +63,7 @@ payload:
   - +.amebaownd.com
   - +.amebaowndme.com
   - +.ameblo.jp
+  - +.amediateka.ru
   - +.amiibo.com
   - +.amp-api.podcast.apple.com
   - +.analytics.tiktok.com
@@ -170,6 +172,7 @@ payload:
   - +.capturingreality.com
   - +.castro.fm
   - +.catchplay.com
+  - +.cdnvideo.ru
   - +.cf-vanguard.com
   - +.championshipseriesleague.com
   - +.charlotte-anime.jp
@@ -643,6 +646,7 @@ payload:
   - +.iole.tv
   - +.itch.io
   - +.itch.zone
+  - +.ivi.ru
   - +.iyf.tv
   - +.joinmaidez.com
   - +.joinsquad.com
@@ -654,6 +658,9 @@ payload:
   - +.kfs.io
   - +.kingkong.com.tw
   - +.kingkongapp.com
+  - +.kinopoisk-ru.clstorage.net
+  - +.kinopoisk.ru
+  - +.kinorium.com
   - +.kirbysepicyarn.com
   - +.kirbysuperstarultra.com
   - +.kk.stream
@@ -742,6 +749,7 @@ payload:
   - +.media-imdb.com
   - +.mediaclip.jp
   - +.megaphone.fm
+  - +.megogo.net
   - +.metacritic.com
   - +.mgo-images.com
   - +.mgo.com
@@ -843,7 +851,6 @@ payload:
   - +.nflxso.net
   - +.nflxvideo.net
   - +.nfsworld.com
-  - +.ngenix.net
   - +.ngeo.com
   - +.nicodic.jp
   - +.nicomanga.jp
@@ -999,6 +1006,7 @@ payload:
   - +.pokemonvgc.com
   - +.pokemonwifi.net
   - +.popcap.com
+  - +.premier.one
   - +.priconne-redive.jp
   - +.prime-video.com
   - +.primevideo.cc
@@ -1132,6 +1140,7 @@ payload:
   - +.sling.com
   - +.slinginternational.com
   - +.smartstream.ne.jp
+  - +.smotreshka.tv
   - +.sndcdn.com
   - +.snk-corp.co.jp
   - +.snk-corp.info
@@ -1181,6 +1190,7 @@ payload:
   - +.stargazer-games.com
   - +.starott.com
   - +.starplus.com
+  - +.start.ru
   - +.starwars.com
   - +.starwarsbattlefront.com
   - +.starwarsbattlefront2.com
@@ -1293,6 +1303,7 @@ payload:
   - +.tospotify.com
   - +.toy-people.com
   - +.tra-ww000-cp.akamaized.net
+  - +.trbcdn.net
   - +.triokini.com
   - +.ttlivecdn.com
   - +.ttoverseaus.net
@@ -1302,6 +1313,7 @@ payload:
   - +.tvb.com
   - +.tver.co.jp
   - +.tver.jp
+  - +.tvigle.ru
   - +.twinmotion.com
   - +.twitch.tv
   - +.twitchcdn.net
@@ -1329,6 +1341,7 @@ payload:
   - +.vhxqa4.com
   - +.vhxqa6.com
   - +.vigorgame.com
+  - +.viju.ru
   - +.vimeo-staging.com
   - +.vimeo-staging2.com
   - +.vimeo.com

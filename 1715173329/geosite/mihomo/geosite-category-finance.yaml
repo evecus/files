@@ -7,15 +7,18 @@ payload:
   - +.abank.com.mm
   - +.ablmm.com
   - +.aboutschwab.com
+  - +.abr.ru
   - +.agdbank.com
   - +.agri-bank.com
   - +.akita-bank.co.jp
+  - +.alfabank.ru
   - +.ansarbank.com
   - +.aozorabank.co.jp
   - +.ashikagabank.co.jp
   - +.awabank.co.jp
   - +.ayabank.com
   - +.bank-maskan.ir
+  - +.bankline.ru
   - +.bankmellat.ir
   - +.banksepah.ir
   - +.bim.ir
@@ -28,6 +31,7 @@ payload:
   - +.cbbank.com.mm
   - +.cbi.ir
   - +.cbm.com.mm
+  - +.cdn-tinkoff.ru
   - +.chibabank.co.jp
   - +.chibakogyo-bank.co.jp
   - +.chid.com.mm
@@ -36,6 +40,7 @@ payload:
   - +.citibank.co.jp
   - +.daiichibank.co.jp
   - +.day24.ir
+  - +.dbo-dengi.online
   - +.edbi.ir
   - +.enbank.ir
   - +.fibank.bg
@@ -56,8 +61,10 @@ payload:
   - +.futunn.com
   - +.futustatic.com
   - +.fxcorporate.com
+  - +.gazprombank.ru
   - +.gbank.com.mm
   - +.ghbi.ir
+  - +.gpb.ru
   - +.gunmabank.co.jp
   - +.hibank24.com
   - +.higobank.co.jp
@@ -196,6 +203,7 @@ payload:
   - +.moomootrustee.com
   - +.mql5.com
   - +.mresalat.ir
+  - +.mtsdengi.ru
   - +.musashinobank.co.jp
   - +.mwdbank.com
   - +.myfin.bg
@@ -211,18 +219,24 @@ payload:
   - +.parsian-bank.com
   - +.paypay-bank.co.jp
   - +.postbank.ir
+  - +.psbank.ru
   - +.qmb.ir
   - +.rakuten-bank.co.jp
   - +.rb24.ir
   - +.refah-bank.ir
   - +.resonabank.co.jp
+  - +.rosbank.ru
   - +.rqbank.ir
+  - +.rshb.ru
   - +.ryukyubank.co.jp
   - +.sagabank.co.jp
   - +.saitama-resona.co.jp
   - +.saninbank.co.jp
   - +.sb24.com
   - +.sbank.ir
+  - +.sber.ru
+  - +.sberbank.com
+  - +.sberbank.ru
   - +.sbishinseibank.co.jp
   - +.sc.com
   - +.schwab.co.uk
@@ -251,9 +265,13 @@ payload:
   - +.standardchartered.com
   - +.surugabank.co.jp
   - +.tajimabank.co.jp
+  - +.tbank-online.com
+  - +.tbank.ru
   - +.tech26.de
   - +.tejaratbank.ir
   - +.tochigibank.co.jp
+  - +.tochka-tech.com
+  - +.tochka.com
   - +.tohobank.co.jp
   - +.tohoku-bank.co.jp
   - +.tomibank.co.jp
@@ -264,6 +282,7 @@ payload:
   - +.tsukubabank.co.jp
   - +.tuncommercialbank.com
   - +.uab.com.mm
+  - +.vtb.ru
   - +.waveomoney.com.mm
   - +.wbrks.com
   - +.wise.com
