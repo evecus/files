@@ -95,7 +95,7 @@ jobs:
                 
                 # 生成 Sing-box JSON
                 jq -n --rawfile ips "temp_ip/$file.txt" \
-                  '{version: 1, rules: [{ip_cidr: ($ips | split("\n") | map(select(length > 0)))}] }' > "$SB_DIR/$file.json"
+                  '{version: 2, rules: [{ip_cidr: ($ips | split("\n") | map(select(length > 0)))}] }' > "$SB_DIR/$file.json"
                 
                 # 编译 Sing-box SRS
                 sing-box rule-set compile --output "$SB_DIR/$file.srs" "$SB_DIR/$file.json"
