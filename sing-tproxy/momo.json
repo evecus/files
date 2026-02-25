@@ -1,75 +1,167 @@
 {
   "dns": {
     "servers": [
-      {"tag": "local", "type": "udp", "server": "223.5.5.5"},
-      {"tag": "public", "type": "https", "server": "dns.alidns.com", "domain_resolver": "local"},
-      {"tag": "google", "type": "https", "server": "8.8.8.8", "detour": "默认代理"}
+      {"tag": "ali-dns", "type": "https", "server": "223.5.5.5"},
+      {"tag": "geogle-dns", "type": "https", "server": "8.8.8.8", "detour": "代理"}
     ],
     "rules": [
-      {"clash_mode": "direct", "server": "local"},
+      {"clash_mode": "direct", "server": "ali-dns"},
       {"clash_mode": "global", "server": "fakeip"},
       {"query_type": "HTTPS", "action": "reject"},
-      {"domain_suffix": ["foreign-domain", "googleapis.cn", "xn--ngstr-lra8j.com"], "server": "google"},
-      {"rule_set": ["cn-domain"], "server": "local"}
+      {"rule_set": ["meproxy", "foreign_domain"], "server": "geogle-dns"},
+      {"rule_set": ["medirect", "geosite-cn"], "server": "ali-dns"}
     ],
-    "final": "google",
+    "final": "geogle-dns",
     "strategy": "prefer_ipv4",
     "independent_cache": true,
     "reverse_mapping": true
   },
   "outbounds": [
-    {"tag": "默认代理", "type": "selector", "outbounds": []},
-    {"tag": "自动选择", "type": "urltest", "outbounds": [], "interval": "10m", "tolerance": 100},
-    {"tag": "漏网之鱼", "type": "selector", "outbounds": ["默认代理", "自动选择", "直连"]},
-    {"tag": "GLOBAL", "type": "selector", "outbounds": ["默认代理", "自动选择", "直连"]},
-    {"tag": "直连", "type": "direct"},
-    {"tag": "拦截", "type": "block"}
+    {
+      "tag": "代理",
+      "type": "selector",
+      "outbounds": []
+    }
+    {
+      "tag": "直连",
+      "type": "direct"
+    },
+    {
+      "tag": "拦截",
+      "type": "block"
+    }
   ],
   "route": {
     "rules": [
-      {"action": "sniff", "sniffer": ["http", "tls", "quic", "dns"]},
-      {"inbound": "dns-in", "action": "hijack-dns"},
-      {"ip_is_private": true, "outbound": "直连"},
-      {"clash_mode": "direct", "outbound": "直连"},
-      {"clash_mode": "global", "outbound": "GLOBAL"},
-      {"rule_set": "ads", "outbound": "拦截"},
-      {"rule_set": "medirect", "outbound": "直连"},
-      {"rule_set": "foreign-domain", "outbound": "默认代理"},
-      {"rule_set": "cn-domain", "outbound": "直连"},
-      {"rule_set": "google-ip", "outbound": "默认代理"},
-      {"rule_set": "telegram-ip", "outbound": "默认代理"},
-      {"rule_set": "cn-ip", "outbound": "直连"}
+      {
+        "action": "sniff",
+        "sniffer": [
+          "http",
+          "tls",
+          "quic",
+          "dns"
+        ]
+      },
+      {
+        "inbound": "dns-in",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "直连"
+      },
+      {
+        "clash_mode": "direct",
+        "outbound": "直连"
+      },
+      {
+        "clash_mode": "global",
+        "outbound": "GLOBAL"
+      },
+      {
+        "rule_set": "medirect",
+        "outbound": "直连"
+      },
+      {
+        "rule_set": "meproxy",
+        "outbound": "代理"
+      },
+      {
+        "rule_set": "ads",
+        "outbound": "拦截"
+      },
+      {
+        "rule_set": "foreign_domain",
+        "outbound": "代理"
+      },
+      {
+        "rule_set": "geosite-cn",
+        "outbound": "直连"
+      },
+      {
+        "rule_set": "foreign_ip",
+        "outbound": "代理"
+      },
+      {
+        "rule_set": "geoip-cn",
+        "outbound": "直连"
+      }
     ],
     "rule_set": [
-      {"tag": "ads", "type": "remote", "format": "binary", "url": "https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblocksingbox.srs", "download_detour": "默认代理"},
-      {"tag": "medirect", "type": "remote", "format": "binary", "url": "https://raw.githubusercontent.com/evecus/files/refs/heads/main/singbox-rules/direct.srs", "download_detour": "默认代理"},
-      {"tag": "foreign-domain", "type": "remote", "format": "binary", "url": "https://raw.githubusercontent.com/evecus/files/refs/heads/main/singbox-rules/foreign_domain.srs", "download_detour": "默认代理"},
-      {"tag": "cn-domain", "type": "remote", "format": "binary", "url": "https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-cn.srs", "download_detour": "默认代理"},
-      {"tag": "google-ip", "type": "remote", "format": "binary", "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/google.srs", "download_detour": "默认代理"},
-      {"tag": "telegram-ip", "type": "remote", "format": "binary", "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/telegram.srs", "download_detour": "默认代理"},
-      {"tag": "cn-ip", "type": "remote", "format": "binary", "url": "https://fastly.jsdelivr.net/gh/1715173329/IPCIDR-CHINA@rule-set/cn.srs", "download_detour": "默认代理"}
+      {
+        "tag": "medirect",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://fastly.jsdelivr.net/gh/evecus/rules_set@main/sing-box/direct.srs",
+        "download_detour": "直连"
+      },
+      {
+        "tag": "meproxy",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://fastly.jsdelivr.net/gh/evecus/rules_set@main/sing-box/proxy.srs",
+        "download_detour": "直连"
+      },
+      {
+        "tag": "foreign_domain",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://fastly.jsdelivr.net/gh/evecus/rules_set@main/sing-box/foreign_domain-lite.srs",
+        "download_detour": "直连"
+      },
+      {
+        "tag": "foreign_ip",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://fastly.jsdelivr.net/gh/evecus/rules_set@main/sing-box/foreign_ip4.srs",
+        "download_detour": "直连"
+      },
+      {
+        "tag": "ads",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://fastly.jsdelivr.net/gh/evecus/rules_set@main/sing-box/ads_domain-lite.srs",
+        "download_detour": "直连"
+      },
+      {
+        "tag": "geoip-cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://fastly.jsdelivr.net/gh/evecus/rules_set@main/sing-box/cn_ip-lite.srs",
+        "download_detour": "直连"
+      },
+      {
+        "tag": "geosite-cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://fastly.jsdelivr.net/gh/evecus/rules_set@main/sing-box/cn_domain-lite.srs",
+        "download_detour": "直连"
+      }
     ],
-    "final": "漏网之鱼",
-    "default_domain_resolver": {"server": "google"}
+    "final": "代理",
+    "auto_detect_interface": true,
+    "default_domain_resolver": {
+      "server": "geogle-dns"
+    }
   },
   "inbounds": [
     {
       "tag": "dns-in",
       "type": "direct",
       "listen": "::",
-      "listen_port": 1053
+      "listen_port": 1153
     },
     {
       "tag": "redirect-in",
       "type": "redirect",
       "listen": "::",
-      "listen_port": 7890
+      "listen_port": 7896
     },
     {
       "tag": "tproxy-in",
       "type": "tproxy",
       "listen": "::",
-      "listen_port": 7891
+      "listen_port": 7899
     }
   ],
   "experimental": {
@@ -81,9 +173,9 @@
     "clash_api": {
       "external_controller": "0.0.0.0:9090",
       "external_ui": "/etc/momo/run/ui",
-      "external_ui_download_url": "https://github.com/Zephyruso/zashboard/archive/refs/heads/gh-pages.zip",
-      "external_ui_download_detour": "默认代理",
-      "secret": "",
+      "external_ui_download_url": "https://fastly.jsdelivr.net/gh/evecus/rules_set@ui/zashboard-gh-pages.zip",
+      "external_ui_download_detour": "直连",
+      "secret": "1234",
       "default_mode": "rule"
     }
   },
