@@ -21,7 +21,20 @@
       "tag": "默认代理",
       "type": "selector",
       "outbounds": []
-    }
+    }，
+    {
+      "tag": "自动选择",
+      "type": "urltest",
+      "outbounds": []
+    },
+    {
+      "tag": "漏网之鱼",
+      "type": "selector",
+      "outbounds": [
+        "直连",
+        "默认代理"
+      ]
+    },
     {
       "tag": "直连",
       "type": "direct"
@@ -138,7 +151,7 @@
         "download_detour": "直连"
       }
     ],
-    "final": "默认代理",
+    "final": "漏网之鱼",
     "auto_detect_interface": true,
     "default_domain_resolver": {
       "server": "geogle-dns"
