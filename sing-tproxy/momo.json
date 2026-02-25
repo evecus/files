@@ -21,7 +21,7 @@
       "tag": "默认代理",
       "type": "selector",
       "outbounds": []
-    }，
+    },
     {
       "tag": "自动选择",
       "type": "urltest",
