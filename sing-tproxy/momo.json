@@ -2,7 +2,7 @@
   "dns": {
     "servers": [
       {"tag": "ali-dns", "type": "https", "server": "223.5.5.5"},
-      {"tag": "geogle-dns", "type": "https", "server": "8.8.8.8", "detour": "代理"}
+      {"tag": "geogle-dns", "type": "https", "server": "8.8.8.8", "detour": "默认代理"}
     ],
     "rules": [
       {"clash_mode": "direct", "server": "ali-dns"},
@@ -18,7 +18,7 @@
   },
   "outbounds": [
     {
-      "tag": "代理",
+      "tag": "默认代理",
       "type": "selector",
       "outbounds": []
     }
@@ -64,7 +64,7 @@
       },
       {
         "rule_set": "meproxy",
-        "outbound": "代理"
+        "outbound": "默认代理"
       },
       {
         "rule_set": "ads",
@@ -72,7 +72,7 @@
       },
       {
         "rule_set": "foreign_domain",
-        "outbound": "代理"
+        "outbound": "默认代理"
       },
       {
         "rule_set": "geosite-cn",
@@ -80,7 +80,7 @@
       },
       {
         "rule_set": "foreign_ip",
-        "outbound": "代理"
+        "outbound": "默认代理"
       },
       {
         "rule_set": "geoip-cn",
@@ -138,7 +138,7 @@
         "download_detour": "直连"
       }
     ],
-    "final": "代理",
+    "final": "默认代理",
     "auto_detect_interface": true,
     "default_domain_resolver": {
       "server": "geogle-dns"
