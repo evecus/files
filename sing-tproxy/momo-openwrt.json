@@ -16,34 +16,6 @@
     "independent_cache": true,
     "reverse_mapping": true
   },
-  "outbounds": [
-    {
-      "tag": "默认代理",
-      "type": "selector",
-      "outbounds": []
-    },
-    {
-      "tag": "自动选择",
-      "type": "urltest",
-      "outbounds": []
-    },
-    {
-      "tag": "漏网之鱼",
-      "type": "selector",
-      "outbounds": [
-        "直连",
-        "默认代理"
-      ]
-    },
-    {
-      "tag": "直连",
-      "type": "direct"
-    },
-    {
-      "tag": "拦截",
-      "type": "block"
-    }
-  ],
   "route": {
     "rules": [
       {
@@ -192,6 +164,34 @@
       "default_mode": "rule"
     }
   },
+  "outbounds": [
+    {
+      "tag": "默认代理",
+      "type": "selector",
+      "outbounds": []
+    },
+    {
+      "tag": "自动选择",
+      "type": "urltest",
+      "outbounds": []
+    },
+    {
+      "tag": "漏网之鱼",
+      "type": "selector",
+      "outbounds": [
+        "直连",
+        "默认代理"
+      ]
+    },
+    {
+      "tag": "直连",
+      "type": "direct"
+    },
+    {
+      "tag": "拦截",
+      "type": "block"
+    }
+  ],
   "log": {
     "disabled": true
   }
