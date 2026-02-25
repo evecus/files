@@ -171,11 +171,6 @@
       "outbounds": []
     },
     {
-      "tag": "自动选择",
-      "type": "urltest",
-      "outbounds": []
-    },
-    {
       "tag": "漏网之鱼",
       "type": "selector",
       "outbounds": [
