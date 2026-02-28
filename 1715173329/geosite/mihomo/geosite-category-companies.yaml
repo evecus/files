@@ -6665,6 +6665,7 @@ payload:
   - +.yandexcloud.net
   - +.yandexcom.net
   - +.yandexmetrica.com
+  - +.yandexwebcache.net
   - +.yandexwebcache.org
   - +.yastat.net
   - +.yastatic-net.ru
@@ -6921,6 +6922,7 @@ payload:
   - amp-api-edge-lb-cn.itunes-apple.com.akadns.net
   - amp-api-edge-lb.itunes-apple.com.akadns.net
   - amp-api-edge.apps.apple.com
+  - amp-api-edge.music.apple.com
   - amp-api-search-edge.apps.apple.com
   - amp-api-updates.apps.apple.com
   - amp-api.apps.apple.com
@@ -7283,6 +7285,8 @@ payload:
   - mtalk.google.com
   - mtalk4.google.com
   - music.apple.com
+  - musicstatus.music.apple.com
+  - mvod.itunes.apple.com
   - mwf-service.akamaized.net
   - myapp.itunes.apple.com
   - myvs.download.prss.microsoft.com
@@ -7520,6 +7524,7 @@ payload:
   - snpi.dell.com
   - software.download.prss.microsoft.com
   - sp.itunes.apple.com
+  - speedysub.music.apple.com
   - ssl-google-analytics.l.google.com
   - ssl.gstatic.com
   - sslredirect.corp.google.com
