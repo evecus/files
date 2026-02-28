@@ -1,7 +1,8 @@
 payload:
     - +.psk
-    - +.arkhangelsk.ru
-    - +.marine.ru
+    - +.government.ru
+    - +.gov.ru
+    - +.gosuslugi.ru
     - +.gu-st.ru
     - +.emias.info
     - +.mgfoms.ru
@@ -10,6 +11,7 @@ payload:
     - +.cikrf.ru
     - +.ebs.ru
     - +.goskey.ru
+    - +.grfc.ru
     - +.izbirkom.ru
     - +.kremlin.ru
     - +.nalog.ru
@@ -28,10 +30,10 @@ payload:
     - +.grozny.ru
     - +.i-ola.ru
     - +.izhevsk.ru
-    - +.astrakhan.ru
+    - +.kalmykia.ru
     - +.karelia.ru
     - +.kazan.ru
-    - +.bir.ru
+    - +.kchr.ru
     - +.khakassia.ru
     - +.mari-el.ru
     - +.mari.ru
@@ -54,17 +56,17 @@ payload:
     - +.krasnodar.su
     - +.krasnoyarsk.ru
     - +.kuban.ru
-    - +.belgorod.ru
+    - +.marine.ru
     - +.perm.ru
     - +.stavropol.ru
     - +.stv.ru
     - +.vl.ru
     - +.vladivostok.ru
     - +.amur.ru
-    - +.government.ru
-    - +.kalmykia.ru
-    - +.gosuslugi.ru
-    - +.kchr.ru
+    - +.arkhangelsk.ru
+    - +.astrakhan.ru
+    - +.belgorod.ru
+    - +.bir.ru
     - +.bryansk.ru
     - +.cbg.ru
     - +.chel.ru
@@ -93,7 +95,6 @@ payload:
     - +.orb.ru
     - +.oryol.ru
     - +.penza.ru
-    - +.gov.ru
     - +.psk.ru
     - +.pskov.ru
     - +.rnd.ru

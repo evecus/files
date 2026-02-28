@@ -1,6 +1,20 @@
 payload:
-    - +.t8tms.com
-    - +.udalogistic.cn
+    - +.bestincapp.cn
+    - +.yundaex.cn
+    - +.sf-saas.com
+    - +.rongechain.com
+    - +.sf-airlines.com
+    - +.sf-cityrush.com
+    - +.sf-express.com
+    - +.ibobscs.com
+    - +.sf-international.com
+    - +.feng1.com
+    - +.sfgy.org
+    - +.sf.cn
+    - +.sfbuy.com
+    - +.sfcar.hk
+    - +.sffix.cn
+    - +.sto-express.cn
     - +.sto-express.com
     - +.sto.cn
     - +.stointl.com
@@ -39,9 +53,7 @@ payload:
     - +.ytokj.net
     - +.ytokj.cn
     - +.ydsys.cn
-    - +.yundaex.cn
-    - +.yundaex.com
-    - +.yundasys.com
+    - +.youyiwms.com
     - +.ztoyh.com
     - +.ztogroup.com
     - +.ztoglobal.com
@@ -49,19 +61,24 @@ payload:
     - +.zto.net
     - +.zto.com
     - +.zto.cn
+    - +.guoocang.com
+    - +.zt-express.com
+    - +.tuxi.com
+    - +.yundaex.com
+    - +.yundasys.com
     - +.yunda56.com
     - +.yundalog.com
     - +.yundaltl.com
     - +.udalogistic.com
-    - +.t1tms.com
+    - +.udalogistic.cn
     - +.bestincapi.com
     - +.800best.net
-    - +.56laile.com
-    - +.youyiwms.com
-    - +.bestincapp.cn
+    - +.tnettms.com
+    - +.sf-financial.com
+    - +.izto.com
     - +.800bestapi.cn
     - +.800bestapi.com
-    - +.guoocang.com
+    - +.800bestapp.cn
     - +.800bestapp.com
     - +.baishinetwork.com
     - +.best-inc.com
@@ -73,28 +90,28 @@ payload:
     - +.bestcrossborder.com
     - +.linliyz.com
     - +.qiancangwms.com
-    - +.jtfulfillment.com
-    - +.sto-express.cn
-    - +.800bestapp.cn
+    - +.qianyierp.com
+    - +.t1tms.com
+    - +.t8tms.com
     - +.t9tms.com
-    - +.tnettms.com
+    - +.56laile.com
     - +.wangniuwms.com
     - +.xinyuanfin.com
     - +.youyierp.com
     - +.youyitms.com
-    - +.zt-express.com
-    - +.tuxi.com
-    - +.izto.com
     - +.ztoapp.com
-    - +.kuaidilab.com
-    - +.deppon.com
+    - +.fcboxmall.com
+    - +.fcbox.com
+    - +.cainiao-inc.com
+    - +.cainiao.com
+    - +.cainiaoyizhan.com
+    - +.guoguo-app.com
     - +.dpma.cc
-    - +.kuaidi100.com
     - +.upfos.cn
     - +.jtexpress.com
     - +.upfos.com
     - +.jtfulfillment.cn
-    - +.qianyierp.com
+    - +.jtfulfillment.com
     - +.jtjms-ae.com
     - +.jtjms-br.com
     - +.jtjms-eg.com
@@ -109,46 +126,29 @@ payload:
     - +.jetlogistic.com
     - +.jtg2g.com
     - +.jtexpress.top
-    - +.kd100.com
+    - +.deppon.com
+    - +.kuaidilab.com
+    - +.kuaidi100.com
     - +.ckd.im
-    - +.fcboxmall.com
-    - +.sf-financial.com
-    - +.sf-saas.com
-    - +.rongechain.com
-    - +.sf-airlines.com
-    - +.sf-cityrush.com
-    - +.sf-express.com
-    - +.ibobscs.com
-    - +.sf-international.com
-    - +.feng1.com
-    - +.sfgy.org
-    - +.sf.cn
-    - +.sfbuy.com
-    - +.sfcar.hk
-    - +.sffix.cn
-    - +.fcbox.com
-    - +.cainiao-inc.com
-    - +.cainiao.com
-    - +.cainiaoyizhan.com
-    - +.guoguo-app.com
-    - +.jnt-express.com.cn
-    - +.sto-express.com.cn
-    - +.yto56.net.cn
+    - +.kd100.com
+    - +.cainiao.com.cn
+    - +.sf-tech.com.cn
+    - +.ytocargo.com.cn
     - +.yto56.com.cn
-    - +.jtexpress.com.cn
     - +.deppon.com.cn
     - +.800best.com.cn
-    - +.cainiao.com.cn
-    - +.mlzt.com.cn
-    - +.yto.net.cn
     - +.nellit.com.cn
     - +.bxexpress.com.cn
-    - +.ytocargo.com.cn
+    - +.mlzt.com.cn
+    - +.yto.net.cn
+    - +.nellit.org.cn
+    - +.jtexpress.com.cn
     - +.ytokj.net.cn
     - +.ytojg.com.cn
     - +.ytokj.com.cn
     - +.nellit.net.cn
-    - +.sf-tech.com.cn
+    - +.sto-express.com.cn
+    - +.jnt-express.com.cn
     - +.izto.com.cn
-    - +.nellit.org.cn
+    - +.yto56.net.cn
     - +.v6-adashx.ut.cainiao.com

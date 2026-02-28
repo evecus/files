@@ -40,6 +40,7 @@ payload:
     - amp-api-edge-lb-cn.itunes-apple.com.akadns.net
     - amp-api-edge-lb.itunes-apple.com.akadns.net
     - amp-api-edge.apps.apple.com
+    - amp-api-edge.music.apple.com
     - amp-api-search-edge.apps.apple.com
     - amp-api.apps.apple.com
     - amp-api.music.apple.com
@@ -70,6 +71,8 @@ payload:
     - km.support.apple.com
     - maps.apple.com
     - misc-assets.itunes.apple.com
+    - musicstatus.music.apple.com
+    - mvod.itunes.apple.com
     - myapp.itunes.apple.com
     - np-edge.itunes.apple.com
     - osxapps.itunes.apple.com
@@ -82,6 +85,7 @@ payload:
     - search.itunes.apple.com
     - sf-api-token-service.itunes.apple.com
     - sp.itunes.apple.com
+    - speedysub.music.apple.com
     - streamingaudio.itunes.apple.com
     - su.itunes.apple.com
     - sync.itunes.apple.com
@@ -252,6 +256,19 @@ payload:
     - www.apple.com
     - www.apple.com.edgekey.net.globalredir.akadns.net
     - xp.apple.com
+    - +.beats1.cn
+    - +.beats1.com.cn
+    - +.beats2.com.cn
+    - +.beats4.cn
+    - +.beatsbydre.com
+    - +.beatsbydre.com.cn
+    - +.beatsep.cn
+    - +.apple-icloud.cn
+    - +.appleicloud.cn
+    - +.icloud-apple.cn
+    - +.icloud.com.cn
+    - +.icloud.net.cn
+    - +.icloudapple.cn
     - +.apple-itunes.cn
     - +.itunes-apple.cn
     - +.itunesapple.cn
@@ -271,16 +288,3 @@ payload:
     - ocsp2.apple.com
     - valid.apple.com
     - valid.origin-apple.com.akadns.net
-    - +.beats1.cn
-    - +.beats1.com.cn
-    - +.beats2.com.cn
-    - +.beats4.cn
-    - +.beatsbydre.com
-    - +.beatsbydre.com.cn
-    - +.beatsep.cn
-    - +.apple-icloud.cn
-    - +.appleicloud.cn
-    - +.icloud-apple.cn
-    - +.icloud.com.cn
-    - +.icloud.net.cn
-    - +.icloudapple.cn
