@@ -1,11 +1,16 @@
-name: Advanced JSON Rules Merge
+name: 合并json
 
 on:
   workflow_dispatch:
     inputs:
       urls:
-        description: '输入 JSON 链接（空格分隔）'
+        description: '请输入需要合并的 JSON 链接（空格分隔）'
         required: true
+        default: ''
+      filename:
+        description: '请输入生成的文件名（不需要加 .json 后缀）'
+        required: true
+        default: 'merged_domains'
 
 jobs:
   merge_and_upload:
@@ -22,80 +27,84 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run Advanced Merge Script
+      - name: Run Merge Script
         shell: python
         run: |
           import json
           import requests
           import os
 
+          # 1. 获取输入参数
           urls_str = "${{ github.event.inputs.urls }}"
+          custom_filename = "${{ github.event.inputs.filename }}"
           urls = urls_str.split()
           
-          # 用于存储最终合并后的 rules
           final_rules = []
           version = 2
 
+          # 2. 拉取并解析所有链接
           for url in urls:
-              print(f"正在处理: {url}")
+              print(f"正在下载并解析: {url}")
               try:
-                  res = requests.get(url.strip())
+                  res = requests.get(url.strip(), timeout=30)
+                  res.raise_for_status()
                   data = res.json()
                   if 'version' in data:
                       version = data['version']
-                  
-                  # 将当前文件的所有 rules 提取出来
                   if 'rules' in data:
                       final_rules.extend(data['rules'])
               except Exception as e:
-                  print(f"解析 {url} 失败: {e}")
+                  print(f"处理 {url} 时出错: {e}")
 
-          # --- 核心逻辑：合并具有相同字段结构的 rules 并去重 ---
-          # 比如：如果两个文件都有 'domain' 字段的 rule，我们将它们合并成一个大的 domain 列表
+          # 3. 智能去重合并逻辑
+          # 按字段组合归类合并，确保 domain/ip_cidr 等各自去重
           merged_data = {}
-          
           for rule in final_rules:
-              # 将 rule 的所有键（排除掉值，只留键名）转为 tuple 作为标识符
-              # 这样具有相同字段组合（如只有 domain，或同时有 domain 和 ip_cidr）的 rule 会被归类
-              keys = tuple(sorted(rule.keys()))
-              if keys not in merged_data:
-                  merged_data[keys] = {k: set() for k in keys}
+              # 提取所有列表类型的键作为标识符
+              list_keys = tuple(sorted([k for k, v in rule.items() if isinstance(v, list)]))
+              if not list_keys: continue 
               
-              for k, v in rule.items():
-                  if isinstance(v, list):
-                      merged_data[keys][k].update(v)
-                  else:
-                      # 如果是非列表字段（如 tag），保留最后一个遇到的值
-                      merged_data[keys][k] = v
+              if list_keys not in merged_data:
+                  merged_data[list_keys] = {k: set() for k in list_keys}
+                  # 保留非列表字段 (例如 tag, action)
+                  for k, v in rule.items():
+                      if not isinstance(v, list):
+                          merged_data[list_keys][k] = v
+              
+              for k in list_keys:
+                  merged_data[list_keys][k].update(rule.get(k, []))
 
-          # 重新格式化为列表并排序
+          # 4. 转换回标准 JSON 格式
           processed_rules = []
           for keys, content in merged_data.items():
               new_rule = {}
-              for k in keys:
-                  val = content[k]
-                  if isinstance(val, set):
-                      # 排序并转回列表
-                      new_rule[k] = sorted(list(val))
-                  else:
-                      new_rule[k] = val
+              for k, v in content.items():
+                  new_rule[k] = sorted(list(v)) if isinstance(v, set) else v
               processed_rules.append(new_rule)
 
-          # 构建最终 JSON
-          output_json = {
-              "version": version,
-              "rules": processed_rules
-          }
+          result = {"version": version, "rules": processed_rules}
 
+          # 5. 目录处理：如果没有 123 目录就创建
           output_dir = "123"
-          os.makedirs(output_dir, exist_ok=True)
-          with open(os.path.join(output_dir, "merged_domains.json"), "w", encoding="utf-8") as f:
-              json.dump(output_json, f, indent=2, ensure_ascii=False)
+          if not os.path.exists(output_dir):
+              print(f"目录 {output_dir} 不存在，正在创建...")
+              os.makedirs(output_dir)
+          
+          # 处理文件名后缀
+          file_name = custom_filename if custom_filename.endswith(".json") else f"{custom_filename}.json"
+          output_path = os.path.join(output_dir, file_name)
+
+          # 6. 保存文件
+          with open(output_path, "w", encoding="utf-8") as f:
+              json.dump(result, f, indent=2, ensure_ascii=False)
+          
+          print(f"成功合并！文件已保存至: {output_path}")
 
       - name: Commit and Push
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          git add 123/merged_domains.json
-          git commit -m "Merge multiple fields and rules" || echo "No changes"
+          # 确保将新创建的目录和文件都加入暂存区
+          git add 123/
+          git commit -m "Merge JSON to ${{ github.event.inputs.filename }}.json" || echo "No changes to commit"
           git push origin main
