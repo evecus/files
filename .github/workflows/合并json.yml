@@ -1,0 +1,101 @@
+name: Advanced JSON Rules Merge
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: '输入 JSON 链接（空格分隔）'
+        required: true
+
+jobs:
+  merge_and_upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run Advanced Merge Script
+        shell: python
+        run: |
+          import json
+          import requests
+          import os
+
+          urls_str = "${{ github.event.inputs.urls }}"
+          urls = urls_str.split()
+          
+          # 用于存储最终合并后的 rules
+          final_rules = []
+          version = 2
+
+          for url in urls:
+              print(f"正在处理: {url}")
+              try:
+                  res = requests.get(url.strip())
+                  data = res.json()
+                  if 'version' in data:
+                      version = data['version']
+                  
+                  # 将当前文件的所有 rules 提取出来
+                  if 'rules' in data:
+                      final_rules.extend(data['rules'])
+              except Exception as e:
+                  print(f"解析 {url} 失败: {e}")
+
+          # --- 核心逻辑：合并具有相同字段结构的 rules 并去重 ---
+          # 比如：如果两个文件都有 'domain' 字段的 rule，我们将它们合并成一个大的 domain 列表
+          merged_data = {}
+          
+          for rule in final_rules:
+              # 将 rule 的所有键（排除掉值，只留键名）转为 tuple 作为标识符
+              # 这样具有相同字段组合（如只有 domain，或同时有 domain 和 ip_cidr）的 rule 会被归类
+              keys = tuple(sorted(rule.keys()))
+              if keys not in merged_data:
+                  merged_data[keys] = {k: set() for k in keys}
+              
+              for k, v in rule.items():
+                  if isinstance(v, list):
+                      merged_data[keys][k].update(v)
+                  else:
+                      # 如果是非列表字段（如 tag），保留最后一个遇到的值
+                      merged_data[keys][k] = v
+
+          # 重新格式化为列表并排序
+          processed_rules = []
+          for keys, content in merged_data.items():
+              new_rule = {}
+              for k in keys:
+                  val = content[k]
+                  if isinstance(val, set):
+                      # 排序并转回列表
+                      new_rule[k] = sorted(list(val))
+                  else:
+                      new_rule[k] = val
+              processed_rules.append(new_rule)
+
+          # 构建最终 JSON
+          output_json = {
+              "version": version,
+              "rules": processed_rules
+          }
+
+          output_dir = "123"
+          os.makedirs(output_dir, exist_ok=True)
+          with open(os.path.join(output_dir, "merged_domains.json"), "w", encoding="utf-8") as f:
+              json.dump(output_json, f, indent=2, ensure_ascii=False)
+
+      - name: Commit and Push
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add 123/merged_domains.json
+          git commit -m "Merge multiple fields and rules" || echo "No changes"
+          git push origin main
