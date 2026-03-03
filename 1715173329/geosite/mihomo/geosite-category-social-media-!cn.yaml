@@ -435,6 +435,7 @@ payload:
   - +.intagrm.com
   - +.internet.org
   - +.intgram.com
+  - +.joinmastodon.org
   - +.kingstagram.com
   - +.klik.me
   - +.l-0005.dc-msedge.net
@@ -451,6 +452,8 @@ payload:
   - +.mail.ru
   - +.maniakey.homes
   - +.markzuckerberg.com
+  - +.mastodon.online
+  - +.mastodon.social
   - +.mfmf.club
   - +.mi.kochudaho.me
   - +.mi.mashiro.site
@@ -496,6 +499,7 @@ payload:
   - +.online-instagram.com
   - +.onlineinstagram.com
   - +.opencreate.org
+  - +.pawoo.net
   - +.periscope.tv
   - +.pixel.facebook.com
   - +.pscp.tv
