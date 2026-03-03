@@ -3,7 +3,7 @@ payload:
     - adeventtracker.spotify.com
     - adstudio-assets.scdn.co
     - bloodhound.spotify.com
+    - disney.my.sentry.io
+    - +.ads.youtube.com
     - +.analytics.tiktok.com
     - +.ads-pixiv.net
-    - +.ads.youtube.com
-    - disney.my.sentry.io
