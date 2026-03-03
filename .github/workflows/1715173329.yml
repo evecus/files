@@ -3,7 +3,7 @@ name: 1715173329规则转换
 on:
   workflow_dispatch:
   schedule:
-    - cron: "25 1 * * *"
+    - cron: "25 2 * * *"
 
 permissions:
   contents: write
@@ -107,21 +107,14 @@ jobs:
           fi
           rm -rf temp_ip
 
-      - name: 3. 只上传 mrs / srs
+      - name: 3. 统一上传
         run: |
           git config user.name "GitHub Action"
           git config user.email "action@github.com"
-
-          # 删除 JSON 和 YAML 中间产物
-          find 1715173329 -type f \( -name "*.json" -o -name "*.yaml" \) -delete
-
-          # 添加编译后的文件
-          git add 1715173329/**/*.mrs || true
-          git add 1715173329/**/*.srs || true
-
+          git add 1715173329/
           if git diff --staged --quiet; then
             echo "没有检测到任何文件变动"
           else
-            git commit -m "Update: 仅同步 SRS 与 MRS"
+            git commit -m "Update: 全量同步 Geosite 与 CNIP"
             git push origin main
           fi
