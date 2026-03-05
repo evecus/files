@@ -82,29 +82,7 @@ jobs:
           fi
           rm -rf temp_ip
 
-      - name: 3. 上传 JSON/YAML 至 laws 分支
-        run: |
-          git config user.name "GitHub Action"
-          git config user.email "action@github.com"
-          
-          # 备份当前生成的所有文件
-          mkdir -p /tmp/generated_files
-          cp -r 1715173329/ /tmp/generated_files/
-
-          # 切换 laws
-          git fetch origin laws || true
-          git checkout laws || git checkout -b laws
-
-          # 同步备份并删除二进制文件
-          rm -rf 1715173329/
-          cp -r /tmp/generated_files/1715173329/ .
-          find 1715173329 -type f \( -name "*.srs" -o -name "*.mrs" \) -delete
-
-          git add 1715173329/
-          if ! git diff --staged --quiet; then
-            git commit -m "Update: 同步 JSON 与 YAML (laws)"
-            git push origin laws
-          fi
+      
 
       - name: 4. 上传 SRS/MRS 至 master 分支
         run: |
