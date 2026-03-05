@@ -49,13 +49,18 @@ jobs:
       - name: Commit and Push
         run: |
           cd dest
+
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
+
+          # 关键：先同步远程
+          git pull --rebase origin main || true
+
           git add .
-          # 检查是否有文件变化
+
           if [ -n "$(git status --porcelain)" ]; then
             git commit -m "Auto-update GeoData: $(date +'%Y-%m-%d %H:%M:%S')"
-            git push
+            git push origin main
           else
             echo "No changes detected, skipping push."
           fi
