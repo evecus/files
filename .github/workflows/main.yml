@@ -1,4 +1,4 @@
-name: Build Pure China Domains TXT
+name: Build Refined China List (30k-40k Version)
 on:
   workflow_dispatch:
   schedule:
@@ -11,45 +11,62 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Set variables
-        run: |
-          echo "RELEASE_NAME=China_List_$(date +%Y%m%d%H%M)" >> $GITHUB_ENV
-          echo "TAG_NAME=$(date +%Y%m%d)" >> $GITHUB_ENV
-          # 核心源：只使用 dnsmasq-china-list 的三个基础库
-          echo "CHINA_DOMAINS_URL=https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/accelerated-domains.china.conf" >> $GITHUB_ENV
-          echo "GOOGLE_DOMAINS_URL=https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/google.china.conf" >> $GITHUB_ENV
-          echo "APPLE_DOMAINS_URL=https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/apple.china.conf" >> $GITHUB_ENV
-
-      - name: Checkout
+      - name: Checkout codebase
         uses: actions/checkout@v4
 
-      - name: Generate China List
+      - name: Process China Domains
         run: |
-          # 1. 下载并提取域名（去掉 dnsmasq 的 server=/.../ 格式，只保留域名）
-          curl -sSL $CHINA_DOMAINS_URL | perl -ne '/^server=\/([^\/]+)\// && print "$1\n"' > raw-cn.txt
-          curl -sSL $GOOGLE_DOMAINS_URL | perl -ne '/^server=\/([^\/]+)\// && print "$1\n"' > raw-google.txt
-          curl -sSL $APPLE_DOMAINS_URL | perl -ne '/^server=\/([^\/]+)\// && print "$1\n"' > raw-apple.txt
-          
-          # 2. 合并、去重、排序
-          cat raw-cn.txt raw-google.txt raw-apple.txt | sort -u > china-list.txt
-          
-          # 3. 统计数量（可选，方便在日志里查看是否符合 3-5 万条）
-          echo "Total domains: $(wc -l < china-list.txt)"
+          # 1. 定义原始源 (11万条的源)
+          CHINA_URL="https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/accelerated-domains.china.conf"
+          GOOGLE_URL="https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/google.china.conf"
+          APPLE_URL="https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/apple.china.conf"
 
-      - name: Prepare Assets
+          # 2. 抓取并初步提取域名
+          echo "正在抓取原始数据..."
+          curl -sSL $CHINA_URL | perl -ne '/^server=\/([^\/]+)\// && print "$1\n"' > raw_all.txt
+          curl -sSL $GOOGLE_URL | perl -ne '/^server=\/([^\/]+)\// && print "$1\n"' >> raw_all.txt
+          curl -sSL $APPLE_URL | perl -ne '/^server=\/([^\/]+)\// && print "$1\n"' >> raw_all.txt
+
+          # 3. 使用 Python 进行“后缀去重” (这是降维打击的关键)
+          # 逻辑：将域名按长度排序，如果一个长域名是以“ .已存在的短域名”结尾，则剔除。
+          echo "正在进行域名去重压缩 (11万 -> 3万)..."
+          python3 -c "
+import sys
+# 读取所有域名并去重排序
+raw_domains = set(sys.stdin.read().splitlines())
+# 按长度从短到长排序
+sorted_domains = sorted(list(raw_domains), key=len)
+refined = []
+for d in sorted_domains:
+    # 检查当前域名是否是已知短域名的子域名
+    # 例如已有 baidu.com，那么 map.baidu.com 就会被跳过
+    is_subdomain = False
+    for r in refined:
+        if d.endswith('.' + r):
+            is_subdomain = True
+            break
+    if not is_subdomain:
+        refined.append(d)
+# 最终结果重新按字母排序输出
+print('\n'.join(sorted(refined)))
+" < raw_all.txt > china-list.txt
+
+          echo "压缩完成！"
+          echo "原始条数: $(wc -l < raw_all.txt)"
+          echo "压缩后条数: $(wc -l < china-list.txt)"
+
+      - name: Upload to Release Branch
         run: |
           mkdir -p ./publish/
           cp china-list.txt ./publish/
-          cd ./publish && sha256sum china-list.txt > china-list.txt.sha256sum
-
-      - name: Release and Push
-        run: |
-          cd publish || exit 1
+          cd ./publish
+          sha256sum china-list.txt > china-list.txt.sha256sum
+          
           git init
           git config --local user.name "github-actions[bot]"
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b release
           git add .
-          git commit -m "${{ env.RELEASE_NAME }}"
+          git commit -m "Update Refined China List $(date +%Y-%m-%d)"
           git remote add origin "https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
-          git push -f -u origin release
+          git push -f origin release
