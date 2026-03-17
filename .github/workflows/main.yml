@@ -1,4 +1,4 @@
-name: Build Refined China List (30k-40k Version)
+name: Build Refined China List
 on:
   workflow_dispatch:
   schedule:
@@ -16,44 +16,44 @@ jobs:
 
       - name: Process China Domains
         run: |
-          # 1. 定义原始源 (11万条的源)
+          # 1. 抓取原始数据
           CHINA_URL="https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/accelerated-domains.china.conf"
           GOOGLE_URL="https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/google.china.conf"
           APPLE_URL="https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/apple.china.conf"
 
-          # 2. 抓取并初步提取域名
-          echo "正在抓取原始数据..."
+          echo "正在下载原始数据..."
           curl -sSL $CHINA_URL | perl -ne '/^server=\/([^\/]+)\// && print "$1\n"' > raw_all.txt
           curl -sSL $GOOGLE_URL | perl -ne '/^server=\/([^\/]+)\// && print "$1\n"' >> raw_all.txt
           curl -sSL $APPLE_URL | perl -ne '/^server=\/([^\/]+)\// && print "$1\n"' >> raw_all.txt
 
-          # 3. 使用 Python 进行“后缀去重” (这是降维打击的关键)
-          # 逻辑：将域名按长度排序，如果一个长域名是以“ .已存在的短域名”结尾，则剔除。
-          echo "正在进行域名去重压缩 (11万 -> 3万)..."
-          python3 -c "
-import sys
-# 读取所有域名并去重排序
-raw_domains = set(sys.stdin.read().splitlines())
-# 按长度从短到长排序
-sorted_domains = sorted(list(raw_domains), key=len)
-refined = []
-for d in sorted_domains:
-    # 检查当前域名是否是已知短域名的子域名
-    # 例如已有 baidu.com，那么 map.baidu.com 就会被跳过
-    is_subdomain = False
-    for r in refined:
-        if d.endswith('.' + r):
-            is_subdomain = True
-            break
-    if not is_subdomain:
-        refined.append(d)
-# 最终结果重新按字母排序输出
-print('\n'.join(sorted(refined)))
-" < raw_all.txt > china-list.txt
+          # 2. 使用 EOF 方式运行 Python，彻底解决缩进和引号问题
+          echo "正在压缩域名列表..."
+          python3 << 'EOF' > china-list.txt
+          import sys
 
-          echo "压缩完成！"
-          echo "原始条数: $(wc -l < raw_all.txt)"
-          echo "压缩后条数: $(wc -l < china-list.txt)"
+          # 读取并去重
+          with open('raw_all.txt', 'r') as f:
+              raw_domains = set(line.strip() for line in f if line.strip())
+
+          # 按长度排序
+          sorted_domains = sorted(list(raw_domains), key=len)
+          refined = []
+
+          for d in sorted_domains:
+              is_subdomain = False
+              for r in refined:
+                  if d.endswith('.' + r):
+                      is_subdomain = True
+                      break
+              if not is_subdomain:
+                  refined.append(d)
+
+          # 排序并添加格式前缀
+          for domain in sorted(refined):
+              print(f"domain:{domain}")
+          EOF
+
+          echo "压缩完成！原始: $(wc -l < raw_all.txt) 条 -> 精简后: $(wc -l < china-list.txt) 条"
 
       - name: Upload to Release Branch
         run: |
@@ -67,6 +67,6 @@ print('\n'.join(sorted(refined)))
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b release
           git add .
-          git commit -m "Update Refined China List $(date +%Y-%m-%d)"
+          git commit -m "Update China List $(date +%Y-%m-%d)"
           git remote add origin "https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
           git push -f origin release
