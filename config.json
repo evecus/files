@@ -1,0 +1,14 @@
+{
+  "log": {
+    "disabled": true
+  },
+  },
+  "inbounds": [
+    {
+      "type": "vless", "tag": "vless-ws-in", "listen": "::", "listen_port": 22991,
+      "users": [{ "uuid": "95279521-cab8-4c5f-babf-dd2dc7e2801b" }],
+      "transport": { "type": "ws", "path": "/wiswji33wehwj" }
+    }
+   ],
+  "outbounds": [{ "type": "direct", "tag": "direct" }]
+}
