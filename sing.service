@@ -1,0 +1,12 @@
+[Unit]
+Description=Sing-box Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sing-box run -D /opt/sing
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
