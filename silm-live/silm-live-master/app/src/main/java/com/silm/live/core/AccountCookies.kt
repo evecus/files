@@ -8,11 +8,11 @@ package com.silm.live.core
  */
 object AccountCookies {
 
-    /** 抖音完整 Cookie（浏览器/WebView 登录后保存，含 sessionid 等登录态） */
+    /** 抖音完整 Cookie（手动粘贴，含 sessionid/sid_guard 等登录态） */
     @Volatile
     var douyin: String = ""
 
-    /** 快手完整 Cookie（WebView 登录后保存，含 kuaishou.live.web_st 等登录态） */
+    /** 快手完整 Cookie（手动粘贴，含 kuaishou.server.web_st 等登录态） */
     @Volatile
     var kuaishou: String = ""
 }

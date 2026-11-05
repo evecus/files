@@ -17,7 +17,7 @@ import androidx.navigation.compose.rememberNavController
 import android.net.Uri
 import com.silm.live.core.SiteManager
 import com.silm.live.data.SettingsStore
-import com.silm.live.ui.account.AccountLoginScreen
+import com.silm.live.ui.account.AccountScreen
 import com.silm.live.ui.follow.FollowScreen
 import com.silm.live.ui.player.PlayerScreen
 import com.silm.live.ui.search.SearchScreen
@@ -86,15 +86,15 @@ fun SilmApp(initialLink: String? = null) {
                         layout = layout,
                         onBack = { navController.popBackStack() },
                         onOpenSync = { navController.navigate("sync") },
-                        onOpenAccount = { platform -> navController.navigate("account/$platform") },
+                        onOpenAccount = { navController.navigate("account") },
                         onOpenRoom = { platform, roomId ->
                             navController.navigate("player/$platform/$roomId")
                         },
                     )
                 }
-                composable("account/{platform}") { entry ->
-                    AccountLoginScreen(
-                        platform = entry.arguments?.getString("platform") ?: "",
+                composable("account") {
+                    AccountScreen(
+                        layout = layout,
                         onBack = { navController.popBackStack() },
                     )
                 }

@@ -72,7 +72,7 @@ fun SettingsScreen(
     layout: AppLayout,
     onBack: () -> Unit,
     onOpenSync: () -> Unit,
-    onOpenAccount: (platform: String) -> Unit = {},
+    onOpenAccount: () -> Unit = {},
     onOpenRoom: (platform: String, roomId: String) -> Unit,
     followViewModel: FollowViewModel = viewModel(factory = FollowViewModel.Factory(LocalContext.current)),
 ) {
@@ -417,57 +417,43 @@ fun SettingsScreen(
                 }
             }
 
-            // ---------- 账号登录（抖音/快手搜索需要登录态） ----------
+            // ---------- 账号管理（抖音/快手 Cookie 粘贴配置） ----------
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp, vertical = 8.dp)
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    Text("账号登录", style = titleStyle)
+                    Text("账号管理", style = titleStyle)
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "抖音搜索需要登录态；快手登录后可降低搜索风控概率。点击进入内嵌网页登录，登录完成后点「保存登录态」。",
+                        "抖音搜索需要登录态，快手配置 Cookie 可降低搜索风控概率。粘贴完整 Cookie 或从文件导入。",
                         style = bodyStyle,
                         color = MaterialTheme.colorScheme.outline
                     )
                     Spacer(Modifier.height(8.dp))
                     listOf(
-                        "douyin" to ("抖音" to douyinCookie),
-                        "kuaishou" to ("快手" to kuaishouCookie),
+                        "douyin" to ("抖音直播" to douyinCookie),
+                        "kuaishou" to ("快手直播" to kuaishouCookie),
                     ).forEach { (platform, pair) ->
                         val (label, cookie) = pair
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .focusClickable(isTv, 12.dp) { onOpenAccount(platform) }
+                                .focusClickable(isTv, 12.dp) { onOpenAccount() }
                                 .padding(vertical = 6.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(label, style = chipStyle)
                                 Text(
-                                    if (cookie.isBlank()) "未登录" else "已登录（点按可重新登录）",
+                                    if (cookie.isBlank()) "未配置" else "已自定义（${cookie.length} 字符）",
                                     style = bodyStyle,
                                     color = MaterialTheme.colorScheme.outline
                                 )
                             }
-                            TextButton(onClick = { onOpenAccount(platform) }) {
-                                Text(if (cookie.isBlank()) "登录" else "重新登录", style = buttonStyle)
-                            }
-                            if (cookie.isNotBlank()) {
-                                TextButton(onClick = {
-                                    scope.launch {
-                                        if (platform == "douyin") {
-                                            SettingsStore.setDouyinCookie(context, "")
-                                        } else {
-                                            SettingsStore.setKuaishouCookie(context, "")
-                                        }
-                                        snackbar.showSnackbar("$label 登录态已清除")
-                                    }
-                                }) {
-                                    Text("清除", style = buttonStyle)
-                                }
+                            TextButton(onClick = { onOpenAccount() }) {
+                                Text("配置", style = buttonStyle)
                             }
                         }
                     }
