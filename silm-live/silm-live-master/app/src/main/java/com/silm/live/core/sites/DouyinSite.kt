@@ -307,7 +307,8 @@ class DouyinSite : LiveSite {
         try {
             return getRoomDetailByWebRidApi(webRid)
         } catch (e: Exception) {
-            if (e is CoreError && e.statusCode == 444) throw e
+            // 对齐 Flutter：API 失败（含 444 风控）一律回退 HTML 路径再试
+            android.util.Log.e("silm", "抖音 enter 接口失败，回退 HTML：${e.message}")
         }
         return getRoomDetailByWebRidHtml(webRid)
     }

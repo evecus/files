@@ -17,6 +17,9 @@ object Http {
         .writeTimeout(20, TimeUnit.SECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
+        // 强制 HTTP/1.1：与 Flutter dart:io / DouyinLiveRecorder(python-requests) 指纹一致，
+        // 抖音 WAF 对 h2 指纹更敏感（真机观察 enter 接口 444）
+        .protocols(listOf(okhttp3.Protocol.HTTP_1_1))
         .build()
 
     class HttpException(val code: Int, message: String) : Exception(message)
