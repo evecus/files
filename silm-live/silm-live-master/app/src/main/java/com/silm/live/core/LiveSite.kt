@@ -66,7 +66,8 @@ object SiteManager {
      *  - *.amemv.com/webcast/room/reflow?room_id={roomId} 或 /reflow/{roomId}
      *  - live.kuaishou.com/u/{快手号}、(v.)m.chenzhongtech.com/fw/live/{快手号}
      *    （含 v.kuaishou.com 短链跳转）
-     *  - www.xiaohongshu.com/livestream/{roomId}（含 xhslink.com 短链跳转）
+     *  - www.xiaohongshu.com/livestream/{roomId}（含 xhslink.com 短链跳转，落点可能
+     *    为 /livestream/{dynpath…}/{roomId} 两段形式）
      */
     suspend fun parseUrl(text: String): Pair<LiveSite, String>? {
         var url = Regex("https?://[\\w./?%&=#:\\-]+").find(text)?.value
@@ -137,9 +138,12 @@ object SiteManager {
                 ?: segments.getOrNull(reflowIndex + 1)?.takeIf { reflowIndex >= 0 }
             return room("douyin", roomId, true, NUMERIC_ROOM_ID)
         }
-        // 小红书
+        // 小红书：/livestream/{roomId}；App 分享短链展开后为 /livestream/{dynpath…}/{roomId}
         if (host == "xiaohongshu.com" || host.endsWith(".xiaohongshu.com")) {
-            return room("xiaohongshu", segments.getOrNull(1), segments.size == 2 && segments[0] == "livestream", NUMERIC_ROOM_ID)
+            if (segments.firstOrNull() == "livestream") {
+                return room("xiaohongshu", segments.lastOrNull(), segments.size in 2..3, NUMERIC_ROOM_ID)
+            }
+            return null
         }
         return null
     }
