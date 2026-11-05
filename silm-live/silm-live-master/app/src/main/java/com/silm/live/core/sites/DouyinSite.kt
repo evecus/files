@@ -19,6 +19,7 @@ import com.silm.live.danmaku.DouyinDanmaku
 import com.silm.live.danmaku.DouyinDanmakuArgs
 import org.json.JSONObject
 import kotlin.random.Random
+import kotlinx.coroutines.withTimeout
 
 /**
  * 抖音直播，接口逻辑移植自 dart_simple_live。
@@ -39,7 +40,13 @@ class DouyinSite : LiveSite {
 
         @Volatile
         var appContext: Context? = null
+
+        /** 直播间页面 Cookie 缓存 TTL（对齐 Flutter _webCookieCacheTtl = 5 分钟） */
+        private const val WEB_COOKIE_TTL_MS = 5 * 60 * 1000L
     }
+
+    /** key = webRid|baseCookieHash，value = cookie 到缓存时间 */
+    private val webCookieCache = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
 
     private fun context(): Context = appContext ?: throw CoreError("App 未初始化")
 
@@ -47,7 +54,39 @@ class DouyinSite : LiveSite {
         cookie.split(";").firstOrNull { it.trim().startsWith("ttwid=") }
             ?.substringAfter('=')?.trim()?.takeIf { it.isNotEmpty() }
 
-    private fun playbackCookie(): String = extractTtwid(DEFAULT_COOKIE) ?: DEFAULT_COOKIE
+    /** 默认匿名 ttwid（对齐 Flutter _defaultPlaybackCookie） */
+    private fun defaultPlaybackCookie(): String = extractTtwid(DEFAULT_COOKIE) ?: DEFAULT_COOKIE
+
+    /** 用户自定义 Cookie 中的 ttwid，未配置返回空（对齐 Flutter _customPlaybackCookie） */
+    private fun customPlaybackCookie(): String =
+        AccountCookies.douyin.trim().let { extractTtwid(it) ?: "" }
+
+    /** 播放/弹幕/状态接口用：用户 ttwid 优先，否则默认（对齐 Flutter _playbackCookie） */
+    private fun playbackCookie(): String = customPlaybackCookie().ifEmpty { defaultPlaybackCookie() }
+
+    /** 搜索用：完整用户 Cookie 优先（对齐 Flutter _searchCookie） */
+    private fun searchCookie(): String = AccountCookies.douyin.trim().ifEmpty { defaultPlaybackCookie() }
+
+    private fun hasCustomCookie(): Boolean = AccountCookies.douyin.trim().isNotEmpty()
+
+    /**
+     * 对齐 Flutter _requestWithCustomCookieFallback：
+     * 配置了自定义 Cookie 时，请求失败或返回空数据 → 用匿名 ttwid 重试一次。
+     */
+    private suspend fun <T> requestWithCustomCookieFallback(
+        request: suspend (String) -> T,
+        hasData: (T) -> Boolean,
+    ): T {
+        val custom = customPlaybackCookie()
+        return try {
+            val result = request(playbackCookie())
+            if (custom.isEmpty() || hasData(result)) result
+            else request(defaultPlaybackCookie())
+        } catch (e: Exception) {
+            if (custom.isEmpty()) throw e
+            request(defaultPlaybackCookie())
+        }
+    }
 
     private fun requestHeaders(cookieValue: String? = playbackCookie()): Map<String, String> {
         val headers = mutableMapOf(
@@ -87,7 +126,7 @@ class DouyinSite : LiveSite {
             "&webid=7382872326016435738"
 
         // 搜索 Cookie：用户登录态优先（对齐 Flutter _searchCookie），否则退回默认 ttwid
-        var dyCookie = "${AccountCookies.douyin.ifBlank { playbackCookie() }};"
+        var dyCookie = "$searchCookie();"
         runCatching {
             val headers = Http.head("https://live.douyin.com", requestHeaders())
             headers.values("set-cookie").forEach { element ->
@@ -173,31 +212,46 @@ class DouyinSite : LiveSite {
 
     // ---------------- Cookie / 房间信息 ----------------
 
-    /** 访问直播间页面取 ttwid/__ac_nonce/msToken，用于弹幕连接 */
+    /** 访问直播间页面取 ttwid/__ac_nonce/msToken，用于弹幕连接（5 分钟缓存，对齐 Flutter _getWebCookie） */
     private suspend fun getWebCookie(webRid: String): String {
-        var dyCookie = ""
-        try {
-            val headResp = Http.head(
+        val baseCookie = playbackCookie()
+        val cacheKey = "$webRid|${baseCookie.hashCode()}"
+        val now = System.currentTimeMillis()
+        webCookieCache[cacheKey]?.let { (value, cachedAt) ->
+            if (now - cachedAt < WEB_COOKIE_TTL_MS) return value
+        }
+        val headResp = try {
+            Http.head(
                 "https://live.douyin.com/$webRid",
                 requestHeaders() + mapOf("referer" to "https://live.douyin.com/$webRid")
             )
-            headResp.values("set-cookie").forEach { element ->
-                val cookie = element.split(";")[0]
-                if (cookie.contains("ttwid") || cookie.contains("__ac_nonce") || cookie.contains("msToken")) {
-                    dyCookie += "$cookie;"
-                }
-            }
         } catch (e: Exception) {
+            // HEAD 失败：有 base Cookie（含用户 ttwid）时直接用它继续，否则向上抛
+            if (baseCookie.isNotEmpty()) {
+                val fallback = "$baseCookie;"
+                webCookieCache[cacheKey] = fallback to now
+                return fallback
+            }
+            throw e
         }
-        if (dyCookie.isEmpty()) dyCookie = DEFAULT_COOKIE
+        var dyCookie = if (baseCookie.isNotEmpty()) "$baseCookie;" else ""
+        headResp.values("set-cookie").forEach { element ->
+            val cookie = element.split(";")[0]
+            if (cookie.contains("ttwid") || cookie.contains("__ac_nonce") || cookie.contains("msToken")) {
+                dyCookie += "$cookie;"
+            }
+        }
+        webCookieCache[cacheKey] = dyCookie to now
         return dyCookie
     }
 
+    /** 弹幕连接 Cookie：base（用户 ttwid 优先）+ 页面新鲜 Cookie 合并（对齐 Flutter _getDanmakuCookie） */
     private suspend fun getDanmakuCookie(webRid: String): String {
         val base = playbackCookie()
         return try {
-            val webCookie = getWebCookie(webRid)
-            mergeCookies(base, webCookie)
+            val webCookie = withTimeout(5_000) { getWebCookie(webRid) }
+            // 用户有自定义 Cookie 时以 base 为准（新鲜页面值仅补缺），否则新鲜值优先
+            if (hasCustomCookie()) mergeCookies(webCookie, base) else mergeCookies(base, webCookie)
         } catch (e: Exception) {
             base
         }
@@ -225,12 +279,21 @@ class DouyinSite : LiveSite {
         }
     }
 
-    private suspend fun getRoomDetailByRoomId(roomId: String): LiveRoomDetail {
-        val result = Http.getJson(
-            "https://webcast.amemv.com/webcast/room/reflow/info/" +
-                "?type_id=0&live_id=1&room_id=$roomId&sec_user_id=&version_code=99.99.99&app_id=6383",
-            requestHeaders()
+    /** reflow 接口（带自定义 Cookie 失败回退，对齐 Flutter _getRoomDataByRoomId） */
+    private suspend fun getRoomDataByRoomId(roomId: String): JSONObject =
+        requestWithCustomCookieFallback(
+            request = { cookieValue ->
+                Http.getJson(
+                    "https://webcast.amemv.com/webcast/room/reflow/info/" +
+                        "?type_id=0&live_id=1&room_id=$roomId&sec_user_id=&version_code=99.99.99&app_id=6383",
+                    requestHeaders(cookieValue)
+                )
+            },
+            hasData = { r -> r.optJSONObject("data")?.optJSONObject("room") != null },
         )
+
+    private suspend fun getRoomDetailByRoomId(roomId: String): LiveRoomDetail {
+        val result = getRoomDataByRoomId(roomId)
         val room = result.optJSONObject("data")?.optJSONObject("room")
             ?: throw CoreError("抖音直播间数据为空，可能是房间不存在、未开播或被风控限制")
         val webRid = room.optJSONObject("owner")?.optString("web_rid", "") ?: ""
@@ -311,9 +374,26 @@ class DouyinSite : LiveSite {
         )
     }
 
-    /** webcast/room/web/enter 接口 */
+    /** webcast/room/web/enter 接口（带自定义 Cookie 失败回退，对齐 Flutter _getRoomDataByApi） */
     private suspend fun getRoomDataByApi(webRid: String): JSONObject {
-        val cookieValue = playbackCookie()
+        val result = requestWithCustomCookieFallback(
+            request = { cookieValue -> requestRoomDataByApi(webRid, cookieValue) },
+            hasData = ::hasWebRoomData,
+        )
+        val data = result.optJSONObject("data")
+            ?: throw CoreError("抖音直播间数据为空，请稍后再试")
+        val rooms = data.optJSONArray("data")
+        if (rooms == null || rooms.length() == 0) {
+            throw CoreError("抖音直播间数据为空，可能是房间不存在、未开播或被风控限制")
+        }
+        return data
+    }
+
+    /** Flutter _hasWebRoomData：data.data 列表非空才算有效 */
+    private fun hasWebRoomData(result: JSONObject): Boolean =
+        (result.optJSONObject("data")?.optJSONArray("data")?.length() ?: 0) > 0
+
+    private suspend fun requestRoomDataByApi(webRid: String, cookieValue: String): JSONObject {
         val requestHeader = requestHeaders(cookieValue) +
             mapOf("referer" to "https://live.douyin.com/$webRid")
         val uri = "https://live.douyin.com/webcast/room/web/enter/" +
@@ -321,14 +401,7 @@ class DouyinSite : LiveSite {
             "&browser_language=zh-CN&browser_platform=Win32&browser_name=Chrome" +
             "&browser_version=125.0.0.0&web_rid=$webRid&msToken="
         val requestUrl = JsSignEngine.douyinABogusUrl(context(), uri, DEFAULT_UA)
-        val result = Http.getJson(requestUrl, requestHeader)
-        val data = result.optJSONObject("data")
-            ?: throw CoreError("抖音直播间数据为空，请稍后再试")
-        val rooms = data.optJSONArray("data")
-        if (rooms == null || rooms.length() == 0) {
-            throw CoreError("抖音直播间数据为空，可能是房间不存在、未开播或被风控限制")
-        }
-        return result.optJSONObject("data") ?: data
+        return Http.getJson(requestUrl, requestHeader)
     }
 
     /** 直播间页面 state 数据 */
@@ -507,11 +580,7 @@ class DouyinSite : LiveSite {
      * web/enter 才能拿到真实开播状态 —— 此前直接判 ==2 导致抖音永远显示未开播。
      */
     private suspend fun getLiveStatusByRoomId(roomId: String): Boolean? {
-        val result = Http.getJson(
-            "https://webcast.amemv.com/webcast/room/reflow/info/" +
-                "?type_id=0&live_id=1&room_id=$roomId&sec_user_id=&version_code=99.99.99&app_id=6383",
-            requestHeaders()
-        )
+        val result = getRoomDataByRoomId(roomId)
         val room = result.optJSONObject("data")?.optJSONObject("room") ?: return null
         val status = listOf("status", "live_status", "room_status")
             .firstNotNullOfOrNull { key -> parseDouyinStatus(room.opt(key)) }
