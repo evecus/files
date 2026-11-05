@@ -28,13 +28,6 @@ object JsSignEngine {
     @Volatile
     private var webView: WebView? = null
 
-    @Volatile
-    private var cryptoLoaded = false
-    @Volatile
-    private var msSdkLoaded = false
-    @Volatile
-    private var abogusLoaded = false
-
     /**
      * 创建 WebView（必须在主线程），以 suspendCoroutine 等待完成，
      * **不使用任何阻塞等待**：避免在主线程调用时 Looper 被阻塞而死锁（曾导致 ANR）。
@@ -47,16 +40,27 @@ object JsSignEngine {
                 try {
                     val wv = WebView(context.applicationContext)
                     wv.settings.javaScriptEnabled = true
-                    wv.settings.domStorageEnabled = false
+                    wv.settings.domStorageEnabled = true
                     wv.settings.allowFileAccess = false
                     wv.settings.blockNetworkImage = true
                     wv.settings.loadsImagesAutomatically = false
+                    // 签名脚本会读取 document.cookie / localStorage；
+                    // data: URL 下这些 API 直接抛异常导致脚本初始化中断
+                    //（真机日志: "Cookies are disabled inside 'data:' URLs" → crawler 未注册 → 签名全灭）。
+                    // 用 https base URL 加载，让文档处于正常源下。
+                    android.webkit.CookieManager.getInstance().setAcceptCookie(true)
                     wv.webViewClient = object : WebViewClient() {
                         override fun onPageFinished(view: WebView?, url: String?) {
                             if (cont.isActive) cont.resume(wv)
                         }
                     }
-                    wv.loadData("<html><body></body></html>", "text/html", "utf-8")
+                    wv.loadDataWithBaseURL(
+                        "https://live.douyin.com/",
+                        "<html><body></body></html>",
+                        "text/html",
+                        "utf-8",
+                        null,
+                    )
                 } catch (e: Exception) {
                     if (cont.isActive) cont.resumeWithException(
                         IllegalStateException("WebView 初始化失败：${e.message}")
@@ -166,16 +170,28 @@ object JsSignEngine {
     private fun readAsset(context: Context, name: String): String =
         context.assets.open(name).bufferedReader().use { it.readText() }
 
+    /**
+     * 加载签名资产脚本并校验目标全局函数已注册。
+     * 脚本初始化若抛异常（如环境不支持），函数不会注册，而布尔缓存标志会让失败状态
+     * 永久驻留 —— 因此加载后用 typeof 校验，未注册则重载一次。
+     */
+    private suspend fun ensureScriptFunction(context: Context, asset: String, fnName: String) {
+        evalJsScript(readAsset(context, asset))
+        if (evalJs("typeof ${fnName}") == "function") return
+        android.util.Log.e(TAG, "$asset 首次装载后 $fnName 未注册，重载重试")
+        evalJsScript(readAsset(context, asset))
+        if (evalJs("typeof ${fnName}") != "function") {
+            android.util.Log.e(TAG, "$asset 装载失败：$fnName 不可用")
+        }
+    }
+
     private fun jsStr(s: String): String = org.json.JSONObject.quote(s)
 
     /** 斗鱼：执行房间加密脚本生成播放签名参数 */
     suspend fun douyuSign(context: Context, script: String, roomId: String, did: String): String =
         withContext(Dispatchers.IO) {
             ensureWebView(context)
-            if (!cryptoLoaded) {
-                evalJsScript(readAsset(context, "douyu_crypto.js"))
-                cryptoLoaded = true
-            }
+            ensureScriptFunction(context, "douyu_crypto.js", "ub98484234")
             val ts = System.currentTimeMillis() / 1000
             val js = "(function(){\n${script}\nreturn ub98484234(${jsStr(roomId)},${jsStr(did)},${jsStr(ts.toString())});\n})()"
             val r = evalJs(js)
@@ -214,16 +230,7 @@ object JsSignEngine {
     suspend fun douyinSignature(context: Context, msStub: String, userAgent: String): String =
         withContext(Dispatchers.IO) {
         ensureWebView(context)
-        if (!msSdkLoaded) {
-            evalJsScript(readAsset(context, "douyin_mssdk.js"))
-            msSdkLoaded = true
-        }
-        repeat(5) {
-            val sig = evalJs("getMSSDKSignature(${jsStr(msStub)},${jsStr(userAgent)})")
-            if (sig.isValidDouyinSig()) return@withContext sig
-        }
-        // 一次失败后可能脚本未正确装载：重载再试一轮
-        evalJsScript(readAsset(context, "douyin_mssdk.js"))
+        ensureScriptFunction(context, "douyin_mssdk.js", "getMSSDKSignature")
         repeat(5) {
             val sig = evalJs("getMSSDKSignature(${jsStr(msStub)},${jsStr(userAgent)})")
             if (sig.isValidDouyinSig()) return@withContext sig
@@ -245,10 +252,7 @@ object JsSignEngine {
         msToken: String? = null
     ): String = withContext(Dispatchers.IO) {
         ensureWebView(context)
-        if (!abogusLoaded) {
-            evalJsScript(readAsset(context, "douyin_abogus.js"))
-            abogusLoaded = true
-        }
+        ensureScriptFunction(context, "douyin_abogus.js", "getABogus")
         val uri = android.net.Uri.parse(url)
         val params = mutableMapOf<String, String>()
         uri.queryParameterNames.forEach { params[it] = uri.getQueryParameter(it) ?: "" }
