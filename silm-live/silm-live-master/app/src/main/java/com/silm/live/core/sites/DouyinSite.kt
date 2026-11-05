@@ -126,7 +126,7 @@ class DouyinSite : LiveSite {
             "&webid=7382872326016435738"
 
         // 搜索 Cookie：用户登录态优先（对齐 Flutter _searchCookie），否则退回默认 ttwid
-        var dyCookie = "$searchCookie();"
+        var dyCookie = "${searchCookie()};"
         runCatching {
             val headers = Http.head("https://live.douyin.com", requestHeaders())
             headers.values("set-cookie").forEach { element ->
