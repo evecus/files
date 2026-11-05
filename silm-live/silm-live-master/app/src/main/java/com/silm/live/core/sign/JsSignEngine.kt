@@ -1,207 +1,99 @@
 package com.silm.live.core.sign
 
-import android.annotation.SuppressLint
-import android.content.Context
-import android.os.Handler
-import android.os.Looper
-import android.webkit.WebView
-import android.webkit.WebViewClient
+import com.dokar.quickjs.QuickJs
 import com.silm.live.core.md5Hex
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import org.json.JSONTokener
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 /**
- * 基于 WebView 的 JS 签名执行引擎。
+ * 基于 QuickJS 的 JS 签名执行引擎（对齐 Flutter dart_quickjs 机制）。
+ *
  * 用于执行斗鱼 homeH5Enc 签名脚本与抖音 a_bogus / MSSDK 签名脚本（assets 内置）。
+ * 相比此前的 WebView 实现：
+ *  - 无浏览器环境依赖（abogus 为纯算法脚本、mssdk 自带 document/window 垫片），
+ *    不再有 data: URL / cookie 禁用导致的初始化失败；
+ *  - 实例常驻，脚本装载一次后重复调用，失败自动销毁重建。
  */
 object JsSignEngine {
 
     private const val TAG = "silm"
 
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private val mutex = Mutex()
 
     @Volatile
-    private var webView: WebView? = null
+    private var quickJs: QuickJs? = null
 
-    /**
-     * 创建 WebView（必须在主线程），以 suspendCoroutine 等待完成，
-     * **不使用任何阻塞等待**：避免在主线程调用时 Looper 被阻塞而死锁（曾导致 ANR）。
-     */
-    @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun createWebViewOnMain(context: Context): WebView =
-        suspendCancellableCoroutine { cont ->
-            mainHandler.post {
-                if (!cont.isActive) return@post
-                try {
-                    val wv = WebView(context.applicationContext)
-                    wv.settings.javaScriptEnabled = true
-                    wv.settings.domStorageEnabled = true
-                    wv.settings.allowFileAccess = false
-                    wv.settings.blockNetworkImage = true
-                    wv.settings.loadsImagesAutomatically = false
-                    // 签名脚本会读取 document.cookie / localStorage；
-                    // data: URL 下这些 API 直接抛异常导致脚本初始化中断
-                    //（真机日志: "Cookies are disabled inside 'data:' URLs" → crawler 未注册 → 签名全灭）。
-                    // 用 https base URL 加载，让文档处于正常源下。
-                    android.webkit.CookieManager.getInstance().setAcceptCookie(true)
-                    wv.webViewClient = object : WebViewClient() {
-                        override fun onPageFinished(view: WebView?, url: String?) {
-                            if (cont.isActive) cont.resume(wv)
-                        }
-                    }
-                    wv.loadDataWithBaseURL(
-                        "https://live.douyin.com/",
-                        "<html><body></body></html>",
-                        "text/html",
-                        "utf-8",
-                        null,
-                    )
-                } catch (e: Exception) {
-                    if (cont.isActive) cont.resumeWithException(
-                        IllegalStateException("WebView 初始化失败：${e.message}")
-                    )
-                }
-            }
-        }
-
-    /** 始终在 IO 线程获取 WebView，杜绝主线程等待 */
-    private suspend fun ensureWebView(context: Context): WebView {
-        webView?.let { return it }
-        return withContext(Dispatchers.IO) {
-            synchronized(this@JsSignEngine) {
-                webView?.let { return@withContext it }
-                val wv = runBlocking { createWebViewOnMain(context) }
-                webView = wv
-                wv
-            }
-        }
-    }
-
-    private suspend fun evalJs(js: String): String = suspendCancellableCoroutine { cont ->
-        val wv = webView
-        if (wv == null) {
-            cont.resumeWithException(IllegalStateException("WebView not initialized"))
-            return@suspendCancellableCoroutine
-        }
-        mainHandler.post {
+    /** 串行化访问引擎；JS 异常后销毁重建实例，避免坏状态驻留 */
+    private suspend fun <T> withEngine(block: suspend (QuickJs) -> T): T =
+        mutex.withLock {
+            val qjs = quickJs ?: QuickJs.create(Dispatchers.Default).also { quickJs = it }
             try {
-                // 包一层 try/catch：JS 异常透出到日志（此前异常被吞、结果恒为 "null"）。
-                // 用户 JS 作为表达式被 return，兼容纯表达式与 IIFE 两种形态
-                val wrapped = "(function(){try{return JSON.stringify({ok:1,r:String((function(){return (" +
-                    js + ")})())})}catch(e){return JSON.stringify({ok:0,err:String(e&&e.message||e)})}})()"
-                wv.evaluateJavascript(wrapped) { result ->
-                    cont.resume(parseEvalResult(result))
-                }
+                block(qjs)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                cont.resumeWithException(e)
+                runCatching { qjs.close() }
+                quickJs = null
+                android.util.Log.e(TAG, "QuickJS 执行失败（实例已重建）：${e.message}")
+                throw IllegalStateException("QuickJS 执行失败：${e.message}", e)
             }
         }
-    }
 
-    /**
-     * 解析 evaluateJavascript 的回调值。
-     *
-     * 包装脚本返回 JSON.stringify(...) 的字符串，evaluateJavascript 会把字符串结果再 JSON 编码一次，
-     * 所以第一次 nextValue() 只能还原出内层 JSON 文本，必须再解析一次才能取到 r。
-     * 此前直接把内层 JSON 文本当结果返回，导致斗鱼签名被判无效（"播放签名刷新失败"），
-     * 抖音 MSSDK 签名 / a_bogus 也被污染（弹幕连接失败）。
-     */
-    private fun parseEvalResult(raw: String?): String {
-        val value = raw ?: return ""
-        return try {
-            var v: Any? = JSONTokener(value).nextValue()
-            // 第一层：还原成内层 JSON 文本，再尝试解析为对象
-            if (v is String) {
-                val inner = v.trim()
-                if (inner.startsWith("{") && inner.endsWith("}")) {
-                    v = try { org.json.JSONObject(inner) } catch (_: Exception) { v }
-                }
-            }
-            when {
-                v == null || v == org.json.JSONObject.NULL -> ""
-                v is org.json.JSONObject -> {
-                    if (v.optInt("ok") == 1) v.optString("r")
-                    else {
-                        android.util.Log.e(TAG, "JS 执行异常: ${v.optString("err")}")
-                        ""
-                    }
-                }
-                v is String -> v
-                else -> value
-            }
+    /** 求值表达式并转为字符串（undefined/null → 空串），JS 异常透出为空结果 + 日志 */
+    private suspend fun evalExpr(qjs: QuickJs, code: String): String =
+        try {
+            qjs.evaluate<Any?>(code)?.toString() ?: ""
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            android.util.Log.e(TAG, "JS 结果解析失败: $value")
+            android.util.Log.e(TAG, "JS 执行异常: ${e.message}")
             ""
         }
+
+    /** 加载完整脚本（可含多条语句/函数声明） */
+    private suspend fun evalScript(qjs: QuickJs, js: String) {
+        qjs.evaluate<Any?>(js)
     }
 
-    /**
-     * 求值一段完整的 JS **脚本**（可含多条语句/函数声明），不包裹表达式。
-     * 用于加载资产脚本：此前把函数声明脚本包进 `return (...)` 表达式，
-     * 函数声明被括号转为函数表达式，永远不会注册到全局作用域，
-     * 导致后续调用报 "xxx is not defined"（抖音/斗鱼签名全灭的根因）。
-     */
-    private suspend fun evalJsScript(js: String): String = suspendCancellableCoroutine { cont ->
-        val wv = webView
-        if (wv == null) {
-            cont.resumeWithException(IllegalStateException("WebView not initialized"))
-            return@suspendCancellableCoroutine
-        }
-        mainHandler.post {
-            try {
-                wv.evaluateJavascript(js) { result ->
-                    val value = result ?: "null"
-                    if (value.length > 120) {
-                        android.util.Log.d(TAG, "脚本加载返回(截断): ${value.take(120)}")
-                    }
-                    cont.resume(value)
-                }
-            } catch (e: Exception) {
-                cont.resumeWithException(e)
-            }
-        }
-    }
-
-    private fun readAsset(context: Context, name: String): String =
+    private fun readAsset(context: android.content.Context, name: String): String =
         context.assets.open(name).bufferedReader().use { it.readText() }
 
     /**
-     * 加载签名资产脚本并校验目标全局函数已注册。
-     * 脚本初始化若抛异常（如环境不支持），函数不会注册，而布尔缓存标志会让失败状态
-     * 永久驻留 —— 因此加载后用 typeof 校验，未注册则重载一次。
+     * 加载签名资产脚本并校验目标全局函数已注册；未注册则重载一次。
      */
-    private suspend fun ensureScriptFunction(context: Context, asset: String, fnName: String) {
-        evalJsScript(readAsset(context, asset))
-        if (evalJs("typeof ${fnName}") == "function") return
-        android.util.Log.e(TAG, "$asset 首次装载后 $fnName 未注册，重载重试")
-        evalJsScript(readAsset(context, asset))
-        if (evalJs("typeof ${fnName}") != "function") {
-            android.util.Log.e(TAG, "$asset 装载失败：$fnName 不可用")
+    private suspend fun ensureScriptFunction(qjs: QuickJs, context: android.content.Context, asset: String, fnName: String) {
+        if (evalExpr(qjs, "typeof $fnName") == "function") return
+        evalScript(qjs, readAsset(context, asset))
+        if (evalExpr(qjs, "typeof $fnName") != "function") {
+            android.util.Log.e(TAG, "$asset 首次装载后 $fnName 未注册，重载重试")
+            evalScript(qjs, readAsset(context, asset))
+            if (evalExpr(qjs, "typeof $fnName") != "function") {
+                android.util.Log.e(TAG, "$asset 装载失败：$fnName 不可用")
+            }
         }
     }
 
     private fun jsStr(s: String): String = org.json.JSONObject.quote(s)
 
     /** 斗鱼：执行房间加密脚本生成播放签名参数 */
-    suspend fun douyuSign(context: Context, script: String, roomId: String, did: String): String =
+    suspend fun douyuSign(context: android.content.Context, script: String, roomId: String, did: String): String =
         withContext(Dispatchers.IO) {
-            ensureWebView(context)
-            ensureScriptFunction(context, "douyu_crypto.js", "ub98484234")
-            val ts = System.currentTimeMillis() / 1000
-            val js = "(function(){\n${script}\nreturn ub98484234(${jsStr(roomId)},${jsStr(did)},${jsStr(ts.toString())});\n})()"
-            val r = evalJs(js)
-            // 有效性：签名参数是 form 串（v=..&did=..&tt=..&sign=..），函数源码/JSON 等垃圾内容一律拒绝
-            val valid = r.contains("=") && !r.contains("function") && !r.contains("{")
-            if (!valid) {
-                android.util.Log.e(TAG, "斗鱼签名结果异常: ${r.take(120)}")
-                return@withContext ""
+            withEngine { qjs ->
+                ensureScriptFunction(qjs, context, "douyu_crypto.js", "ub98484234")
+                val ts = System.currentTimeMillis() / 1000
+                val js = "(function(){\n${script}\nreturn ub98484234(${jsStr(roomId)},${jsStr(did)},${jsStr(ts.toString())});\n})()"
+                val r = evalExpr(qjs, js)
+                // 有效性：签名参数是 form 串（v=..&did=..&tt=..&sign=..），函数源码/JSON 等垃圾内容一律拒绝
+                val valid = r.contains("=") && !r.contains("function") && !r.contains("{")
+                if (!valid) {
+                    android.util.Log.e(TAG, "斗鱼签名结果异常: ${r.take(120)}")
+                    return@withEngine ""
+                }
+                r
             }
-            r
         }
 
     private fun defaultDouyinSignParams(roomId: String, uniqueId: String): String {
@@ -226,17 +118,18 @@ object JsSignEngine {
     fun douyinMsStub(roomId: String, uniqueId: String): String =
         md5Hex(defaultDouyinSignParams(roomId, uniqueId))
 
-    /** 抖音：webcast 弹幕 signature */
-    suspend fun douyinSignature(context: Context, msStub: String, userAgent: String): String =
+    /** 抖音：webcast 弹幕 signature（与 Flutter getSignature 一致） */
+    suspend fun douyinSignature(context: android.content.Context, msStub: String, userAgent: String): String =
         withContext(Dispatchers.IO) {
-        ensureWebView(context)
-        ensureScriptFunction(context, "douyin_mssdk.js", "getMSSDKSignature")
-        repeat(5) {
-            val sig = evalJs("getMSSDKSignature(${jsStr(msStub)},${jsStr(userAgent)})")
-            if (sig.isValidDouyinSig()) return@withContext sig
-        }
-        android.util.Log.e(TAG, "抖音签名生成失败（WebView），降级返回 stub")
-        msStub
+            withEngine { qjs ->
+                ensureScriptFunction(qjs, context, "douyin_mssdk.js", "getMSSDKSignature")
+                repeat(5) {
+                    val sig = evalExpr(qjs, "getMSSDKSignature(${jsStr(msStub)},${jsStr(userAgent)})")
+                    if (sig.isValidDouyinSig()) return@withEngine sig
+                }
+                android.util.Log.e(TAG, "抖音签名生成失败（QuickJS），降级返回 stub")
+                msStub
+            }
         }
 
     /** 与 Flutter 版一致：签名不得含 "-" 或 "="（含则重新生成），且必须是纯 base64 变体字符 */
@@ -246,38 +139,39 @@ object JsSignEngine {
 
     /** 抖音：a_bogus 签名，返回最终带签名的 URL */
     suspend fun douyinABogusUrl(
-        context: Context,
+        context: android.content.Context,
         url: String,
         userAgent: String,
         msToken: String? = null
     ): String = withContext(Dispatchers.IO) {
-        ensureWebView(context)
-        ensureScriptFunction(context, "douyin_abogus.js", "getABogus")
-        val uri = android.net.Uri.parse(url)
-        val params = mutableMapOf<String, String>()
-        uri.queryParameterNames.forEach { params[it] = uri.getQueryParameter(it) ?: "" }
-        val effectiveMsToken = msToken?.trim().takeUnless { it.isNullOrEmpty() }
-            ?: generateMsToken(107)
-        params["msToken"] = effectiveMsToken
-        params.remove("a_bogus")
-        val qb = StringBuilder()
-        params.entries.forEachIndexed { i, e ->
-            if (i > 0) qb.append("&")
-            qb.append(java.net.URLEncoder.encode(e.key, "UTF-8")).append("=")
-                .append(java.net.URLEncoder.encode(e.value, "UTF-8").replace("+", "%20"))
+        withEngine { qjs ->
+            ensureScriptFunction(qjs, context, "douyin_abogus.js", "getABogus")
+            val uri = android.net.Uri.parse(url)
+            val params = mutableMapOf<String, String>()
+            uri.queryParameterNames.forEach { params[it] = uri.getQueryParameter(it) ?: "" }
+            val effectiveMsToken = msToken?.trim().takeUnless { it.isNullOrEmpty() }
+                ?: generateMsToken(107)
+            params["msToken"] = effectiveMsToken
+            params.remove("a_bogus")
+            val qb = StringBuilder()
+            params.entries.forEachIndexed { i, e ->
+                if (i > 0) qb.append("&")
+                qb.append(java.net.URLEncoder.encode(e.key, "UTF-8")).append("=")
+                    .append(java.net.URLEncoder.encode(e.value, "UTF-8").replace("+", "%20"))
+            }
+            val unsignedUrl = buildString {
+                append("https://").append(uri.host ?: "live.douyin.com")
+                if (uri.port != -1) append(":").append(uri.port)
+                append(uri.path ?: "")
+                if (qb.isNotEmpty()) append("?").append(qb)
+            }
+            val query = unsignedUrl.substringAfter("?", "")
+            val aBogus = evalExpr(qjs, "getABogus(${jsStr(query)},${jsStr(userAgent)})")
+            if (aBogus.isEmpty()) android.util.Log.e(TAG, "抖音 a_bogus 生成失败（空结果）")
+            val sep = if (query.isEmpty()) "?" else "&"
+            unsignedUrl + sep + "a_bogus=" +
+                java.net.URLEncoder.encode(aBogus, "UTF-8").replace("+", "%20")
         }
-        val unsignedUrl = buildString {
-            append("https://").append(uri.host ?: "live.douyin.com")
-            if (uri.port != -1) append(":").append(uri.port)
-            append(uri.path ?: "")
-            if (qb.isNotEmpty()) append("?").append(qb)
-        }
-        val query = unsignedUrl.substringAfter("?", "")
-        val aBogus = evalJs("getABogus(${jsStr(query)},${jsStr(userAgent)})")
-        if (aBogus.isEmpty()) android.util.Log.e(TAG, "抖音 a_bogus 生成失败（空结果）")
-        val sep = if (query.isEmpty()) "?" else "&"
-        unsignedUrl + sep + "a_bogus=" +
-            java.net.URLEncoder.encode(aBogus, "UTF-8").replace("+", "%20")
     }
 
     fun generateMsToken(length: Int): String {
