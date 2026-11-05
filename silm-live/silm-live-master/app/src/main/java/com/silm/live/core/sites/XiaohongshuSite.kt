@@ -7,6 +7,8 @@ import com.silm.live.core.LivePlayUrl
 import com.silm.live.core.LiveRoomDetail
 import com.silm.live.core.LiveSite
 import com.silm.live.core.PlatformIdentity
+import com.silm.live.core.SearchAnchorResult
+import com.silm.live.core.SearchRoomResult
 import com.silm.live.danmaku.DanmakuClient
 import org.json.JSONObject
 import java.net.URLDecoder
@@ -29,6 +31,18 @@ class XiaohongshuSite : LiveSite {
 
     override val id = "xiaohongshu"
     override val name = "小红书直播"
+
+    /**
+     * 小红书暂不支持搜索：网页/客户端搜索接口都需要 x-s / x-s-common 签名
+     * （混淆 JS 生成，需移植整套签名算法），短期无法低成本实现。
+     * 抛错而不是返回空，避免搜索页显示"无结果"造成误解。
+     */
+    override suspend fun searchRooms(keyword: String, page: Int): SearchRoomResult =
+        throw CoreError("小红书暂不支持搜索，可通过分享链接添加直播间")
+
+    override suspend fun searchAnchors(keyword: String, page: Int): SearchAnchorResult =
+        throw CoreError("小红书暂不支持搜索，可通过分享链接添加直播间")
+
 
     /** 播放请求头：官方 Referer + 与取流一致的移动端 UA */
     private val playHeaders = mapOf(

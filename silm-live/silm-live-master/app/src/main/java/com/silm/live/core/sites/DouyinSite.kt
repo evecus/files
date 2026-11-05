@@ -1,6 +1,7 @@
 package com.silm.live.core.sites
 
 import android.content.Context
+import com.silm.live.core.AccountCookies
 import com.silm.live.core.CoreError
 import com.silm.live.core.Http
 import com.silm.live.core.LivePlayQuality
@@ -85,8 +86,8 @@ class DouyinSite : LiveSite {
             "&downlink=10&effective_type=4g&round_trip_time=100" +
             "&webid=7382872326016435738"
 
-        // 预取 ttwid/__ac_nonce，拼在默认 ttwid 之后
-        var dyCookie = "${playbackCookie()};"
+        // 搜索 Cookie：用户登录态优先（对齐 Flutter _searchCookie），否则退回默认 ttwid
+        var dyCookie = "${AccountCookies.douyin.ifBlank { playbackCookie() }};"
         runCatching {
             val headers = Http.head("https://live.douyin.com", requestHeaders())
             headers.values("set-cookie").forEach { element ->
@@ -121,7 +122,7 @@ class DouyinSite : LiveSite {
             throw CoreError("抖音直播搜索返回异常数据，请稍后再试")
         }
         if (result.optInt("status_code", 0) == 2483) {
-            throw CoreError("抖音搜索需要登录，请在远程同步设置中配置完整抖音 Cookie")
+            throw CoreError("抖音搜索需要登录：请在 设置 → 账号登录 中登录抖音后重试")
         }
 
         val items = mutableListOf<SearchRoomItem>()

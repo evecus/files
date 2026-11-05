@@ -2,6 +2,7 @@ package com.silm.live.data
 
 import android.content.Context
 import androidx.datastore.preferences.core.edit
+import com.silm.live.core.AccountCookies
 import com.silm.live.core.LiveSite
 import com.silm.live.core.SiteManager
 import androidx.datastore.preferences.core.stringPreferencesKey
@@ -160,6 +161,8 @@ object SettingsStore {
     private val KEY_DANMAKU_TEXT_SP = stringPreferencesKey("danmaku_text_sp")
     private val KEY_DANMAKU_AREA = stringPreferencesKey("danmaku_area_percent")
     private val KEY_PLATFORM_ORDER = stringPreferencesKey("platform_order")
+    private val KEY_COOKIE_DOUYIN = stringPreferencesKey("cookie_douyin")
+    private val KEY_COOKIE_KUAISHOU = stringPreferencesKey("cookie_kuaishou")
 
     /** 默认平台顺序（SiteManager 注册顺序） */
     fun defaultPlatformOrder(): List<String> = SiteManager.sites.map { it.id }
@@ -197,6 +200,35 @@ object SettingsStore {
     /** 按给定顺序排列的平台列表 */
     fun sitesInOrder(order: List<String>): List<LiveSite> =
         normalizePlatformOrder(order).mapNotNull { SiteManager.byId(it) }
+
+    // ---------------- 账号登录 Cookie（抖音/快手搜索需要登录态） ----------------
+
+    /** 应用启动时把持久化的 Cookie 灌入内存缓存，供 core 层站点同步读取 */
+    suspend fun primeAccountCookies(context: Context) {
+        val prefs = context.dataStore.data.first()
+        AccountCookies.douyin = prefs[KEY_COOKIE_DOUYIN] ?: ""
+        AccountCookies.kuaishou = prefs[KEY_COOKIE_KUAISHOU] ?: ""
+    }
+
+    fun douyinCookie(context: Context): Flow<String> =
+        context.dataStore.data.map { it[KEY_COOKIE_DOUYIN] ?: "" }
+
+    fun kuaishouCookie(context: Context): Flow<String> =
+        context.dataStore.data.map { it[KEY_COOKIE_KUAISHOU] ?: "" }
+
+    suspend fun setDouyinCookie(context: Context, cookie: String) {
+        AccountCookies.douyin = cookie
+        context.dataStore.edit {
+            if (cookie.isBlank()) it.remove(KEY_COOKIE_DOUYIN) else it[KEY_COOKIE_DOUYIN] = cookie
+        }
+    }
+
+    suspend fun setKuaishouCookie(context: Context, cookie: String) {
+        AccountCookies.kuaishou = cookie
+        context.dataStore.edit {
+            if (cookie.isBlank()) it.remove(KEY_COOKIE_KUAISHOU) else it[KEY_COOKIE_KUAISHOU] = cookie
+        }
+    }
 
     fun danmakuEnabled(context: Context): Flow<Boolean> =
         context.dataStore.data.map { (it[KEY_DANMAKU] ?: "true") == "true" }

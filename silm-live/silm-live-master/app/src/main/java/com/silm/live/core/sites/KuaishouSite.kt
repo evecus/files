@@ -1,5 +1,6 @@
 package com.silm.live.core.sites
 
+import com.silm.live.core.AccountCookies
 import com.silm.live.core.CoreError
 import com.silm.live.core.Http
 import com.silm.live.core.LivePlayQuality
@@ -386,12 +387,44 @@ class KuaishouSite : LiveSite {
     )
 
     override suspend fun searchRooms(keyword: String, page: Int): SearchRoomResult {
+        warmUpSearchCookie(keyword)
         // 主路：search/liveStream；为空或失败时回退 overview（与 Flutter 一致）
         val primary = runCatching { searchLiveStreams(keyword, page) }.getOrNull()
         if (primary != null && (primary.items.isNotEmpty() || page > 1)) return primary
         if (page > 1) return SearchRoomResult(hasMore = false, items = emptyList())
         val fallback = runCatching { searchRoomsByOverview(keyword) }.getOrNull()
         return fallback ?: SearchRoomResult(hasMore = false, items = emptyList())
+    }
+
+    /**
+     * 搜索预热（对齐 Flutter `_getCookie` + 登录 Cookie 合并）：
+     *  - 用户登录 Cookie 优先合并（搜索接口对匿名请求做风控，返回 result=10「服务器繁忙」）
+     *  - 进程内尚无 Cookie 时先访问搜索页，收集 Set-Cookie（did 等）再发起搜索
+     */
+    private suspend fun warmUpSearchCookie(keyword: String) {
+        if (AccountCookies.kuaishou.isNotBlank()) {
+            mergeCookieHeader(AccountCookies.kuaishou)
+        }
+        if (cookieHeader.isBlank()) {
+            runCatching {
+                val kw = java.net.URLEncoder.encode(keyword, "UTF-8")
+                val resp = Http.getTextWithHeaders(
+                    "https://live.kuaishou.com/search?keyword=$kw",
+                    headersWithCookie()
+                )
+                saveCookie(resp.headers.values("Set-Cookie"))
+            }
+        }
+    }
+
+    /** 把 "k=v; k2=v2" 形式的 Cookie 合并进 cookieHeader（同名时用户 Cookie 覆盖） */
+    private fun mergeCookieHeader(raw: String) {
+        val pairs = raw.split(";").mapNotNull { part ->
+            val kv = part.trim().split("=", limit = 2)
+            if (kv.size == 2 && kv[0].isNotBlank() && kv[1].isNotBlank()) kv[0].trim() to kv[1].trim() else null
+        }
+        if (pairs.isEmpty()) return
+        saveCookie(pairs.map { (k, v) -> "$k=$v; Path=/" })
     }
 
     private suspend fun searchLiveStreams(keyword: String, page: Int): SearchRoomResult {
@@ -427,6 +460,7 @@ class KuaishouSite : LiveSite {
     }
 
     override suspend fun searchAnchors(keyword: String, page: Int): SearchAnchorResult {
+        warmUpSearchCookie(keyword)
         val primary = runCatching { searchAuthors(keyword, page) }.getOrNull()
         if (primary != null && (primary.items.isNotEmpty() || page > 1)) return primary
         if (page > 1) return SearchAnchorResult(hasMore = false, items = emptyList())

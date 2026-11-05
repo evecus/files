@@ -17,6 +17,7 @@ import androidx.navigation.compose.rememberNavController
 import android.net.Uri
 import com.silm.live.core.SiteManager
 import com.silm.live.data.SettingsStore
+import com.silm.live.ui.account.AccountLoginScreen
 import com.silm.live.ui.follow.FollowScreen
 import com.silm.live.ui.player.PlayerScreen
 import com.silm.live.ui.search.SearchScreen
@@ -38,6 +39,11 @@ fun SilmApp(initialLink: String? = null) {
     // TV 端强制深色，遥控器场景观感更佳
     SilmTheme(forceDark = layout == AppLayout.TV) {
         val navController = rememberNavController()
+
+        // 启动时把持久化的账号 Cookie 灌入内存缓存
+        LaunchedEffect(Unit) {
+            SettingsStore.primeAccountCookies(context)
+        }
 
         // 处理外部分享链接
         LaunchedEffect(initialLink) {
@@ -80,9 +86,16 @@ fun SilmApp(initialLink: String? = null) {
                         layout = layout,
                         onBack = { navController.popBackStack() },
                         onOpenSync = { navController.navigate("sync") },
+                        onOpenAccount = { platform -> navController.navigate("account/$platform") },
                         onOpenRoom = { platform, roomId ->
                             navController.navigate("player/$platform/$roomId")
                         },
+                    )
+                }
+                composable("account/{platform}") { entry ->
+                    AccountLoginScreen(
+                        platform = entry.arguments?.getString("platform") ?: "",
+                        onBack = { navController.popBackStack() },
                     )
                 }
                 composable("sync") {
