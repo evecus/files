@@ -23,7 +23,7 @@ import kotlinx.coroutines.withTimeout
 
 /**
  * 抖音直播，接口逻辑移植自 dart_simple_live。
- * 依赖 WebView JS 引擎生成 a_bogus 签名。
+ * 依赖 QuickJS 引擎（JsSignEngine）生成 a_bogus 签名。
  */
 class DouyinSite : LiveSite {
     override val id = "douyin"

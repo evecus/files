@@ -21,7 +21,7 @@ import java.security.SecureRandom
 
 /**
  * 斗鱼直播，接口逻辑移植自 dart_simple_live。
- * 播放签名依赖 WebView 执行服务端下发的加密脚本。
+ * 播放签名依赖 QuickJS 引擎（JsSignEngine）执行服务端下发的加密脚本。
  */
 class DouyuSite : LiveSite {
     override val id = "douyu"
