@@ -1,0 +1,213 @@
+package com.github.mytv.dv.model;
+
+import defpackage.ax4;
+import defpackage.dh2;
+import defpackage.er0;
+import defpackage.j42;
+import defpackage.me0;
+import defpackage.sp;
+import defpackage.uc2;
+import defpackage.ut0;
+import defpackage.wd3;
+import defpackage.yj4;
+import java.util.List;
+import kotlinx.serialization.KSerializer;
+import kotlinx.serialization.descriptors.SerialDescriptor;
+
+/* compiled from: r8-map-id-c2f6a97aa2e8a24cc4494d4253d5e904442917ade8115d3074f7f7c1f1495db8 */
+/* loaded from: classes2.dex */
+public final class SearchUserResponse {
+    private final int cursor;
+    private final int hasMore;
+    private final LogPb logPb;
+    private final int statusCode;
+    private final List<SearchUserItem> userList;
+    public static final Companion Companion = new Companion(null);
+    public static final int $stable = 8;
+    private static final uc2[] $childSerializers = {ut0.K(dh2.I, new wd3((byte) 21)), null, null, null, null};
+
+    public /* synthetic */ SearchUserResponse(int i, List list, int i2, int i3, int i4, LogPb logPb, yj4 yj4Var) {
+        if ((i & 1) == 0) {
+            this.userList = null;
+        } else {
+            this.userList = list;
+        }
+        if ((i & 2) == 0) {
+            this.hasMore = 0;
+        } else {
+            this.hasMore = i2;
+        }
+        if ((i & 4) == 0) {
+            this.cursor = 0;
+        } else {
+            this.cursor = i3;
+        }
+        if ((i & 8) == 0) {
+            this.statusCode = 0;
+        } else {
+            this.statusCode = i4;
+        }
+        if ((i & 16) == 0) {
+            this.logPb = null;
+        } else {
+            this.logPb = logPb;
+        }
+    }
+
+    /* JADX INFO: Access modifiers changed from: private */
+    public static final /* synthetic */ KSerializer _childSerializers$_anonymous_() {
+        return new sp(SearchUserItem$$serializer.INSTANCE);
+    }
+
+    public static /* synthetic */ SearchUserResponse copy$default(SearchUserResponse searchUserResponse, List list, int i, int i2, int i3, LogPb logPb, int i4, Object obj) {
+        if ((i4 & 1) != 0) {
+            list = searchUserResponse.userList;
+        }
+        if ((i4 & 2) != 0) {
+            i = searchUserResponse.hasMore;
+        }
+        if ((i4 & 4) != 0) {
+            i2 = searchUserResponse.cursor;
+        }
+        if ((i4 & 8) != 0) {
+            i3 = searchUserResponse.statusCode;
+        }
+        if ((i4 & 16) != 0) {
+            logPb = searchUserResponse.logPb;
+        }
+        LogPb logPb2 = logPb;
+        int i5 = i2;
+        return searchUserResponse.copy(list, i, i5, i3, logPb2);
+    }
+
+    public static final /* synthetic */ void write$Self$app(SearchUserResponse searchUserResponse, me0 me0Var, SerialDescriptor serialDescriptor) {
+        uc2[] uc2VarArr = $childSerializers;
+        if (me0Var.q(serialDescriptor) || searchUserResponse.userList != null) {
+            me0Var.k(serialDescriptor, 0, (KSerializer) uc2VarArr[0].getValue(), searchUserResponse.userList);
+        }
+        if (me0Var.q(serialDescriptor) || searchUserResponse.hasMore != 0) {
+            ((ax4) me0Var).A(serialDescriptor, 1, searchUserResponse.hasMore);
+        }
+        if (me0Var.q(serialDescriptor) || searchUserResponse.cursor != 0) {
+            ((ax4) me0Var).A(serialDescriptor, 2, searchUserResponse.cursor);
+        }
+        if (me0Var.q(serialDescriptor) || searchUserResponse.statusCode != 0) {
+            ((ax4) me0Var).A(serialDescriptor, 3, searchUserResponse.statusCode);
+        }
+        if (!me0Var.q(serialDescriptor) && searchUserResponse.logPb == null) {
+            return;
+        }
+        me0Var.k(serialDescriptor, 4, LogPb$$serializer.INSTANCE, searchUserResponse.logPb);
+    }
+
+    public final List<SearchUserItem> component1() {
+        return this.userList;
+    }
+
+    public final int component2() {
+        return this.hasMore;
+    }
+
+    public final int component3() {
+        return this.cursor;
+    }
+
+    public final int component4() {
+        return this.statusCode;
+    }
+
+    public final LogPb component5() {
+        return this.logPb;
+    }
+
+    public final SearchUserResponse copy(List<SearchUserItem> list, int i, int i2, int i3, LogPb logPb) {
+        return new SearchUserResponse(list, i, i2, i3, logPb);
+    }
+
+    public boolean equals(Object obj) {
+        if (this == obj) {
+            return true;
+        }
+        if (!(obj instanceof SearchUserResponse)) {
+            return false;
+        }
+        SearchUserResponse searchUserResponse = (SearchUserResponse) obj;
+        return j42.c(this.userList, searchUserResponse.userList) && this.hasMore == searchUserResponse.hasMore && this.cursor == searchUserResponse.cursor && this.statusCode == searchUserResponse.statusCode && j42.c(this.logPb, searchUserResponse.logPb);
+    }
+
+    public final int getCursor() {
+        return this.cursor;
+    }
+
+    public final int getHasMore() {
+        return this.hasMore;
+    }
+
+    public final LogPb getLogPb() {
+        return this.logPb;
+    }
+
+    public final int getStatusCode() {
+        return this.statusCode;
+    }
+
+    public final List<SearchUserItem> getUserList() {
+        return this.userList;
+    }
+
+    public int hashCode() {
+        List<SearchUserItem> list = this.userList;
+        int hashCode = (((((((list == null ? 0 : list.hashCode()) * 31) + this.hasMore) * 31) + this.cursor) * 31) + this.statusCode) * 31;
+        LogPb logPb = this.logPb;
+        return hashCode + (logPb != null ? logPb.hashCode() : 0);
+    }
+
+    public String toString() {
+        return "SearchUserResponse(userList=" + this.userList + ", hasMore=" + this.hasMore + ", cursor=" + this.cursor + ", statusCode=" + this.statusCode + ", logPb=" + this.logPb + ")";
+    }
+
+    /* compiled from: r8-map-id-c2f6a97aa2e8a24cc4494d4253d5e904442917ade8115d3074f7f7c1f1495db8 */
+    public static final class Companion {
+        public /* synthetic */ Companion(er0 er0Var) {
+            this();
+        }
+
+        public final KSerializer serializer() {
+            return SearchUserResponse$$serializer.INSTANCE;
+        }
+
+        private Companion() {
+        }
+    }
+
+    public static /* synthetic */ void getCursor$annotations() {
+    }
+
+    public static /* synthetic */ void getHasMore$annotations() {
+    }
+
+    public static /* synthetic */ void getLogPb$annotations() {
+    }
+
+    public static /* synthetic */ void getStatusCode$annotations() {
+    }
+
+    public static /* synthetic */ void getUserList$annotations() {
+    }
+
+    public SearchUserResponse() {
+        this((List) null, 0, 0, 0, (LogPb) null, 31, (er0) null);
+    }
+
+    public SearchUserResponse(List<SearchUserItem> list, int i, int i2, int i3, LogPb logPb) {
+        this.userList = list;
+        this.hasMore = i;
+        this.cursor = i2;
+        this.statusCode = i3;
+        this.logPb = logPb;
+    }
+
+    public /* synthetic */ SearchUserResponse(List list, int i, int i2, int i3, LogPb logPb, int i4, er0 er0Var) {
+        this((i4 & 1) != 0 ? null : list, (i4 & 2) != 0 ? 0 : i, (i4 & 4) != 0 ? 0 : i2, (i4 & 8) != 0 ? 0 : i3, (i4 & 16) != 0 ? null : logPb);
+    }
+}

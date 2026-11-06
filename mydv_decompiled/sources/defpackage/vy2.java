@@ -1,0 +1,23 @@
+package defpackage;
+
+import android.content.Context;
+
+/* compiled from: r8-map-id-c2f6a97aa2e8a24cc4494d4253d5e904442917ade8115d3074f7f7c1f1495db8 */
+/* loaded from: classes2.dex */
+public interface vy2 {
+    void a(sx2 sx2Var, boolean z);
+
+    boolean c(oy4 oy4Var);
+
+    boolean d();
+
+    boolean e(ky2 ky2Var);
+
+    void f(uy2 uy2Var);
+
+    boolean h(ky2 ky2Var);
+
+    void i();
+
+    void k(Context context, sx2 sx2Var);
+}

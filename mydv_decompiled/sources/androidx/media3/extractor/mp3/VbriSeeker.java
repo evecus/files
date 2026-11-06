@@ -1,0 +1,134 @@
+package androidx.media3.extractor.mp3;
+
+import androidx.media3.common.util.Log;
+import androidx.media3.common.util.ParsableByteArray;
+import androidx.media3.common.util.Util;
+import androidx.media3.extractor.MpegAudioUtil;
+import androidx.media3.extractor.SeekMap;
+import androidx.media3.extractor.SeekPoint;
+import defpackage.hf1;
+
+/* compiled from: r8-map-id-c2f6a97aa2e8a24cc4494d4253d5e904442917ade8115d3074f7f7c1f1495db8 */
+/* loaded from: classes2.dex */
+final class VbriSeeker implements Seeker {
+    private static final String TAG = "VbriSeeker";
+    private final int averageBitrate;
+    private final long dataEndPosition;
+    private final long dataStartPosition;
+    private final long durationUs;
+    private final long[] positions;
+    private final long[] timesUs;
+
+    private VbriSeeker(long[] jArr, long[] jArr2, long j, long j2, long j3) {
+        this.timesUs = jArr;
+        this.positions = jArr2;
+        this.durationUs = j;
+        this.dataStartPosition = j2;
+        this.dataEndPosition = j3;
+        this.averageBitrate = Mp3Util.computeAverageBitrate(j3 - j2, j);
+    }
+
+    public static VbriSeeker create(long j, long j2, MpegAudioUtil.Header header, ParsableByteArray parsableByteArray) {
+        int readUnsignedByte;
+        parsableByteArray.skipBytes(6);
+        long j3 = j2 + header.frameSize;
+        long readInt = parsableByteArray.readInt() + j3;
+        int readInt2 = parsableByteArray.readInt();
+        if (readInt2 <= 0) {
+            return null;
+        }
+        long sampleCountToDurationUs = Util.sampleCountToDurationUs((readInt2 * header.samplesPerFrame) - 1, header.sampleRate);
+        int readUnsignedShort = parsableByteArray.readUnsignedShort();
+        int readUnsignedShort2 = parsableByteArray.readUnsignedShort();
+        int readUnsignedShort3 = parsableByteArray.readUnsignedShort();
+        parsableByteArray.skipBytes(2);
+        int i = readUnsignedShort2;
+        long[] jArr = new long[readUnsignedShort];
+        long[] jArr2 = new long[readUnsignedShort];
+        int i2 = 0;
+        long j4 = j2 + header.frameSize;
+        while (i2 < readUnsignedShort) {
+            long[] jArr3 = jArr2;
+            jArr[i2] = (i2 * sampleCountToDurationUs) / readUnsignedShort;
+            jArr3[i2] = j4;
+            if (readUnsignedShort3 == 1) {
+                readUnsignedByte = parsableByteArray.readUnsignedByte();
+            } else if (readUnsignedShort3 == 2) {
+                readUnsignedByte = parsableByteArray.readUnsignedShort();
+            } else if (readUnsignedShort3 == 3) {
+                readUnsignedByte = parsableByteArray.readUnsignedInt24();
+            } else {
+                if (readUnsignedShort3 != 4) {
+                    return null;
+                }
+                readUnsignedByte = parsableByteArray.readUnsignedIntToInt();
+            }
+            int i3 = i;
+            j4 += i3 * readUnsignedByte;
+            i2++;
+            i = i3;
+            readUnsignedShort = readUnsignedShort;
+            jArr2 = jArr3;
+        }
+        long[] jArr4 = jArr2;
+        if (j != -1 && j != readInt) {
+            StringBuilder A = hf1.A(j, "VBRI data size mismatch: ", ", ");
+            A.append(readInt);
+            Log.w(TAG, A.toString());
+        }
+        if (readInt != j4) {
+            StringBuilder A2 = hf1.A(readInt, "VBRI bytes and ToC mismatch (using max): ", ", ");
+            A2.append(j4);
+            A2.append("\nSeeking will be inaccurate.");
+            Log.w(TAG, A2.toString());
+            readInt = Math.max(readInt, j4);
+        }
+        return new VbriSeeker(jArr, jArr4, sampleCountToDurationUs, j3, readInt);
+    }
+
+    @Override // androidx.media3.extractor.mp3.Seeker
+    public int getAverageBitrate() {
+        return this.averageBitrate;
+    }
+
+    @Override // androidx.media3.extractor.mp3.Seeker
+    public long getDataEndPosition() {
+        return this.dataEndPosition;
+    }
+
+    @Override // androidx.media3.extractor.mp3.Seeker
+    public long getDataStartPosition() {
+        return this.dataStartPosition;
+    }
+
+    @Override // androidx.media3.extractor.SeekMap
+    public long getDurationUs() {
+        return this.durationUs;
+    }
+
+    @Override // androidx.media3.extractor.SeekMap
+    public SeekMap.SeekPoints getSeekPoints(long j) {
+        int binarySearchFloor = Util.binarySearchFloor(this.timesUs, j, true, true);
+        SeekPoint seekPoint = new SeekPoint(this.timesUs[binarySearchFloor], this.positions[binarySearchFloor]);
+        if (seekPoint.timeUs >= j || binarySearchFloor == this.timesUs.length - 1) {
+            return new SeekMap.SeekPoints(seekPoint);
+        }
+        int i = binarySearchFloor + 1;
+        return new SeekMap.SeekPoints(seekPoint, new SeekPoint(this.timesUs[i], this.positions[i]));
+    }
+
+    @Override // androidx.media3.extractor.mp3.Seeker
+    public long getTimeUs(long j) {
+        return this.timesUs[Util.binarySearchFloor(this.positions, j, true, true)];
+    }
+
+    @Override // androidx.media3.extractor.SeekMap
+    public final boolean isEstimated() {
+        return false;
+    }
+
+    @Override // androidx.media3.extractor.SeekMap
+    public boolean isSeekable() {
+        return true;
+    }
+}

@@ -1,0 +1,17 @@
+package defpackage;
+
+/* compiled from: r8-map-id-c2f6a97aa2e8a24cc4494d4253d5e904442917ade8115d3074f7f7c1f1495db8 */
+/* loaded from: classes.dex */
+public final class ux implements tx {
+    public static final ux a = new ux();
+
+    @Override // defpackage.tx
+    public final l13 align(l13 l13Var, u8 u8Var) {
+        return l13Var.then(new jx(u8Var, false));
+    }
+
+    @Override // defpackage.tx
+    public final l13 matchParentSize(l13 l13Var) {
+        return l13Var.then(new jx(q8.N, true));
+    }
+}

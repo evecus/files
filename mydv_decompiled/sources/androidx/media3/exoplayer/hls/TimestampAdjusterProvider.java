@@ -1,0 +1,24 @@
+package androidx.media3.exoplayer.hls;
+
+import android.util.SparseArray;
+import androidx.media3.common.util.TimestampAdjuster;
+
+/* compiled from: r8-map-id-c2f6a97aa2e8a24cc4494d4253d5e904442917ade8115d3074f7f7c1f1495db8 */
+/* loaded from: classes2.dex */
+public final class TimestampAdjusterProvider {
+    private final SparseArray<TimestampAdjuster> timestampAdjusters = new SparseArray<>();
+
+    public TimestampAdjuster getAdjuster(int i) {
+        TimestampAdjuster timestampAdjuster = this.timestampAdjusters.get(i);
+        if (timestampAdjuster != null) {
+            return timestampAdjuster;
+        }
+        TimestampAdjuster timestampAdjuster2 = new TimestampAdjuster(TimestampAdjuster.MODE_SHARED);
+        this.timestampAdjusters.put(i, timestampAdjuster2);
+        return timestampAdjuster2;
+    }
+
+    public void reset() {
+        this.timestampAdjusters.clear();
+    }
+}

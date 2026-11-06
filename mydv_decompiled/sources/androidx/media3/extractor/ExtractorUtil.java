@@ -1,0 +1,104 @@
+package androidx.media3.extractor;
+
+import androidx.media3.common.C;
+import androidx.media3.common.ParserException;
+import androidx.media3.container.OpusUtil;
+import java.io.EOFException;
+import org.checkerframework.dataflow.qual.Pure;
+
+/* compiled from: r8-map-id-c2f6a97aa2e8a24cc4494d4253d5e904442917ade8115d3074f7f7c1f1495db8 */
+/* loaded from: classes.dex */
+public final class ExtractorUtil {
+    private ExtractorUtil() {
+    }
+
+    @Pure
+    public static void checkContainerInput(boolean z, String str) {
+        if (!z) {
+            throw ParserException.createForMalformedContainer(str, null);
+        }
+    }
+
+    public static int getMaximumEncodedRateBytesPerSecond(int i) {
+        if (i == 20) {
+            return OpusUtil.MAX_BYTES_PER_SECOND;
+        }
+        if (i == 30) {
+            return DtsUtil.DTS_HD_MAX_RATE_BYTES_PER_SECOND;
+        }
+        switch (i) {
+            case 5:
+                return Ac3Util.AC3_MAX_RATE_BYTES_PER_SECOND;
+            case 6:
+                return 768000;
+            case 7:
+                return DtsUtil.DTS_MAX_RATE_BYTES_PER_SECOND;
+            case 8:
+                return DtsUtil.DTS_HD_MAX_RATE_BYTES_PER_SECOND;
+            case 9:
+                return MpegAudioUtil.MAX_RATE_BYTES_PER_SECOND;
+            case 10:
+                return 100000;
+            case 11:
+                return AacUtil.AAC_HE_V1_MAX_RATE_BYTES_PER_SECOND;
+            case 12:
+                return 7000;
+            default:
+                switch (i) {
+                    case 14:
+                        return Ac3Util.TRUEHD_MAX_RATE_BYTES_PER_SECOND;
+                    case 15:
+                        return 8000;
+                    case 16:
+                        return AacUtil.AAC_XHE_MAX_RATE_BYTES_PER_SECOND;
+                    case 17:
+                        return Ac4Util.MAX_RATE_BYTES_PER_SECOND;
+                    case 18:
+                        return 768000;
+                    default:
+                        return C.RATE_UNSET_INT;
+                }
+        }
+    }
+
+    public static boolean peekFullyQuietly(ExtractorInput extractorInput, byte[] bArr, int i, int i2, boolean z) {
+        try {
+            return extractorInput.peekFully(bArr, i, i2, z);
+        } catch (EOFException e) {
+            if (z) {
+                return false;
+            }
+            throw e;
+        }
+    }
+
+    public static int peekToLength(ExtractorInput extractorInput, byte[] bArr, int i, int i2) {
+        int i3 = 0;
+        while (i3 < i2) {
+            int peek = extractorInput.peek(bArr, i + i3, i2 - i3);
+            if (peek == -1) {
+                break;
+            }
+            i3 += peek;
+        }
+        return i3;
+    }
+
+    public static boolean readFullyQuietly(ExtractorInput extractorInput, byte[] bArr, int i, int i2) {
+        try {
+            extractorInput.readFully(bArr, i, i2);
+            return true;
+        } catch (EOFException unused) {
+            return false;
+        }
+    }
+
+    public static boolean skipFullyQuietly(ExtractorInput extractorInput, int i) {
+        try {
+            extractorInput.skipFully(i);
+            return true;
+        } catch (EOFException unused) {
+            return false;
+        }
+    }
+}

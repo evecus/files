@@ -1,0 +1,32 @@
+package defpackage;
+
+/* compiled from: r8-map-id-c2f6a97aa2e8a24cc4494d4253d5e904442917ade8115d3074f7f7c1f1495db8 */
+/* loaded from: classes.dex */
+public final class vh implements kk3 {
+    public final jk3 a;
+    public final jk3 b = ad4.w(Boolean.FALSE);
+
+    public vh(boolean z) {
+        this.a = ad4.w(Boolean.valueOf(z));
+    }
+
+    @Override // defpackage.l13
+    public final boolean all(tm1 tm1Var) {
+        return ((Boolean) tm1Var.invoke(this)).booleanValue();
+    }
+
+    @Override // defpackage.l13
+    public final Object foldIn(Object obj, hn1 hn1Var) {
+        return hn1Var.invoke(obj, this);
+    }
+
+    @Override // defpackage.l13
+    public final /* synthetic */ l13 then(l13 l13Var) {
+        return hf1.e(this, l13Var);
+    }
+
+    @Override // defpackage.kk3
+    public final Object b() {
+        return this;
+    }
+}

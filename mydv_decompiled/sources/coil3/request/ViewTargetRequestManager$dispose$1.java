@@ -1,0 +1,45 @@
+package coil3.request;
+
+import defpackage.dl0;
+import defpackage.fj0;
+import defpackage.hn1;
+import defpackage.k05;
+import defpackage.mu0;
+import defpackage.rp0;
+import defpackage.wd5;
+import defpackage.zy;
+
+/* compiled from: r8-map-id-c2f6a97aa2e8a24cc4494d4253d5e904442917ade8115d3074f7f7c1f1495db8 */
+@rp0(c = "coil3.request.ViewTargetRequestManager$dispose$1", f = "ViewTargetRequestManager.kt", l = {}, m = "invokeSuspend", v = 1)
+/* loaded from: classes2.dex */
+public final class ViewTargetRequestManager$dispose$1 extends k05 implements hn1 {
+    int label;
+    final /* synthetic */ ViewTargetRequestManager this$0;
+
+    /* JADX WARN: 'super' call moved to the top of the method (can break code semantics) */
+    public ViewTargetRequestManager$dispose$1(ViewTargetRequestManager viewTargetRequestManager, fj0 fj0Var) {
+        super(2, fj0Var);
+        this.this$0 = viewTargetRequestManager;
+    }
+
+    @Override // defpackage.fu
+    public final fj0 create(Object obj, fj0 fj0Var) {
+        return new ViewTargetRequestManager$dispose$1(this.this$0, fj0Var);
+    }
+
+    @Override // defpackage.hn1
+    public final Object invoke(dl0 dl0Var, fj0 fj0Var) {
+        return ((ViewTargetRequestManager$dispose$1) create(dl0Var, fj0Var)).invokeSuspend(wd5.a);
+    }
+
+    @Override // defpackage.fu
+    public final Object invokeSuspend(Object obj) {
+        if (this.label != 0) {
+            zy.i("call to 'resume' before 'invoke' with coroutine");
+            return null;
+        }
+        mu0.V(obj);
+        this.this$0.setRequest(null);
+        return wd5.a;
+    }
+}

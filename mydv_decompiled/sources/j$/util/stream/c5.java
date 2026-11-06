@@ -1,0 +1,15 @@
+package j$.util.stream;
+
+/* compiled from: r8-map-id-c2f6a97aa2e8a24cc4494d4253d5e904442917ade8115d3074f7f7c1f1495db8 */
+/* loaded from: classes3.dex */
+public abstract class c5 extends d5 {
+    @Override // j$.util.stream.a
+    public final boolean M() {
+        return false;
+    }
+
+    @Override // j$.util.stream.g
+    public final g unordered() {
+        return !y6.ORDERED.h(this.f) ? this : new z4(this, y6.r);
+    }
+}

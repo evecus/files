@@ -1,0 +1,20 @@
+package defpackage;
+
+import java.util.concurrent.CancellationException;
+
+/* compiled from: r8-map-id-c2f6a97aa2e8a24cc4494d4253d5e904442917ade8115d3074f7f7c1f1495db8 */
+/* loaded from: classes.dex */
+public final class f1 extends CancellationException {
+    public final transient ag1 I;
+
+    public f1(ag1 ag1Var) {
+        super("Flow was aborted, no more elements needed");
+        this.I = ag1Var;
+    }
+
+    @Override // java.lang.Throwable
+    public final Throwable fillInStackTrace() {
+        setStackTrace(new StackTraceElement[0]);
+        return this;
+    }
+}

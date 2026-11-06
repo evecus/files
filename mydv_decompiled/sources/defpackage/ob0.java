@@ -1,0 +1,35 @@
+package defpackage;
+
+import java.util.Comparator;
+
+/* compiled from: r8-map-id-c2f6a97aa2e8a24cc4494d4253d5e904442917ade8115d3074f7f7c1f1495db8 */
+/* loaded from: classes2.dex */
+public abstract class ob0 {
+    public static final mb0 a = new mb0();
+    public static final nb0 b = new nb0(-1);
+    public static final nb0 c = new nb0(1);
+
+    public ob0 a(int i, int i2) {
+        return mb0.g(Integer.compare(i, i2));
+    }
+
+    public ob0 b(long j, long j2) {
+        return mb0.g(Long.compare(j, j2));
+    }
+
+    public ob0 c(Object obj, Object obj2, Comparator comparator) {
+        return mb0.g(comparator.compare(obj, obj2));
+    }
+
+    public ob0 d(boolean z, boolean z2) {
+        return mb0.g(Boolean.compare(z, z2));
+    }
+
+    public ob0 e(boolean z, boolean z2) {
+        return mb0.g(Boolean.compare(z2, z));
+    }
+
+    public int f() {
+        return 0;
+    }
+}
