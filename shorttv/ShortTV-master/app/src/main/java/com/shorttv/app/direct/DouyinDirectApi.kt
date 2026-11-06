@@ -280,13 +280,17 @@ class DouyinDirectApi(
         data class DyLiveUser(
             @SerialName("sec_uid") val secUid: String = "",
             val nickname: String = "",
-            @SerialName("avatar_medium") val avatarMedium: UrlList = UrlList()
+            @SerialName("avatar_medium") val avatarMedium: UrlList = UrlList(),
+            /** 游客身份唯一 id（IM WebSocket 连接参数）。 */
+            @SerialName("unique_id") val uniqueId: String = ""
         )
 
         @Serializable
         data class DyLiveRoom(
             @SerialName("id_str") val idStr: String = "",
             @SerialName("room_id_str") val roomIdStr: String = "",
+            /** IM 推流内部 id（webcast IM push v3 连接参数）。 */
+            @SerialName("internal_stream_id") val internalStreamId: String = "",
             val title: String = "",
             val status: Int = 0,
             @SerialName("user_count_str") val userCountStr: String = "0",
@@ -336,7 +340,11 @@ class DouyinDirectApi(
     private val http: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
+        .dns(DohDns)
         .build()
+
+    /** 直播 IM WebSocket 复用同一 OkHttp（含 DoH DNS，douyin 域名解析依赖它）。 */
+    val wsHttpClient: OkHttpClient get() = http
 
     /** 手机端优先使用移动端 App 推荐流（竖屏内容为主），由 ViewModel 按设备形态注入。 */
     @Volatile
@@ -1161,6 +1169,10 @@ class DouyinDirectApi(
         val resolvedDuration = durationMs.takeIf { it > 0 }
             ?: detail(awemeId)?.video?.duration?.toLong()?.takeIf { it > 0 }
             ?: 0L
+        // 优先移动端 App 弹幕接口（无需 Web 签名，弱身份可过，与 app feed 同链路）
+        runCatching { appDanmaku(awemeId, resolvedDuration) }.getOrNull()
+            ?.let { return it }
+        // 回退 Web 签名接口（同 myDV）
         val params = webBaseParams().apply {
             put("item_id", awemeId)
             put("group_id", awemeId)
@@ -1185,7 +1197,74 @@ class DouyinDirectApi(
             .onFailure { Log.w(TAG, "danmaku response decode failed: ${it.message}") }
             .getOrNull() ?: return emptyList()
         val elements = resp.danmakuList.ifEmpty { resp.data?.danmakuList.orEmpty() }
-        return elements.mapIndexedNotNull { i, element ->
+        return parseDanmakuElements(awemeId, elements)
+    }
+
+    /**
+     * 移动端 App 弹幕接口（/aweme/v1/danmaku/get/）。
+     * 与 app feed 同链路：设备参数 + APP_UA，无需 a_bogus / Web msToken。
+     */
+    private suspend fun appDanmaku(awemeId: String, durationMs: Long): List<DanmakuItem>? {
+        val params = linkedMapOf(
+            "item_id" to awemeId,
+            "start_time" to "0",
+            "end_time" to durationMs.toString(),
+            "duration" to durationMs.toString(),
+            "count" to "200",
+            "aid" to "1128",
+            "app_name" to "aweme",
+            "version_code" to "170400",
+            "device_platform" to "android",
+            "device_type" to "Pixel 7",
+            "device_brand" to "Google",
+            "os_api" to "33",
+            "os_version" to "13",
+            "device_id" to identity.appDeviceId,
+            "iid" to identity.appIid,
+            "openudid" to identity.appOpenudid,
+            "channel" to "googleplay",
+            "resolution" to "1080*2400",
+            "dpi" to "420",
+            "language" to "zh",
+            "ac" to "wifi",
+            "network_type" to "wifi",
+            "os" to "android",
+            "ts" to (System.currentTimeMillis() / 1000).toString(),
+            "_rticket" to System.currentTimeMillis().toString()
+        )
+        val url = "$APP_BASE/aweme/v1/danmaku/get/?${buildQuery(params)}"
+        val body = withContext(Dispatchers.IO) {
+            runCatching {
+                http.newCall(
+                    Request.Builder()
+                        .url(url)
+                        .header("User-Agent", APP_UA)
+                        .header("Accept", "application/json")
+                        .get()
+                        .build()
+                ).execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        Log.w(TAG, "appDanmaku HTTP ${resp.code}")
+                        null
+                    } else {
+                        resp.body?.string().orEmpty()
+                    }
+                }
+            }.onFailure { Log.w(TAG, "appDanmaku request failed: ${it.message}") }
+                .getOrNull().orEmpty()
+        }
+        if (body.isBlank()) return null
+        val resp = runCatching { json.decodeFromString<DanmakuResp>(body) }
+            .onFailure { Log.w(TAG, "appDanmaku decode failed: ${it.message}") }
+            .getOrNull() ?: return null
+        val elements = resp.danmakuList.ifEmpty { resp.data?.danmakuList.orEmpty() }
+        val items = parseDanmakuElements(awemeId, elements)
+        return items.ifEmpty { null } // 空结果走 Web 回退（避免空列表误判为成功）
+    }
+
+    /** danmaku get_v2 / App 接口共用的元素解析（DyDanmaku → DanmakuItem）。 */
+    private fun parseDanmakuElements(awemeId: String, elements: List<JsonElement>): List<DanmakuItem> =
+        elements.mapIndexedNotNull { i, element ->
             val d = runCatching {
                 json.decodeFromJsonElement(DyDanmaku.serializer(), element)
             }.onFailure { Log.w(TAG, "danmaku decode skipped: ${it.message}") }
@@ -1201,7 +1280,6 @@ class DouyinDirectApi(
                 diggCount = d.diggCount.longValue()
             )
         }.distinctBy { it.id }
-    }
 
     // ---------- 直播 ----------
 
@@ -1210,6 +1288,15 @@ class DouyinDirectApi(
      * 使用 __ac_signature + X-MS-STUB（msStub=MD5(请求体)）。
      */
     suspend fun liveEnter(roomId: String): LiveRoom? {
+        val resp = liveEnterResp(roomId) ?: return null
+        return resp.data?.room?.toLiveRoom(roomId)
+    }
+
+    /**
+     * enter 接口共用请求（直播页与 IM 弹幕参数共用，保持原 liveEnter 行为）。
+     * @return 原始响应 DTO，失败返回 null。
+     */
+    private suspend fun liveEnterResp(roomId: String): LiveEnterResp? {
         identity.ensureAll()
         identity.ensureTtwid()
         val params = linkedMapOf(
@@ -1258,14 +1345,34 @@ class DouyinDirectApi(
                         Log.w(TAG, "liveEnter HTTP ${resp.code}: ${body.take(200)}")
                         return@use null
                     }
-                    val r = json.decodeFromString<LiveEnterResp>(body)
-                    r.data?.room?.toLiveRoom(roomId)
+                    json.decodeFromString<LiveEnterResp>(body)
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "liveEnter failed: ${e.message}")
                 null
             }
         }
+    }
+
+    /**
+     * 直播 IM 弹幕连接参数：房间数字 id / 游客 unique_id / internal_stream_id。
+     * 复用 enter 请求，与 liveEnter 同签名链路。
+     */
+    suspend fun liveImArgs(webRid: String): LiveImArgs? {
+        val resp = liveEnterResp(webRid) ?: return null
+        val room = resp.data?.room
+        val roomIdStr = room?.roomIdStr.orEmpty().ifBlank { room?.idStr.orEmpty() }
+        if (roomIdStr.isBlank()) {
+            Log.w(TAG, "liveImArgs: room_id_str 缺失")
+            return null
+        }
+        return LiveImArgs(
+            roomIdStr = roomIdStr,
+            userUniqueId = resp.data?.user?.uniqueId.orEmpty(),
+            internalStreamId = room?.internalStreamId.orEmpty(),
+            cookie = identity.cookieHeader(),
+            ua = identity.userAgent
+        )
     }
 
     /**
@@ -1325,3 +1432,17 @@ class DouyinDirectApi(
         else -> 0
     }
 }
+
+/** 直播 IM WebSocket 连接参数（LiveImClient 使用）。 */
+data class LiveImArgs(
+    /** 数字房间 id（room_id_str）。 */
+    val roomIdStr: String,
+    /** 游客唯一 id（data.user.unique_id）。 */
+    val userUniqueId: String,
+    /** 内部推流 id（data.room.internal_stream_id）。 */
+    val internalStreamId: String,
+    /** 当前身份 Cookie（非空才随 WS 请求发送）。 */
+    val cookie: String,
+    /** 请求 UA。 */
+    val ua: String
+)
