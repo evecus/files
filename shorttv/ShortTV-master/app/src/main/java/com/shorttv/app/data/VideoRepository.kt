@@ -95,8 +95,9 @@ class VideoRepository {
                     if (page.items.isNotEmpty()) return page.let { AwemePage(it.items, it.hasMore, it.nextCursor) }
                 }.onFailure { Log.w(TAG, "direct feed failed: ${it.message}") }
             }
-            Log.w(TAG, "direct feed unavailable")
-            return AwemePage(emptyList(), false, cursor)
+            // 直连失败（风控 / 网络 / 空响应）时回退演示数据，保证首页始终可用（与 SERVER 模式一致）
+            Log.w(TAG, "direct feed unavailable, fallback to demo data")
+            return demoFeed(cursor)
         }
         if (dataSource == DataSource.DEMO) return demoFeed(cursor)
         val api = apiClientFor(baseUrl)
