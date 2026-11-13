@@ -1,0 +1,196 @@
+# QUIC-LB: Load Balancing
+
+Implementation of [draft-ietf-quic-load-balancers](https://datatracker.ietf.org/doc/html/draft-ietf-quic-load-balancers) for routing QUIC packets across multiple backend servers.
+
+## How it works
+
+```
+Client ──── UDP ────► QUIC-LB (port 443) ──── UDP ────► Server A (server_id=0001)
+                      extracts server_id       ├─────► Server B (server_id=0002)
+                      from encrypted CID       └─────► Server C (server_id=0003)
+```
+
+1. Each backend server encodes its **server_id** into every Connection ID it generates
+2. The load balancer decrypts the CID to extract the server_id and routes to the correct backend
+3. Connection migration works automatically — the CID always identifies the server
+
+## Quick Start
+
+### 1. Create a config file
+
+```
+# quic-lb.conf
+listen 0.0.0.0:443
+config_id 0
+server_id_len 2
+nonce_len 6
+key 0123456789abcdef0123456789abcdef
+server 0001 10.0.0.1:4433
+server 0002 10.0.0.2:4433
+```
+
+### 2. Start backend servers
+
+Each server needs `--server-id` and `--lb-key` matching the config:
+
+```sh
+# Server A
+zig-out/bin/server --port 4433 --server-id 0001 --lb-key 0123456789abcdef0123456789abcdef
+
+# Server B
+zig-out/bin/server --port 4433 --server-id 0002 --lb-key 0123456789abcdef0123456789abcdef
+```
+
+### 3. Start the load balancer
+
+```sh
+zig-out/bin/quic-lb quic-lb.conf
+```
+
+### 4. Connect through the LB
+
+```sh
+zig-out/bin/client --port 443
+```
+
+## Config File Format
+
+```
+listen <ip:port>          # LB listen address
+config_id <0-6>           # Config rotation ID (3 bits)
+server_id_len <1-15>      # Server ID length in bytes
+nonce_len <4-18>          # Nonce length in bytes
+key <32 hex chars>        # AES-128 encryption key (omit for plaintext mode)
+server <id_hex> <ip:port> # Backend mapping (repeat for each server)
+```
+
+- `server_id_len + nonce_len` must be ≤ 19
+- The `key` enables encrypted mode (4-pass Feistel cipher or single-pass AES-ECB)
+- Without `key`, server IDs are visible in plaintext (use only in trusted networks)
+
+## Server Flags
+
+Both `server` and `wt-browser-server` accept:
+
+```
+--server-id <hex>    Server ID (must match LB config, e.g. "0001")
+--lb-key <hex>       AES-128 key (32 hex chars, must match LB config)
+```
+
+## Encryption Modes
+
+| Mode | When | Security |
+|---|---|---|
+| **Plaintext** | No `key` in config | Server ID visible to observers |
+| **4-pass Feistel** | `key` set, `server_id_len + nonce_len ≠ 16` | Encrypted with AES-ECB rounds |
+| **Single-pass AES** | `key` set, `server_id_len + nonce_len = 16` | Direct AES-ECB block cipher |
+
+## Programmatic Usage
+
+```zig
+const quic_lb = @import("quic").quic_lb;
+
+// Configure QUIC-LB CID encoding
+var lb_config = quic_lb.Config{
+    .config_id = 0,
+    .server_id_len = 2,
+    .nonce_len = 6,
+    .key = my_aes_key, // or null for plaintext
+};
+lb_config.server_id[0] = 0x00;
+lb_config.server_id[1] = 0x01;
+
+// Pass to connection config
+const conn_config = connection.ConnectionConfig{
+    .quic_lb = lb_config,
+};
+```
+
+## Steering between workers on one port
+
+A server that runs one `event_loop.Server` per thread, all bound to the same
+port with `Config.reuse_port`, needs no separate load balancer: the kernel
+spreads new connections across workers, and QUIC-LB CIDs steer the rest.
+
+- Give every worker the same `Config.quic_lb` with its own `server_id`.
+- Give them one `tls_config` (its session-ticket key), `retry_token_key`
+  (Retry and NEW_TOKEN tokens) and `http1.ticket_key`: a client's next
+  connection lands on whichever worker the kernel picks.
+- Set `Config.foreign_datagram` on each. When a Handshake or 1-RTT datagram's
+  DCID is unknown to the worker that received it but decodes to another
+  worker's id — a client whose NAT rebound, say — the hook gets the bytes,
+  addresses and target id instead of the client getting a stateless reset.
+- The hook runs on the receiving worker's thread. Copy the bytes, move them to
+  the owner's thread (a queue and an `xev.Async`), and call the owner's
+  `Server.injectDatagram` there. The owner answers from its own socket, which
+  has the same address.
+
+Initials are never steered: whichever worker receives one accepts the
+connection. A datagram handed over is never handed on again by its id, so a
+CID nobody owns gets a stateless reset from the worker it was steered to.
+
+On Linux the kernel can do the steering: `quic_lb.steerReuseportGroup(fd,
+&config, n)` attaches a classic BPF program to the port's SO_REUSEPORT group
+(SO_ATTACH_REUSEPORT_CBPF, Linux 4.5+, no privilege needed), and each
+datagram whose DCID is one of ours goes straight to the socket of the worker
+it names. The hook then only sees what the program can't place.
+
+- The group numbers its sockets in bind order: give the workers server ids
+  0 to n-1 and bind their sockets in that order. Closing a socket moves the
+  group's last into its slot, so close them last first.
+- Short headers are read at the CID's offset; long headers only when the
+  DCID has our length and first octet, so a new client's random DCID is
+  spread by the 4-tuple hash as before.
+- It needs plaintext CIDs and a one-byte server id, and is refused
+  otherwise.
+
+### Handing a connection to another worker
+
+A worker can give a live connection away, streams, datagrams and
+WebTransport sessions as they stand: a game server moves a client to the
+worker that runs its room. Every worker shares one `Config.moved_cids` (and
+`static_reset_key`, `tls_config` and the QUIC-LB config but its id), and the
+handler declares `onHandover`.
+
+1. `session.handOver(to)` on the old worker. At the end of the pass, after its
+   sends, the server detaches the connection, records its CIDs in `MovedCids`
+   as `to`'s, and calls `onHandover(handover)`.
+2. The handler queues the `Handover` for the new worker's thread — in the same
+   ordered queue as the datagrams `foreign_datagram` steers there, so the
+   connection always arrives before its packets.
+3. The new worker calls `adopt(handover)`. It gives the peer CIDs carrying its
+   own id with Retire Prior To past the old ones (RFC 9000 §5.1.2); the peer
+   switches to them within a round trip.
+
+Meanwhile a packet still on an old CID lands on a worker that does not know
+it, finds it in `MovedCids`, and is steered to the new owner; one that
+reaches the new owner before the connection does is dropped, not reset. The
+old CIDs leave `MovedCids` when the peer retires them or the connection closes.
+
+A WebSocket on the HTTP/1.1 listener moves the same way, with no CIDs to
+rotate: a TCP connection stays on its socket, whichever loop polls it. From
+`onWsMessage`, `ws.handOver()`; once no read or write of it is in flight, the
+old worker calls `onWsHandover(handover)`; the new one's
+`http1_server.adopt(handover)` serves it on, TLS session, unread input and
+unsent output included.
+
+## Limitations
+
+- Initial packets from new clients have random DCIDs (not QUIC-LB encoded) — the LB uses round-robin for these
+- Retry tokens are disabled when QUIC-LB is active (Retry changes the DCID)
+- The LB tracks client↔backend mappings for return traffic (not fully stateless)
+- Single-socket LB — adequate for moderate traffic; production deployments may want kernel-level routing
+
+## CID Format
+
+```
+┌──────────────┬────────────────────────────────────┐
+│  First Octet │         Encrypted Payload          │
+│ [config][len]│     [server_id]     [nonce]        │
+│  3 bits 5bits│   server_id_len    nonce_len       │
+└──────────────┴────────────────────────────────────┘
+```
+
+- Bits 7-5 of the first octet: config rotation ID (0-6)
+- Bits 4-0: CID length self-encoding (or random if disabled)
+- Remaining bytes: server_id + nonce, optionally encrypted

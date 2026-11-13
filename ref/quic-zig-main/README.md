@@ -1,0 +1,624 @@
+![quic-zig](./quic-zig.svg)
+
+A QUIC / H3 / WebTransport implementation in pure Zig.
+
+> **Current state:** Not production-ready. Public APIs may still change as the project gets battle-tested.
+
+---
+
+Check out my [GitHub Sponsors](https://github.com/sponsors/endel) for motivation
+and goals of this project!
+
+## Features
+
+- **QUIC v1 & v2** (RFC 9000 / RFC 9369) — handshake, streams, flow control, connection migration, PMTUD, ECN
+- **TLS 1.3** (RFC 8446 / RFC 9001) — ECDSA P-256, Ed25519 and RSA-PSS certificates, X25519, AES-128-GCM + ChaCha20, session resumption, 0-RTT
+- **Loss Detection & Congestion Control** (RFC 9002) — CUBIC, PTO, token bucket pacer
+- **HTTP/3** (RFC 9114) — QPACK static table, request/response, priority scheduling (RFC 9218)
+- **WebTransport** (draft-ietf-webtrans-http3) — bidi/uni streams, datagrams, Extended CONNECT, browser support
+- **Media over QUIC** (draft-ietf-moq-transport-17) — wire layer, pub/sub, multi-subscriber relay with alias remapping, live browser video demo (WebCodecs VP8)
+- **HTTP/1.1 + WebSocket** (RFC 6455) — TCP listener on the QUIC server's event loop: static files and WebSockets beside WebTransport, TLS 1.3 with the QUIC certificates, Alt-Svc for HTTP/3
+
+## The Story
+
+This project started in February 2022 with a simple UDP listener and a
+question: _"Is it possible to write an entire WebTransport implementation in Zig?"_
+
+What followed was months of painful, incremental progress. Parsing QUIC Initial
+headers byte by byte. Getting stuck on packet number decryption. Falling down
+the TLS 1.3 rabbit hole. Evaluating every crypto library under the sun
+-- BoringSSL, BearSSL, picotls, s2n -- watching pure-Zig TLS efforts like
+[feilich](https://github.com/Luukdegram/feilich) emerge and eventually TLS
+land in Zig's standard library. Reading [quiche](https://github.com/cloudflare/quiche) source
+code for the tenth time, mesmerized by how clean it was, wondering if my own
+attempt would ever get there.
+
+By August 2022, the reality had fully set in: _"The more I read implementations
+and portions of the specs, the more I see this is a multi-year endeavour that
+may never end. I'm struggling to implement the very basics."_ The project was
+shelved. QUIC is not one spec -- it's a stack of RFCs (9000, 9001, 9002, 9114,
+9204, 9297) each building on the last, each with enough edge cases to fill a
+career. For a solo developer, it was humanly impossible.
+
+Fast-forward to 2026. Claude Code changed the equation. Not by writing perfect
+code -- but by making it possible to move fast enough across the full stack that
+the project could actually reach the point where it gets battle-tested. The
+entire codebase was rebuilt from scratch: TLS 1.3 handshake, QUIC transport,
+loss detection, congestion control, HTTP/3, QPACK, and WebTransport -- all in
+pure Zig, no C dependencies.
+
+The code passes most interop tests against [quic-go](https://github.com/quic-go/quic-go)
+and [quiche](https://github.com/cloudflare/quiche), and integrates with the
+official [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner).
+
+Is AI-assisted code "slop"? Only until it's battle-tested. That's the challenge
+-- and I'm hoping we can get there.
+
+
+## Using as a Library
+
+Add to your `build.zig.zon`:
+
+```bash
+zig fetch --save git+https://github.com/endel/quic-zig
+```
+
+Then in your `build.zig`:
+
+```zig
+const quic_dep = b.dependency("quic", .{ .target = target, .optimize = optimize });
+
+const exe = b.addExecutable(.{
+    .name = "my-app",
+    .root_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "quic", .module = quic_dep.module("quic") }},
+    }),
+});
+```
+
+### High-level API (event loop server)
+
+```zig
+const quic = @import("quic");
+const event_loop = quic.event_loop;
+
+const MyHandler = struct {
+    pub const protocol: event_loop.Protocol = .webtransport;
+
+    pub fn onConnectRequest(_: *MyHandler, session: *event_loop.Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch return;
+    }
+
+    pub fn onStreamData(_: *MyHandler, session: *event_loop.Session, stream_id: u64, data: []const u8, fin: bool) void {
+        if (data.len > 0) {
+            session.sendStreamData(stream_id, data) catch {}; // echo
+        }
+        if (fin) session.closeStream(stream_id);
+    }
+
+    pub fn onDatagram(_: *MyHandler, session: *event_loop.Session, session_id: u64, data: []const u8) void {
+        session.sendDatagram(session_id, data) catch {}; // echo
+    }
+
+    pub fn onSessionReady(_: *MyHandler, _: *event_loop.Session, _: u64) void {}
+    pub fn onSessionClosed(_: *MyHandler, _: *event_loop.Session, _: u64, _: u32, _: []const u8) void {}
+};
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
+
+    var handler = MyHandler{};
+    var server = try event_loop.Server(MyHandler).init(alloc, &handler, .{
+        .port = 4433,
+        .cert_path = "cert.pem",
+        .key_path = "key.pem",
+    });
+    defer server.deinit();
+    try server.run();
+}
+```
+
+### Streaming HTTP/3 responses
+
+An `.h3` server — or a `.webtransport` one, which also takes ordinary requests
+alongside Extended CONNECT — can answer a request in pieces, from any later
+callback on the same loop:
+
+```zig
+pub fn onRequest(self: *MyHandler, session: *event_loop.Session, stream_id: u64, headers: []const qpack.Header) void {
+    session.sendResponseHeaders(stream_id, &.{.{ .name = ":status", .value = "200" }}) catch return;
+    self.pending = .{ .session = session.*, .stream_id = stream_id }; // write the body later
+}
+
+// Later, e.g. from a TCP read callback on the same xev loop:
+try s.sendResponseData(stream_id, chunk);         // one DATA frame
+try s.finishResponse(stream_id, null);            // optional trailers, then FIN
+s.resetRequest(stream_id, @intFromEnum(event_loop.H3Error.internal_error)); // or abort
+```
+
+Pace a large body with `streamSendCapacity(stream_id)` and
+`streamBufferedBytes(stream_id)`, and `notifyWritable(0, stream_id, n)` to get
+`onWritable` once `n` more bytes fit and fewer than `n` wait unsent. Writes made
+outside a server callback go out on the next loop iteration by themselves;
+`server.flush()` sends them at once.
+
+Server lifecycle callbacks, all optional: `onRequest`, `onData`,
+`onRequestEnd(session, stream_id)` (request body complete),
+`onRequestCancelled(session, stream_id, error_code)` (peer RESET_STREAM or
+STOP_SENDING), and `onConnectionClosed(session)` — called once per connection,
+after which its `Session`/`ConnEntry` must not be used. `session.id()` is a
+stable per-connection key. Just before it, `onSessionClosed(session, 0, 0, "")`
+fires too (`abrupt` true in the 6-parameter form), whatever the connection's
+sessions did.
+
+Request headers, and a CONNECT's path, are valid only during their callback:
+every connection on a loop decodes into one buffer, so copy what you keep.
+
+To run beside other I/O, pass `Config.loop` (a `event_loop.Xev.Loop` you own)
+and run it yourself; on teardown call `stop()` and keep running the loop until
+`isStopped()` before `deinit()`. `Client` works the same way. A timer of your
+own on a server's loop (`server.eventLoop()`) should stop re-arming once
+`server.isStopping()` is true. `reuse_port`, `recv_buffer_size`,
+`send_buffer_size`, `max_connections` and `alpn` are on `Config` too, and
+`max_handshakes`: past that many connections still in their handshake (a
+quarter of `max_connections` by default), a new client must answer a Retry
+before it gets any state. `max_handshakes_per_source` (a quarter of
+`max_handshakes`) bounds what one IPv4 address or IPv6 /64 holds even after
+it answers.
+
+Timed work, such as a game's fixed-step ticks, fits `onPass(self, now_ns) ?i64`
+better than a timer of your own. The loop calls it once per pass, after
+dispatching what arrived and before sending, so what it writes shares that
+pass's send batch. It returns the `sys.nanoTimestamp()` by which it next needs a
+pass, or null: the loop wakes for it then, never earlier, and sleeps while
+nothing is due. A deadline that comes up outside the server's callbacks, in a
+WebSocket callback say, goes to `server.wakeAt(ns)`.
+
+### HTTP/1.1 listener: static files and WebSockets
+
+`Config.http1` adds a TCP listener to the server, on the same port as QUIC
+by default (TCP and UDP don't clash) and on the **same event loop**. It
+serves static files and WebSockets (RFC 6455) with the QUIC certificates,
+and advertises HTTP/3 through `Alt-Svc`. A handler's WebSocket callbacks run
+on the loop's thread like its WebTransport ones, so one handler can serve
+both transports without locks: WebSocket as the fallback for browsers or
+networks where WebTransport isn't available.
+
+```zig
+const MyHandler = struct {
+    pub const protocol: event_loop.Protocol = .webtransport;
+
+    // ...WebTransport callbacks as above...
+
+    pub fn onWsUpgrade(_: *MyHandler, req: *event_loop.WsRequest, path: []const u8) void {
+        if (!std.mem.startsWith(u8, path, "/game")) return req.reject(404);
+        const ws = req.accept(.{}) catch return; // 101; `ws` can send right away
+        ws.send("welcome") catch {};
+    }
+
+    pub fn onWsMessage(_: *MyHandler, ws: *event_loop.WsConn, data: []const u8) void {
+        ws.send(data) catch {}; // echo; fragments arrive reassembled
+    }
+
+    // Once per accepted WebSocket: the peer's code, 1006 if the connection
+    // dropped, 1001 on stop(). `ws` is gone after this returns.
+    pub fn onWsClose(_: *MyHandler, _: *event_loop.WsConn, _: u16, _: []const u8) void {}
+};
+
+var server = try event_loop.Server(MyHandler).init(alloc, &handler, .{
+    .port = 4433,
+    .cert_path = "cert.pem",
+    .key_path = "key.pem",
+    .http1 = .{ .static_dir = "public" },
+});
+```
+
+- `onWsUpgrade` gets the request target, query string included. Read
+  request headers with `req.header("origin")`. Call `req.accept(.{
+  .protocol, .headers })` or `req.reject(status)`; a request left undecided
+  gets 403.
+- `onWsMessage` may take a fourth parameter, `kind: event_loop.WsMessageKind`,
+  to tell text from binary.
+- A `*WsConn` is valid until `onWsClose` returns. It has:
+  - `id()`, which comes from the counter behind `Session.id()`, so one map
+    can key both transports;
+  - `send` and `sendText`, which work from any callback on the loop,
+    WebTransport ones included;
+  - `close(code, reason)`;
+  - `bufferedAmount()`;
+  - `peerAddress()`.
+- `send` fails with `error.SendBufferFull` instead of queueing past
+  `max_send_buffer`.
+- `onWsClose` never fires from inside a `WsConn` method.
+
+| Transport | Port | Protocol |
+|-----------|------|----------|
+| UDP | 4433 | QUIC / H3 / WebTransport (TLS 1.3) |
+| TCP | 4433 | HTTP/1.1 static files + WebSocket (TLS 1.3, or plain) |
+
+`Http1Config` options:
+
+| Field | Default | Description |
+|---|---|---|
+| `static_dir` | `null` | Directory GET/HEAD serve from; without one, only WebSockets (other requests get 404) |
+| `port` | same as QUIC | TCP port override |
+| `unix_path` | `null` | Unix socket to listen on instead of `port`, for a proxy on the same host |
+| `alt_svc` | `true` | Send `Alt-Svc: h3=":port"` |
+| `tls` | `true` | `false` serves plain `http://` / `ws://`: for localhost, where a browser can't pin a certificate hash for WebSocket as it can for WebTransport, or behind a TLS-terminating proxy |
+| `max_connections` | `4096` | Open TCP connections past which new ones are closed |
+| `handshake_timeout_ms` | `10000` | TLS handshake plus the first request head |
+| `keepalive_timeout_ms` | `15000` | Idle time between requests |
+| `min_body_rate` | `500` | Bytes/s, over each `stall_timeout_ms`, a request body still arriving must keep up, or the connection is cut. `0` takes any byte. The QUIC server's `Config` has its own, for HTTP/3 |
+| `stall_timeout_ms` | `30000` | That window, and the longest a file or a streamed answer waits for its client to read |
+| `websocket.max_message_size` | 1 MiB | Larger messages close with 1009 |
+| `websocket.max_send_buffer` | 4 MiB | Bytes `send` may leave queued for a slow peer |
+| `websocket.ping_interval_ms` | `30000` | Ping after this much silence; drop (1006) after twice it. `0` disables |
+| `websocket.min_receive_rate` | `500` | Bytes/s under which a peer mid-message, or not reading its output, counts as silent. `0` takes any byte |
+
+`drain()` stops new TCP connections and lets requests in flight finish;
+WebSockets stay open, as WebTransport sessions do. `stop()` sends every
+WebSocket a Close with 1001. `zig build run-ws-echo-server -- --plain`
+echoes both transports from one handler. Against the Autobahn testsuite it
+scores 298 OK and 3 informational out of 301, with nothing failed or
+non-strict. `./tools/autobahn.sh` reruns it, and CI runs it too; see
+[`SPEC/RFC6455_WEBSOCKET.md`](SPEC/RFC6455_WEBSOCKET.md).
+
+### Graceful shutdown
+
+`stop()` sends CONNECTION_CLOSE to every connection, waits out their closing
+period (3×PTO), and `run()` returns. Like the rest of the server it runs on the
+loop thread, so a signal handler or another thread calls `requestStop()`
+instead, which wakes the loop to stop. Signal handling is the application's
+responsibility:
+
+```zig
+const std = @import("std");
+const posix = std.posix;
+const quic = @import("quic");
+
+var server_instance: ?*MyServer = null;
+
+fn handleSignal(_: posix.SIG) callconv(.c) void {
+    if (server_instance) |s| s.requestStop();
+}
+
+pub fn main() !void {
+    // ...
+    var server = try quic.event_loop.Server(MyHandler).init(alloc, &handler, .{ .port = 4433 });
+    defer server.deinit();
+    server_instance = &server;
+    defer server_instance = null; // runs before deinit()
+
+    const act = posix.Sigaction{
+        .handler = .{ .handler = handleSignal },
+        .mask = std.mem.zeroes(posix.sigset_t),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.TERM, &act, null);
+    posix.sigaction(posix.SIG.INT, &act, null);
+
+    try server.run(); // returns once the stop has finished
+}
+```
+
+`stop()` cuts off requests in flight. For an HTTP/3 server, `drain()` is the
+gentler first step (`requestDrain()` from a signal handler): it sends GOAWAY,
+refuses new connections, lets in-flight requests finish and closes each
+connection once it has none left. Wait on `isDrained()` with a deadline of your
+own, from `onPass`, then call `stop()` either way. `Client` has `requestStop()`
+too. With `Config.loop` the loop is yours to wake: call `stop()` from there.
+
+A handler that cannot keep up with a request body — a proxy with a slow
+upstream — can `session.pauseRequestBody(stream_id)` and later
+`resumeRequestBody(stream_id)`. While paused the client is held back by flow
+control, so the server buffers at most one stream window.
+
+### High-level API (event loop client)
+
+The client mirrors the server pattern — define a handler struct, and `Client(Handler)` manages the QUIC handshake, H3/WebTransport setup, and Extended CONNECT automatically:
+
+```zig
+const quic = @import("quic");
+const event_loop = quic.event_loop;
+
+const MyHandler = struct {
+    pub const protocol: event_loop.Protocol = .webtransport;
+
+    pub fn onSessionReady(_: *MyHandler, session: *event_loop.ClientSession, session_id: u64) void {
+        const stream_id = session.openBidiStream(session_id, null) catch return; // null = no sendOrder
+        session.sendStreamData(stream_id, "Hello!") catch {};
+        session.closeStream(stream_id);
+
+        session.sendDatagram(session_id, "Hello via datagram!") catch {};
+    }
+
+    pub fn onStreamData(_: *MyHandler, session: *event_loop.ClientSession, stream_id: u64, data: []const u8, _: bool) void {
+        if (data.len == 0) return;
+        std.debug.print("Response on stream {d}: {s}\n", .{ stream_id, data });
+        session.closeConnection();
+    }
+
+    pub fn onDatagram(_: *MyHandler, session: *event_loop.ClientSession, session_id: u64, data: []const u8) void {
+        std.debug.print("Datagram: {s}\n", .{data});
+        _ = session_id;
+    }
+};
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
+
+    var handler = MyHandler{};
+    var client = try event_loop.Client(MyHandler).init(alloc, &handler, .{
+        .address = "127.0.0.1",
+        .port = 4433,
+        .server_name = "localhost",
+        .ca = .{ .file = "ca.crt" },
+    });
+    defer client.deinit();
+    try client.run();
+}
+```
+
+`ClientConfig` options:
+
+| Field | Default | Description |
+|---|---|---|
+| `address` | `"127.0.0.1"` | Server IP address |
+| `port` | `4433` | Server port |
+| `server_name` | `"localhost"` | TLS SNI / CONNECT authority |
+| `path` | `"/.well-known/webtransport"` | WebTransport CONNECT path |
+| `ca` | `.system` | Trust anchors: `.system` (the platform's store, loaded once per process), `.file` (a PEM bundle), or `.pinned_hashes` (SHA-256 leaf fingerprints, the `serverCertificateHashes` equivalent). A server whose chain ends at none of them is refused |
+| `skip_cert_verify` | `false` | Accept any certificate, whatever `ca` says (testing only) |
+| `max_datagram_frame_size` | `65536` | QUIC datagram frame size limit |
+| `wt_credits` | QUIC's own limits | draft-13 §5.6 session credit granted to the peer, per session: `.max_streams_bidi`, `.max_streams_uni`, `.max_data` |
+| `wt_advertise_credits` | `false` | Also announce those credits in SETTINGS (§5.5). Off: Safari 26.4 refuses the session when it sees them |
+| `ipv6` | `false` | Use IPv6 dual-stack socket |
+| `tls_config` | `null` | Override TLS config directly |
+| `conn_config` | `null` | Override QUIC connection config |
+
+Handler callbacks (all optional):
+
+| Callback | Description |
+|---|---|
+| `onConnected(session)` | QUIC handshake complete |
+| `onSessionReady(session, session_id)` | WebTransport session established |
+| `onSessionRejected(session, session_id, status)` | Server rejected CONNECT. `status` is empty when it reset the CONNECT stream instead of answering |
+| `onStreamData(session, stream_id, data[, fin])` | Data received on a stream |
+| `onDatagram(session, session_id, data)` | Datagram received |
+| `onBidiStream(session, session_id, stream_id)` | Incoming bidi stream opened |
+| `onUniStream(session, session_id, stream_id)` | Incoming uni stream opened |
+| `onStreamReset(session, session_id, stream_id, error_code)` | Peer reset a stream — the `WebTransportError.streamErrorCode` equivalent |
+| `onStopSending(session, session_id, stream_id, error_code)` | Peer asked us to stop sending on a stream |
+| `onWritable(session, session_id, stream_id)` | The peer's credit now fits what `notifyWritable` asked for — the `writer.ready` equivalent. `stream_id` is null for a session-wide wait |
+| `onSessionClosed(session, session_id, error_code, reason[, abrupt])` | Session closed: the code and reason of a close capsule (ours or the peer's), or 0 and `""` for a bare FIN on the CONNECT stream. `abrupt` is true when the peer reset or stopped that stream instead, or sent a malformed capsule — what makes a browser reject `closed` |
+| `onSessionDraining(session, session_id)` | Session draining |
+| `onPollComplete(session)` | Called each poll cycle |
+
+Writes are never refused for want of the peer's credit: `sendStreamData`
+buffers. Check `sendCapacity(session_id)` or `streamSendCapacity(stream_id)`
+before writing much, and call `notifyWritable(session_id, stream_id, n)` to
+hear when `n` bytes fit — the session form (`stream_id = null`) is for opening
+a stream per message.
+
+### Low-level API (direct connection control)
+
+```zig
+const quic = @import("quic");
+
+// Client
+var conn = try quic.connection.connect(allocator, "example.com", .{}, tls_config, null);
+defer conn.deinit();
+
+// Send/receive loop
+var out: [1500]u8 = undefined;
+const n = conn.send(&out) catch 0;
+// sendto(sockfd, out[0..n], ...)
+// recvfrom(...) -> buf
+conn.handleDatagram(buf[0..len], recv_info);
+```
+
+## Building
+
+Requires **Zig 0.17.1**.
+
+```bash
+zig build
+```
+
+Produces binaries in `zig-out/bin/`:
+
+| Binary | Description |
+|--------|-------------|
+| `server` | HTTP/3 echo server (127.0.0.1:4434) |
+| `client` | HTTP/3 client |
+| `wt-server` | WebTransport echo server |
+| `wt-client` | WebTransport client |
+| `wt-browser-server` | WebTransport server for browser clients (0.0.0.0:4433) |
+| `ws-echo-server` | WebSocket and WebTransport echo from one handler (`--plain` for ws://) |
+| `moq-server` | MoQ Transport publisher over raw QUIC (ALPN `moqt-18`/`moqt-17`) |
+| `moq-client` | MoQ Transport client over raw QUIC — subscribe or `--mode publish` |
+| `moq-relay` | MoQ Transport relay, WebTransport and raw QUIC on one port; serves the browser demos |
+| `moq-test-client` | MoQ interop-runner test client (TAP 14) |
+| `moq-lite` | moq-lite client: `publish`, `subscribe`, `announce`, `serve` |
+| `moq-lite-relay` | moq-lite relay over WebTransport |
+| `interop-server` | QUIC Interop Runner server endpoint |
+| `interop-client` | QUIC Interop Runner client endpoint |
+| `interop-wt-server` | QUIC Interop Runner WebTransport server |
+
+Hardware AES is chosen when the binary is built, not when it runs. A build
+for another machine (`-Dtarget=x86_64-linux-gnu`) targets a baseline CPU
+without AES instructions, so TLS falls back to ChaCha20 in software; the
+server warns about it at startup. Name the deployment CPU, e.g.
+`-Dcpu=x86_64_v3+aes+pclmul` or `-Dcpu=neoverse_n1`.
+
+## Running Tests
+
+```bash
+zig build test
+```
+
+## Interop Testing
+
+### Local
+
+Bidirectional interop is verified against [quic-go](https://github.com/quic-go/quic-go) and [quiche](https://github.com/cloudflare/quiche) across QUIC, HTTP/3, and WebTransport. Browser WebTransport (Chrome) is also tested.
+
+An automated test script covers all combinations:
+
+```bash
+./interop/run_local_tests.sh
+```
+
+Or run individual tests manually:
+
+```bash
+# Build Go interop programs
+cd interop/quic-go
+go build -o h3server_bin ./h3server && go build -o h3client_bin ./h3client
+go build -o wt_server_bin ./wt_server && go build -o wt_client_bin ./wt_client
+
+# H3: Zig server ↔ Go client
+zig-out/bin/server &
+./interop/quic-go/h3client_bin --addr localhost:4434
+
+# WebTransport: Zig server ↔ Go client
+zig-out/bin/wt-server &
+./interop/quic-go/wt_client_bin --addr localhost:4434
+
+# Browser WebTransport (requires ECDSA cert)
+cd interop/browser && ./generate-cert.sh
+zig build run-wt-browser-server
+# Open interop/browser/index.html in Chrome
+```
+
+### QUIC Interop Runner
+
+This project integrates with the official [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner), the framework used by all major QUIC implementations for cross-implementation testing.
+
+**Prerequisites:**
+
+- Docker (with `docker compose` v2)
+- Python 3
+- [Wireshark](https://www.wireshark.org/) >= 4.5.0 (`tshark` must be in PATH)
+
+**Setup:**
+
+```bash
+# Initialize the interop runner submodule
+git submodule update --init interop/quic-interop-runner
+
+# Install Python dependencies
+pip3 install -r interop/quic-interop-runner/requirements.txt
+```
+
+**Run tests:**
+
+```bash
+# Handshake test (quic-zig ↔ quic-zig)
+./interop/runner/run.sh handshake
+
+# Multiple tests
+./interop/runner/run.sh handshake,transfer,retry
+
+# Test against another implementation (e.g. quic-go)
+./interop/runner/run.sh handshake quic-go
+```
+
+The script builds a Docker image (`quic-zig-interop:latest`), injects it into the runner's implementation list, and executes the tests.
+
+**Manual Docker build:**
+
+```bash
+docker build --platform linux/amd64 \
+  -t quic-zig-interop:latest \
+  -f interop/runner/Dockerfile .
+```
+
+## Media over QUIC
+
+Two dialects, because the standards track and the deployed ecosystem have not
+converged yet. They share the transport underneath and nothing above it — most
+of all, moq-lite uses the QUIC varint where draft-17 uses a leading-ones one.
+
+| | Module | Spec |
+|---|---|---|
+| IETF MoQ Transport draft-17 and draft-18 | `src/moq/`, `quic.moq` | [DRAFT_IETF_MOQ_TRANSPORT.md](./SPEC/DRAFT_IETF_MOQ_TRANSPORT.md) |
+| moq-lite draft-05 | `src/moq/lite/`, `quic.moq.lite` | [DRAFT_LCURLEY_MOQ_LITE_05.md](./SPEC/DRAFT_LCURLEY_MOQ_LITE_05.md) |
+
+Interop with the [MoQ interop runner](https://github.com/englishm/moq-interop-runner):
+[SPEC/moq-interop.md](./SPEC/moq-interop.md), results in
+[SPEC/moq-interop-results.md](./SPEC/moq-interop-results.md).
+
+### moq-lite
+
+```bash
+zig build run-moq-lite-relay -- --port 4450
+zig build run-moq-lite -- publish   --url https://127.0.0.1:4450/ \
+    --broadcast clock --track seconds --tls-disable-verify
+zig build run-moq-lite -- subscribe --url https://127.0.0.1:4450/ \
+    --broadcast clock --track seconds --tls-disable-verify
+```
+
+Against the reference implementation (`cargo install moq-relay moq-clock`), in
+both directions and across a relay that speaks lite-05 to us and lite-04 to
+them. `interop/browser/moq_lite.html` is a standalone JS subscriber;
+`tools/moq_lite_browser_test.mjs` drives it through Chrome.
+
+### MoQ interop test client
+
+```bash
+zig build run-moq-test-client -- --relay moqt://127.0.0.1:4455/ --tls-disable-verify
+tools/moq_interop.sh          # matrix -> SPEC/moq-interop-results.md
+```
+
+### Live browser video demo
+
+Two Chrome/Brave tabs — one publishing from webcam, the other (or many others) subscribing:
+
+```bash
+cd interop/browser && ./generate-cert.sh   # once, short-lived ECDSA cert
+zig build run-moq-relay                    # Zig MoQ relay on :4433
+# Open https://127.0.0.1:4433/moq_video.html in two tabs.
+# Paste the cert SHA-256 hash from the server's startup banner.
+# Tab A: "Start Publishing (camera)"   Tab B: "Start Subscribing"
+```
+
+Flow: browser camera → `VideoEncoder` (VP8 @ 1 Mbps) → MoQ objects over
+WebTransport uni streams → Zig relay parses the subgroup header, remaps
+`track_alias`, fans out to each subscriber's WT session → browser `VideoDecoder`
+→ `<canvas>`. No external MoQ library anywhere in the stack. Tested with 6
+simultaneous subscribers on one publisher.
+
+### Raw-QUIC MoQ (non-browser, ALPN `moqt-17`)
+
+```bash
+zig build run-moq-relay                                                          # :4443
+zig build run-moq-client -- --addr 127.0.0.1:4443 --ns live --track camera --mode publish
+zig build run-moq-client -- --addr 127.0.0.1:4443 --ns live --track camera       # subscribe
+```
+
+### Library API
+
+```zig
+const quic = @import("quic");
+const wire = quic.moq.wire;         // draft-17 leading-ones varint, KV codec, tuples
+const msg = quic.moq.message;       // all 18 control messages, encode and decode
+const obj = quic.moq.object;        // subgroup/datagram/fetch stream headers
+const track = quic.moq.track;       // TrackNamespace, FilterType, GroupOrder, …
+const session = quic.moq.session;   // SETUP + request-stream state machine
+const url = quic.moq.url;           // moqt:// and https:// relay locators
+
+const lite = quic.moq.lite;         // moq-lite: QUIC varints, its own messages
+```
+
+Apps that don't reference `quic.moq` don't link any MoQ code — Zig's lazy
+semantic analysis strips unused subtrees at compile time.
+
+## License
+
+MIT License

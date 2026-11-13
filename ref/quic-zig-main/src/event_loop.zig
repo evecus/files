@@ -1,0 +1,8964 @@
+const std = @import("std");
+const posix = std.posix;
+const builtin = @import("builtin");
+const log = std.log.scoped(.event_loop);
+const sys = @import("sys.zig");
+const net = @import("sockaddr.zig");
+const io_compat = @import("io_compat.zig");
+
+const xev_backend = @import("xev_backend.zig");
+const xev = xev_backend.xev;
+const halted_poll_action = xev_backend.halted_poll_action;
+const forgetPollResult = xev_backend.forgetPollResult;
+const cancelCompletion = xev_backend.cancelCompletion;
+
+/// The libxev backend this build selected. A caller sharing one loop across
+/// several clients has to create it from here: on Linux this is `Epoll`, not
+/// what a bare `@import("xev")` gives you, and the two are different types.
+pub const Xev = xev;
+
+const connection = @import("quic/connection.zig");
+const connection_manager = @import("quic/connection_manager.zig");
+pub const ConnEntry = connection_manager.ConnEntry;
+pub const MovedCids = connection_manager.MovedCids;
+pub const SourceFilter = connection_manager.SourceFilter;
+const stream_mod = @import("quic/stream.zig");
+const tls13 = @import("quic/tls13.zig");
+const ja4 = @import("tls/ja4.zig");
+const ecn_socket = @import("quic/ecn_socket.zig");
+const h3 = @import("h3/connection.zig");
+const http = @import("http/exchange.zig");
+const Mailbox = @import("mailbox.zig").Mailbox;
+
+/// Packets of one send burst per clock read. A read for each packet was 3-6%
+/// of a busy server's CPU; this keeps sent times, and so RTT samples, within
+/// microseconds of the wire. A flush is a syscall, so one is followed by a read.
+const packets_per_clock_read = 16;
+const h0 = @import("h0/connection.zig");
+const http1 = @import("http1/server.zig");
+const qpack = @import("h3/qpack.zig");
+const h3_frame = @import("h3/frame.zig");
+const wt = @import("webtransport/session.zig");
+const wt_fc = @import("webtransport/flow_control.zig");
+const transport_params = @import("quic/transport_params.zig");
+const packet = @import("quic/packet.zig");
+const quic_lb = @import("quic/quic_lb.zig");
+const stateless_reset = @import("quic/stateless_reset.zig");
+const Certificate = std.crypto.Certificate;
+const ca_bundle = @import("quic/ca_bundle.zig");
+
+pub const Protocol = enum { quic, h3, h0, webtransport };
+
+/// HTTP/3 error codes, for `Session.resetRequest` and `onRequestCancelled`.
+pub const H3Error = h3.H3Error;
+
+fn nowMs() i64 {
+    return @divTrunc(sys.nanoTimestamp(), std.time.ns_per_ms);
+}
+
+pub const Http1Config = http1.Config;
+pub const Http1WebSocketConfig = http1.WebSocketConfig;
+
+/// A WebSocket upgrade request, handed to `onWsUpgrade`; see `http1.WsRequest`.
+pub const WsRequest = http1.WsRequest;
+/// An open WebSocket; see `http1.WsConn`.
+pub const WsConn = http1.WsConn;
+pub const WsAcceptOptions = http1.WsAcceptOptions;
+pub const WsSendError = http1.WsSendError;
+/// A WebSocket on its way to another server; see `WsConn.handOver`.
+pub const WsHandover = http1.WsHandover;
+/// A plain GET or HEAD on the HTTP/1.1 listener, for `onHttpRequest`.
+pub const HttpRequest = http1.HttpRequest;
+/// An HTTP/1.1 connection the handler serves itself, for `onRawOpen`.
+pub const RawConn = http1.RawConn;
+pub const RawError = http1.RawError;
+/// A request the handler answers later, for `onHttpExchange`.
+pub const HttpExchange = http1.HttpExchange;
+/// A request offered at its head with its body streamed, over HTTP/1.1 and
+/// HTTP/3 alike, for `onHttpHead`; see `http/exchange.zig`.
+pub const Exchange = http.Exchange;
+pub const WsMessageKind = http1.WsMessageKind;
+pub const WsCloseCode = http1.WsCloseCode;
+
+/// The largest datagram we can receive whole. It has to be whatever we tell
+/// peers they may send — a longer one is truncated by recvmsg and then fails
+/// AEAD authentication, which reads as a decryption bug rather than a short
+/// read. Safari fills the 16 KB loopback MTU and found that the hard way.
+const MAX_RECV_DATAGRAM: usize = (transport_params.TransportParams{}).max_udp_payload_size;
+
+/// Datagrams read in one pass before connections get their turn, so a flood
+/// that keeps the socket full can't hold off timers and sends. Small under
+/// test, where the OS default receive buffer holds only a few hundred.
+const max_recv_per_pass: usize = if (builtin.is_test) 64 else 1024;
+
+/// A nonblocking UDP socket bound to `addr`.
+fn bindUdp(addr: net.Address, options: sys.UdpSocketOptions) !posix.socket_t {
+    const fd = try sys.udpSocket(addr.any.family, options);
+    errdefer sys.close(fd);
+    try sys.bind(fd, &addr.any, addr.getOsSockLen());
+    return fd;
+}
+
+pub const Config = struct {
+    address: []const u8 = "127.0.0.1",
+    port: u16 = 4433,
+    cert_path: []const u8 = "interop/certs/server.crt",
+    key_path: []const u8 = "interop/certs/server.key",
+    max_datagram_frame_size: u64 = 65536,
+    webtransport_max_sessions: u64 = 4,
+    /// draft-ietf-webtrans-http3-13 §5.3-§5.6 session flow control: the window
+    /// each session grants its peer, handed over as a WT_MAX_STREAMS /
+    /// WT_MAX_DATA capsule when the session opens and raised as the peer
+    /// spends it.
+    ///
+    /// A zero grants nothing, which stops a draft-13 peer opening any stream at
+    /// all. Peers that never sent the draft-13 WT_MAX_SESSIONS get no capsules
+    /// and no limits either way; see `webtransport.flowControlEnabled`.
+    wt_credits: wt_fc.Credits = wt_fc.Credits.default,
+
+    /// Also announce those windows in SETTINGS, as §5.5 allows, so a peer may
+    /// open a stream in the same flight as its CONNECT rather than waiting for
+    /// the capsule.
+    ///
+    /// Off, because it costs a live browser: Safari 26.4 rejects the session
+    /// outright — every scenario, `connect-echo` included — when
+    /// SETTINGS_WT_INITIAL_MAX_DATA / _STREAMS_BIDI / _UNI (0x2b61, 0x2b65,
+    /// 0x2b64) are present, and goes back to passing when they are not.
+    /// Measured both ways; `WT_SETTINGS_CREDITS=1` on `wpt-server` reproduces it.
+    /// Nothing is lost meanwhile: the per-session capsule carries the same
+    /// credit to every peer that implements §5.6.
+    wt_advertise_credits: bool = false,
+
+    /// Also advertise the pre-draft-13 WebTransport settings
+    /// (ENABLE_WEBTRANSPORT, WT_ENABLED, the old WT_MAX_SESSIONS codepoint).
+    /// Chrome and Firefox read those; Safari 26.4 reads only the draft-13 ones,
+    /// which are always sent.
+    wt_legacy_settings: bool = true,
+
+    /// Close a connection once the WebTransport sessions it carried are all
+    /// over and no HTTP/3 request is open: GOAWAY, then CONNECTION_CLOSE with
+    /// H3_NO_ERROR when the peer has ended its CONNECT streams and acked our
+    /// last capsules, or 3 PTO on; see `WebTransportConnection.closeIfUnused`.
+    ///
+    /// On, because browsers never reuse such a connection: each WebTransport
+    /// object gets one of its own, and Chrome leaves without a
+    /// CONNECTION_CLOSE, so every session would otherwise hold its connection
+    /// (and a `max_connections` place) for the idle timeout. Off suits a
+    /// client known to pool sessions and plain requests on one connection;
+    /// it then idles out instead. Either way a client sending a request just
+    /// as it closes learns from the GOAWAY that it was not processed.
+    wt_close_after_sessions: bool = true,
+
+    /// Answer every new client with Retry (RFC 9000 8.1.2): it must echo
+    /// the token from its own address before the server keeps any state.
+    /// Costs every client a round trip; see `retry_threshold`.
+    require_retry: bool = false,
+
+    /// Retry new clients only once this many connections are live, so a
+    /// loaded server gives state only to clients that proved their address
+    /// and an idle one costs nothing extra. Below it, clients still echoing
+    /// a Retry are served as such. `Server.setRequireRetry` covers load
+    /// signals of the embedder's own.
+    ///
+    /// Servers behind one port (`reuse_port`) should share `retry_token_key`,
+    /// or a token is only good at the server that issued it.
+    retry_threshold: ?usize = null,
+
+    /// `ConnectionConfig.max_ack_delay` for every connection: how long a
+    /// client's packet may wait for our ACK. Ignored when `conn_config` is
+    /// set.
+    max_ack_delay: u14 = 25,
+    /// `ConnectionConfig.ack_bytes_threshold` for every connection. Ignored
+    /// when `conn_config` is set.
+    ack_bytes_threshold: u32 = 0,
+    /// `ConnectionConfig.request_ack_frequency` for every connection: ask
+    /// clients that support it for fewer ACKs. Ignored when `conn_config`
+    /// is set.
+    request_ack_frequency: bool = true,
+    /// `ConnectionConfig.datagrams_before_streams` for every connection:
+    /// datagrams are not held behind a backlogged stream. Ignored when
+    /// `conn_config` is set.
+    datagrams_before_streams: bool = false,
+    /// `ConnectionConfig.max_idle_timeout` for every connection, in
+    /// milliseconds. Ignored when `conn_config` is set.
+    max_idle_timeout: u64 = 30_000,
+    /// Bytes per second, over each `stall_timeout_ms`, an HTTP/3 request
+    /// body still arriving must keep up, or its stream is reset: for a
+    /// handler that takes requests at their head (`onHttpHead`). Zero
+    /// takes any byte.
+    min_body_rate: u32 = 500,
+    /// The window `min_body_rate` is held over, and the longest such a
+    /// handler's answer waits for its client to make room for more.
+    stall_timeout_ms: u32 = 30_000,
+
+    // Advanced: provide pre-built TLS and connection configs directly.
+    // When tls_config is set, cert_path/key_path are ignored.
+    tls_config: ?tls13.TlsConfig = null,
+    conn_config: ?connection.ConnectionConfig = null,
+    retry_token_key: ?[16]u8 = null,
+    /// Key for stateless reset tokens (RFC 9000 §10.3.2). Null draws a
+    /// random one, whose tokens die with the server. A key shared by
+    /// servers a packet can reach in place of its connection's owner lets
+    /// any of them give that connection's token away (§21.11), so under
+    /// `reuse_port` they send no resets unless `foreign_datagram` steers
+    /// packets home. Servers sharing a key some other way must route by
+    /// CID themselves.
+    static_reset_key: ?[16]u8 = null,
+    /// With `static_reset_key` null, derive it from the TLS private key and
+    /// the bound UDP port (`stateless_reset.deriveKey`) instead of drawing
+    /// one. A server restarted on that port with that key then resets the
+    /// connections its last run left in a way their clients recognise, and
+    /// every server on the port derives the same key, as a shared one.
+    /// Two processes serving one port at once would reset each other's
+    /// connections.
+    derive_reset_key: bool = false,
+
+    // Use IPv6 dual-stack socket (supports both IPv4 and IPv6)
+    ipv6: bool = false,
+
+    /// A bound, non-blocking UDP socket to serve on instead of opening one.
+    /// The server owns it once `init` succeeds; on failure it is left open
+    /// for the caller. `address`, `port`, `ipv6`, `reuse_port` and the
+    /// buffer sizes are not applied to it. Lets a replacement server take
+    /// over a socket it could not bind itself: after dropping privileges,
+    /// say, or while an SO_REUSEPORT group is held by another user.
+    socket: ?posix.socket_t = null,
+
+    // Optional second port for preferred_address (connectionmigration).
+    // When set, a second socket is created on this port so that clients
+    // migrating to the server's preferred address can reach us.
+    preferred_port: ?u16 = null,
+
+    /// An HTTP/1.1 listener on TCP beside QUIC on UDP, on the same port by
+    /// default (TCP and UDP are separate namespaces) and the same loop:
+    /// the handler's `onHttpRequest` and static files from `static_dir`,
+    /// WebSockets through its `onWsUpgrade` / `onWsMessage` / `onWsClose`,
+    /// connections it serves itself through `onRawOpen` / `onRawData` /
+    /// `onRawClose`, TLS with the QUIC certificates, and Alt-Svc
+    /// advertising HTTP/3.
+    /// Required when the handler declares `onWsUpgrade`.
+    http1: ?Http1Config = null,
+
+    /// ALPN protocols offered in the handshake when the server loads its
+    /// certificate from `cert_path`/`key_path`. Null means `{"h3"}`. The
+    /// strings are borrowed and must outlive the server. Ignored when
+    /// `tls_config` is set: its own `alpn` applies.
+    alpn: ?[]const []const u8 = null,
+
+    /// Live connections past which new ones are refused with
+    /// CONNECTION_REFUSED.
+    max_connections: usize = connection_manager.ConnectionManager.DEFAULT_MAX_CONNECTIONS,
+
+    /// Connections still in their handshake past which a new client must
+    /// first answer a Retry, so a flood of Initials from spoofed addresses
+    /// costs no state and leaves room for real clients. Null is a quarter of
+    /// `max_connections`.
+    max_handshakes: ?usize = null,
+
+    /// Handshakes one source (an IPv4 address or an IPv6 /64) may hold open
+    /// once it has proven its address, so a host that answers every Retry
+    /// still cannot fill `max_connections` alone. Past it, that source's
+    /// new Initials are dropped until one of its handshakes ends. Null is a
+    /// quarter of `max_handshakes`.
+    max_handshakes_per_source: ?usize = null,
+
+    /// Asked for each Initial that would open a connection, before Retry or
+    /// any decryption: false drops it without a reply. For a denylist of
+    /// the embedder's own; established connections are not affected.
+    source_filter: ?SourceFilter = null,
+
+    /// Server-wide cap, per second, on each kind of reply sent without
+    /// connection state: Version Negotiation, stateless reset and
+    /// CONNECTION_REFUSED, budgeted separately. Each is triggerable with a
+    /// spoofed source address. Zero sends none.
+    stateless_reply_rate: u32 = 200,
+
+    /// SO_REUSEPORT on the UDP socket(s), so several servers — one per worker
+    /// thread, each on its own loop — can bind the same port and let the
+    /// kernel spread peers across them.
+    ///
+    /// The kernel balances by 4-tuple (Linux) and knows nothing of QUIC, so a
+    /// peer that migrates can land on a worker that does not have its
+    /// connection; it gets a stateless reset unless `quic_lb` and
+    /// `foreign_datagram` steer it back to the owner.
+    reuse_port: bool = false,
+
+    /// QUIC-LB CID encoding (draft-ietf-quic-load-balancers): every CID this
+    /// server issues — the handshake SCID and each NEW_CONNECTION_ID —
+    /// carries `server_id`. Applied on top of `conn_config` when both are set.
+    /// Servers that steer to each other share everything but `server_id`.
+    quic_lb: ?quic_lb.Config = null,
+
+    /// Called for a Handshake or 1-RTT datagram whose DCID is not ours but
+    /// decodes, under `quic_lb`, to another server id: a peer of a sibling
+    /// server that migrated onto this socket. Without it such a datagram
+    /// gets a stateless reset. Requires `quic_lb`.
+    ///
+    /// Runs on this server's loop thread, during its receive pass. The hook
+    /// copies the bytes (they are only valid for the call), moves them to the
+    /// owner's thread — a queue plus an `xev.Async`, say — and there calls
+    /// the owner's `injectDatagram`. Initials are never reported: whichever
+    /// server receives one accepts the connection, or while it drains offers
+    /// it to `new_while_draining`.
+    foreign_datagram: ?ForeignDatagramHook = null,
+
+    /// While this server drains (from `drain()` until `stop()`), offered each
+    /// new connection's first datagram before it is refused. Return true once
+    /// it is on its way to a server still taking connections, which takes it
+    /// in through `injectDatagram`; false refuses it, as without the hook.
+    /// `server_id` is empty, and the bytes are valid only for the call.
+    ///
+    /// Under `reuse_port` the kernel goes on giving a draining server its
+    /// share of new peers, so a reload that starts servers beside the old
+    /// ones would refuse those for as long as the old ones drain; this lets
+    /// them go to a new one. A datagram that came in through `injectDatagram`
+    /// is never offered, so draining servers can't pass one back and forth.
+    /// The peer's later packets carry its new server's connection ids, which
+    /// `foreign_datagram` steers.
+    new_while_draining: ?NewDatagramHook = null,
+
+    /// The CIDs of connections handed between the servers on this port,
+    /// shared by all of them: with it, `Session.handOver` moves a connection
+    /// to a sibling server and `adopt` takes one in. Requires
+    /// `foreign_datagram`, which carries the moved connections' packets to
+    /// their new owner, and `static_reset_key` or `derive_reset_key`: every
+    /// server must share the key for a connection's reset tokens to hold
+    /// wherever it goes. The
+    /// servers must also share `tls_config`, whose material a connection
+    /// keeps pointing into.
+    moved_cids: ?*MovedCids = null,
+
+    /// Connection ids this server hands out are `id_base` + 1, + 2, …:
+    /// servers that hand connections to each other give each a range of its
+    /// own, so an id stays unique wherever its connection goes. WebSocket
+    /// ids are drawn from the same counter.
+    id_base: u64 = 0,
+
+    /// SO_RCVBUF / SO_SNDBUF for the UDP socket(s). Null keeps the OS default,
+    /// which is small for a busy server (~200 KB on Linux); several MB avoids
+    /// drops under bursts. The kernel may clamp it (`net.core.rmem_max`).
+    recv_buffer_size: ?u32 = null,
+    send_buffer_size: ?u32 = null,
+
+    /// An event loop to join rather than create, so the server can share one
+    /// thread with other I/O — TCP listeners, upstream connections, clients.
+    /// The caller owns the loop and runs it; `run()` is only for a server
+    /// that owns its loop, and `stop()` never stops a loop it joined.
+    ///
+    /// The loop outlives the server, so the server's completions have to be
+    /// off it before `deinit()`: call `stop()`, then keep running the loop
+    /// until `isStopped()`.
+    loop: ?*xev.Loop = null,
+};
+
+/// A datagram a server received for a connection another server owns; see
+/// `Config.foreign_datagram`.
+pub const ForeignDatagram = struct {
+    /// The whole UDP payload, valid only for the duration of the hook.
+    bytes: []const u8,
+    peer: posix.sockaddr.storage,
+    /// The receiving socket's address. Under SO_REUSEPORT it is the owner's
+    /// too, so hand it to `injectDatagram` unchanged.
+    local: posix.sockaddr.storage,
+    ecn: u2,
+    /// The QUIC-LB server id the DCID decodes to, `quic_lb.server_id_len`
+    /// bytes. Nothing checks that such a server exists: the hook drops
+    /// what it cannot route. Empty for `Config.new_while_draining`.
+    server_id: []const u8,
+};
+
+pub const ForeignDatagramHook = struct {
+    ctx: ?*anyopaque = null,
+    func: *const fn (ctx: ?*anyopaque, datagram: *const ForeignDatagram) void,
+};
+
+/// `Config.new_while_draining`: true when another server takes the datagram.
+pub const NewDatagramHook = struct {
+    ctx: ?*anyopaque = null,
+    func: *const fn (ctx: ?*anyopaque, datagram: *const ForeignDatagram) bool,
+};
+
+/// A connection on its way from one server to another: from the old one's
+/// `onHandover` to the new one's `adopt`, on the new one's thread. See
+/// `Session.handOver`. It must reach exactly one `adopt`, or `discard`.
+pub const Handover = struct {
+    entry: *ConnEntry,
+    moved: *MovedCids,
+
+    /// The connection's id, which it keeps on the new server.
+    pub fn id(self: Handover) u64 {
+        return self.entry.id;
+    }
+
+    /// Free a connection no server will adopt — one still queued when the
+    /// server it was going to stops — without a word to the peer. Its CIDs
+    /// leave `MovedCids`, so its next packet draws a stateless reset.
+    pub fn discard(self: Handover) void {
+        const entry = self.entry;
+        self.moved.abandon(entry);
+        const alloc = entry.conn.allocator;
+        connection_manager.destroyProtocols(alloc, entry.wt_conn, entry.h3_conn, entry.h0_conn);
+        entry.finished_streams.deinit(alloc);
+        entry.conn.deinit();
+        alloc.destroy(entry.conn);
+        alloc.destroy(entry);
+    }
+};
+
+/// Session wraps a ConnEntry and provides convenience methods for sending data.
+///
+/// The entry pointer is stable from the first callback that hands it out
+/// until `onConnectionClosed`, so a handler may keep it — or a copy of the
+/// Session — across loop iterations and write from other callbacks on the same
+/// loop. After `onConnectionClosed` the entry is freed.
+///
+/// Writes made from outside a Server callback (a TCP read callback on a shared
+/// loop, say) are sent on the next loop iteration without any further call;
+/// `Server.flush()` sends them immediately. Sessions are not thread-safe: use
+/// them only from the thread running the server's loop.
+pub const Session = struct {
+    entry: *ConnEntry,
+
+    /// This connection's id: unique within the server, never reused.
+    pub fn id(self: *const Session) u64 {
+        return self.entry.id;
+    }
+
+    /// The client's verified certificate (DER leaf), when the certificate
+    /// entry SNI selected has `client_auth` and the client sent one.
+    pub fn peerCertificate(self: *const Session) ?[]const u8 {
+        return self.entry.conn.peerCertificate();
+    }
+
+    /// The client-auth policy this connection's handshake ran under.
+    pub fn clientAuth(self: *const Session) ?*const tls13.ClientAuth {
+        return self.entry.conn.clientAuth();
+    }
+
+    /// The JA4 fingerprint of the client's ClientHello, when
+    /// `TlsConfig.fingerprint_filter` is set.
+    pub fn fingerprint(self: *const Session) ?ja4.Ja4 {
+        return self.entry.conn.fingerprint();
+    }
+
+    // --- H3 methods (also for ordinary requests on a WebTransport server) ---
+
+    /// A whole response: headers, `body` as one DATA frame, FIN.
+    pub fn sendResponse(self: *Session, stream_id: u64, headers: []const qpack.Header, body: []const u8) !void {
+        const h3c = self.entry.h3_conn orelse return error.NoH3Connection;
+        defer self.entry.wake();
+        try h3c.sendResponse(stream_id, headers, body);
+    }
+
+    /// Response headers without ending the stream: a 1xx, or the final
+    /// response's headers ahead of a streamed body. Fails with
+    /// `error.ResponseHeadersAlreadySent` after the final headers; trailers
+    /// go through `finishResponse`.
+    pub fn sendResponseHeaders(self: *Session, stream_id: u64, headers: []const qpack.Header) !void {
+        const h3c = self.entry.h3_conn orelse return error.NoH3Connection;
+        defer self.entry.wake();
+        try h3c.sendResponseHeaders(stream_id, headers);
+    }
+
+    /// One DATA frame of response body. Empty data writes nothing. Buffered
+    /// in full regardless of flow control; pace with `notifyWritable`.
+    /// Fails with `error.ResponseHeadersNotSent` before the final headers.
+    pub fn sendResponseData(self: *Session, stream_id: u64, data: []const u8) !void {
+        const h3c = self.entry.h3_conn orelse return error.NoH3Connection;
+        defer self.entry.wake();
+        try h3c.sendResponseData(stream_id, data);
+    }
+
+    /// End the response with optional trailers, then FIN. Fails with
+    /// `error.ResponseHeadersNotSent` before the final headers.
+    pub fn finishResponse(self: *Session, stream_id: u64, trailers: ?[]const qpack.Header) !void {
+        const h3c = self.entry.h3_conn orelse return error.NoH3Connection;
+        defer self.entry.wake();
+        try h3c.finishResponse(stream_id, trailers);
+    }
+
+    /// Abort a request stream in both directions (RESET_STREAM +
+    /// STOP_SENDING) with an HTTP/3 error code, e.g.
+    /// `@intFromEnum(H3Error.internal_error)` or `.request_cancelled`.
+    pub fn resetRequest(self: *Session, stream_id: u64, error_code: u64) void {
+        const h3c = self.entry.h3_conn orelse return;
+        h3c.cancelRequest(stream_id, error_code);
+        self.entry.wake();
+    }
+
+    /// Stop delivering `stream_id`'s request body: no more `onData` or
+    /// `onRequestEnd` for it until `resumeRequestBody`. Unlike buffering in
+    /// the handler, this pushes back on the client — the body stays unread
+    /// in QUIC and MAX_STREAM_DATA is only extended as it is read, so at
+    /// most one stream window (`ConnectionConfig.initial_max_stream_data_*`)
+    /// is held per paused request. For a proxy whose upstream is slower
+    /// than its client. Safe to call from inside `onData`.
+    pub fn pauseRequestBody(self: *Session, stream_id: u64) !void {
+        const h3c = self.entry.h3_conn orelse return error.NoH3Connection;
+        try h3c.pauseBody(stream_id);
+    }
+
+    /// Resume a body paused with `pauseRequestBody`. What arrived meanwhile
+    /// is delivered on a later loop pass, then `onRequestEnd` if the client
+    /// has finished; no packet needs to arrive for that.
+    pub fn resumeRequestBody(self: *Session, stream_id: u64) void {
+        const h3c = self.entry.h3_conn orelse return;
+        h3c.resumeBody(stream_id);
+        self.entry.repoll();
+    }
+
+    /// Bytes written to the stream and not yet sent — held back by flow or
+    /// congestion control. Null for a stream we cannot send on.
+    pub fn streamBufferedBytes(self: *const Session, stream_id: u64) ?u64 {
+        return self.entry.conn.streamBufferedBytes(stream_id);
+    }
+
+    /// `streamBufferedBytes` over every stream of the connection.
+    pub fn sendBufferedBytes(self: *const Session) u64 {
+        return self.entry.conn.sendBufferedBytes();
+    }
+
+    // --- WebTransport methods ---
+
+    /// Stop `onStreamData` for a WebTransport stream until `resumeStream`,
+    /// so a relay can hold a fast sender to the pace of a slow receiver. The
+    /// data stays unread in QUIC and the peer is held back by the stream's
+    /// flow-control window. Resets are still reported through
+    /// `onStreamReset`.
+    pub fn pauseStream(self: *Session, stream_id: u64) !void {
+        const wtc = self.entry.wt_conn orelse return error.NoWebTransportConnection;
+        try wtc.pauseStream(stream_id);
+    }
+
+    /// Resume a stream paused with `pauseStream`. What arrived meanwhile,
+    /// FIN included, is delivered on a later loop pass without waiting for
+    /// a packet. Callable from outside a server callback.
+    pub fn resumeStream(self: *Session, stream_id: u64) void {
+        const wtc = self.entry.wt_conn orelse return;
+        wtc.resumeStream(stream_id);
+        self.entry.repoll();
+    }
+
+    pub fn sendStreamData(self: *Session, stream_id: u64, data: []const u8) !void {
+        defer self.entry.wake();
+        errdefer self.entry.mark(true); // a poll writes the WT_DATA_BLOCKED a refusal owes
+        if (self.entry.wt_conn) |wtc| {
+            try wtc.sendStreamData(stream_id, data);
+        }
+    }
+
+    /// `session_id` names the WebTransport session; on raw QUIC there is
+    /// none and it is ignored.
+    pub fn sendDatagram(self: *Session, session_id: u64, data: []const u8) !void {
+        defer self.entry.wake();
+        if (self.entry.wt_conn) |wtc| {
+            return wtc.sendDatagram(session_id, data);
+        }
+        return self.entry.conn.sendDatagram(data);
+    }
+
+    pub fn acceptSession(self: *Session, session_id: u64) !void {
+        defer self.entry.repoll(); // streams held for it, and its first credit, wait on a poll
+        if (self.entry.wt_conn) |wtc| {
+            try wtc.acceptSession(session_id);
+        }
+    }
+
+    /// Refuse a session `onConnectRequest` offered with an HTTP status from
+    /// 300 to 599, leaving the connection and its other sessions as they
+    /// are; see `WebTransportConnection.rejectSession`.
+    pub fn rejectSession(self: *Session, session_id: u64, status: u16) !void {
+        defer self.entry.repoll(); // streams held for it are refused on a poll
+        const wtc = self.entry.wt_conn orelse return error.NoWtConnection;
+        try wtc.rejectSession(session_id, status);
+    }
+
+    pub fn closeStream(self: *Session, stream_id: u64) void {
+        defer self.entry.wake();
+        if (self.entry.wt_conn) |wtc| {
+            wtc.closeStream(stream_id);
+        }
+    }
+
+    pub fn openBidiStream(self: *Session, session_id: u64, send_order: ?i64) !u64 {
+        errdefer self.entry.mark(true); // a poll writes the WT_STREAMS_BLOCKED a refusal owes
+        if (self.entry.wt_conn) |wtc| {
+            return try wtc.openBidiStream(session_id, send_order);
+        }
+        return error.NoWtConnection;
+    }
+
+    pub fn openUniStream(self: *Session, session_id: u64, send_order: ?i64) !u64 {
+        errdefer self.entry.mark(true); // a poll writes the WT_STREAMS_BLOCKED a refusal owes
+        if (self.entry.wt_conn) |wtc| {
+            return try wtc.openUniStream(session_id, send_order);
+        }
+        return error.NoWtConnection;
+    }
+
+    pub fn setSendOrder(self: *Session, stream_id: u64, send_order: ?i64) void {
+        defer self.entry.wake();
+        if (self.entry.wt_conn) |wtc| {
+            wtc.setSendOrder(stream_id, send_order);
+        }
+    }
+
+    pub fn closeSession(self: *Session, session_id: u64) void {
+        defer self.entry.repoll(); // with the peer's FIN already in, the close is reported now
+        if (self.entry.wt_conn) |wtc| {
+            wtc.closeSession(session_id);
+        }
+    }
+
+    pub fn closeSessionWithError(self: *Session, session_id: u64, error_code: u32, reason: []const u8) !void {
+        defer self.entry.repoll(); // with the peer's FIN already in, the close is reported now
+        if (self.entry.wt_conn) |wtc| {
+            try wtc.closeSessionWithError(session_id, error_code, reason);
+        }
+    }
+
+    /// Ask the peer to wind one session down, closing nothing: a
+    /// WT_DRAIN_SESSION capsule (draft-16 §4.7). Either side may go on using
+    /// it. Safari and Chrome 158 resolve `WebTransport.draining` on it;
+    /// Firefox only on GOAWAY, which `drainConnection` sends.
+    pub fn drainSession(self: *Session, session_id: u64) !void {
+        defer self.entry.wake();
+        if (self.entry.wt_conn) |wtc| {
+            try wtc.drainSession(session_id);
+        }
+    }
+
+    /// `Server.drain` for this connection alone: a GOAWAY, so the client
+    /// sends no new request or CONNECT here (RFC 9114 §5.2, draft-16 §4.7),
+    /// and a WT_DRAIN_SESSION on each of its sessions, one accepted later
+    /// included. Closes nothing: requests in flight finish, sessions stay
+    /// until the handler or the peer ends them, and the connection closes
+    /// once nothing is left on it. For moving one client elsewhere, say. A
+    /// connection without HTTP/3 is left as it is.
+    pub fn drainConnection(self: *Session) void {
+        beginDrain(self.entry, sys.nanoTimestamp());
+        self.entry.wake();
+    }
+
+    pub fn resetStream(self: *Session, stream_id: u64, error_code: u32) void {
+        defer self.entry.wake();
+        if (self.entry.wt_conn) |wtc| {
+            wtc.resetStream(stream_id, error_code);
+        }
+    }
+
+    pub fn stopSending(self: *Session, stream_id: u64, error_code: u32) void {
+        defer self.entry.wake();
+        if (self.entry.wt_conn) |wtc| {
+            wtc.stopSending(stream_id, error_code);
+        }
+    }
+
+    pub fn acceptSessionWithHeaders(self: *Session, session_id: u64, extra_headers: []const qpack.Header) !void {
+        defer self.entry.repoll(); // see acceptSession
+        if (self.entry.wt_conn) |wtc| {
+            try wtc.acceptSessionWithHeaders(session_id, extra_headers);
+        }
+    }
+
+    /// What the peer advertised in its HTTP/3 SETTINGS, once they have
+    /// arrived. Worth logging when a peer's WebTransport behaviour is in
+    /// question: which draft's codepoints it speaks is in here.
+    pub fn peerSettings(self: *const Session) ?h3_frame.Settings {
+        const h3c = self.entry.h3_conn orelse return null;
+        if (!h3c.peer_settings_received) return null;
+        return h3c.peer_settings;
+    }
+
+    pub fn getStats(self: *const Session) connection.Connection.Stats {
+        return self.entry.conn.getStats();
+    }
+
+    pub fn getSendStreamStats(self: *const Session, stream_id: u64) ?wt.SendStreamStats {
+        if (self.entry.wt_conn) |wtc| return wtc.getSendStreamStats(stream_id);
+        return null;
+    }
+
+    pub fn getRecvStreamStats(self: *const Session, stream_id: u64) ?wt.RecvStreamStats {
+        if (self.entry.wt_conn) |wtc| return wtc.getRecvStreamStats(stream_id);
+        return null;
+    }
+
+    pub fn closeConnection(self: *Session) void {
+        defer self.entry.wake();
+        self.entry.conn.close(0, "");
+    }
+
+    pub fn setIncomingDatagramMaxAge(self: *Session, max_age_ms: ?u64) void {
+        self.entry.conn.setIncomingDatagramMaxAge(max_age_ms);
+    }
+
+    pub fn setOutgoingDatagramMaxAge(self: *Session, max_age_ms: ?u64) void {
+        self.entry.conn.setOutgoingDatagramMaxAge(max_age_ms);
+    }
+
+    pub fn setIncomingDatagramHighWaterMark(self: *Session, count: usize) void {
+        self.entry.conn.setIncomingDatagramHighWaterMark(count);
+    }
+
+    pub fn setOutgoingDatagramHighWaterMark(self: *Session, count: usize) void {
+        self.entry.conn.setOutgoingDatagramHighWaterMark(count);
+    }
+
+    pub fn isDatagramSendQueueFull(self: *const Session) bool {
+        if (self.entry.wt_conn) |wtc| {
+            return wtc.isDatagramSendQueueFull();
+        }
+        return true;
+    }
+
+    /// Bytes `session_id` can still write before the peer's credit is spent;
+    /// see `WebTransportConnection.sendCapacity`. On raw QUIC, the connection's.
+    pub fn sendCapacity(self: *const Session, session_id: u64) u64 {
+        if (self.entry.wt_conn) |wtc| return wtc.sendCapacity(session_id);
+        return self.entry.conn.sendCapacity();
+    }
+
+    pub fn streamSendCapacity(self: *const Session, stream_id: u64) ?u64 {
+        if (self.entry.wt_conn) |wtc| return wtc.streamSendCapacity(stream_id);
+        return self.entry.conn.streamSendCapacity(stream_id);
+    }
+
+    /// One `onWritable` once `min_bytes` fit.
+    ///
+    /// On a WebTransport stream or session, see
+    /// `WebTransportConnection.notifyWritable`. On an HTTP/3 request stream
+    /// (`.h3`, or an ordinary request on a WebTransport server) `stream_id` is
+    /// required, `session_id` is ignored, and `onWritable` receives the
+    /// stream id as both; see `H3Connection.notifyWritable` — it also waits
+    /// for the stream's unsent backlog to fall below `min_bytes`.
+    pub fn notifyWritable(self: *Session, session_id: u64, stream_id: ?u64, min_bytes: u64) !void {
+        defer self.entry.repoll(); // an already-met wait fires on a poll pass
+        if (stream_id) |sid| {
+            if (self.isH3RequestStream(sid)) {
+                return self.entry.h3_conn.?.notifyWritable(sid, min_bytes);
+            }
+        }
+        const wtc = self.entry.wt_conn orelse return error.NoWtConnection;
+        try wtc.notifyWritable(session_id, stream_id, min_bytes);
+    }
+
+    fn isH3RequestStream(self: *const Session, stream_id: u64) bool {
+        const h3c = self.entry.h3_conn orelse return false;
+        const wtc = self.entry.wt_conn orelse return true;
+        if (!stream_mod.isBidi(stream_id)) return false;
+        if (h3c.excluded_streams.contains(stream_id)) return false;
+        return wtc.getSession(stream_id) == null;
+    }
+
+    pub fn maxDatagramPayloadSize(self: *const Session, session_id: u64) ?usize {
+        if (self.entry.wt_conn) |wtc| {
+            return wtc.maxDatagramPayloadSize(session_id);
+        }
+        return null;
+    }
+
+    // --- Raw QUIC methods ---
+
+    pub fn writeStream(self: *Session, stream_id: u64, data: []const u8) !void {
+        defer self.entry.wake();
+        if (self.entry.conn.streams.getStream(stream_id)) |stream| {
+            return stream.send.writeData(data);
+        }
+        if (self.entry.conn.streams.send_streams.get(stream_id)) |ss| {
+            return ss.writeData(data);
+        }
+        return error.StreamNotFound;
+    }
+
+    pub fn closeQuicStream(self: *Session, stream_id: u64) void {
+        defer self.entry.wake();
+        if (self.entry.conn.streams.getStream(stream_id)) |stream| {
+            stream.send.close();
+        } else if (self.entry.conn.streams.send_streams.get(stream_id)) |ss| {
+            ss.close();
+        }
+    }
+
+    pub fn readStream(self: *Session, stream_id: u64) ?[]const u8 {
+        const stream = self.entry.conn.streams.getStream(stream_id) orelse return null;
+        // The read frees flow-control credit to announce, and may take the
+        // FIN, which a poll reports.
+        self.entry.mark(true);
+        return stream.recv.read();
+    }
+
+    pub fn openStream(self: *Session) !u64 {
+        const stream = try self.entry.conn.openStream();
+        return stream.stream_id;
+    }
+
+    pub fn openQuicUniStream(self: *Session) !u64 {
+        const ss = try self.entry.conn.openUniStream();
+        return ss.stream_id;
+    }
+
+    pub fn resetQuicStream(self: *Session, stream_id: u64, error_code: u64) void {
+        defer self.entry.wake();
+        if (self.entry.conn.streams.getStream(stream_id)) |stream| {
+            stream.send.reset(error_code);
+        } else if (self.entry.conn.streams.send_streams.get(stream_id)) |ss| {
+            ss.reset(error_code);
+        }
+    }
+
+    /// A QUIC DATAGRAM with no WebTransport session prefix.
+    pub fn sendQuicDatagram(self: *Session, data: []const u8) !void {
+        defer self.entry.wake();
+        try self.entry.conn.sendDatagram(data);
+    }
+
+    /// True for a connection a `raw_quic` WebTransport server is serving as
+    /// plain QUIC, because it negotiated something other than h3.
+    pub fn isRawQuic(self: *const Session) bool {
+        return self.entry.raw_quic;
+    }
+
+    pub fn alpn(self: *const Session) []const u8 {
+        return self.entry.conn.negotiatedAlpn();
+    }
+
+    // --- H0 methods ---
+
+    pub fn serveFile(self: *Session, stream_id: u64, root_dir: []const u8, path: []const u8) !void {
+        defer self.entry.wake();
+        if (self.entry.h0_conn) |h0c| {
+            try h0c.serveFile(stream_id, root_dir, path);
+        }
+    }
+
+    pub fn sendH0Response(self: *Session, stream_id: u64, data: []const u8) !void {
+        defer self.entry.wake();
+        if (self.entry.h0_conn) |h0c| {
+            try h0c.sendResponse(stream_id, data);
+        }
+    }
+
+    // --- Connection-level methods ---
+
+    pub fn sendKeepAlive(self: *Session) void {
+        defer self.entry.wake();
+        self.entry.conn.sendKeepAlive();
+    }
+
+    /// Move this connection, with its streams, datagrams and WebTransport
+    /// sessions as they stand, to the sibling server whose QUIC-LB id is
+    /// `to`: one on another thread, on the same port (`Config.moved_cids`).
+    ///
+    /// At the end of the current pass, once its sends are out, this server
+    /// lets go of the connection and hands it to the handler's
+    /// `onHandover(handover: Handover)`, on this thread. That passes it to
+    /// the new server's thread, where `adopt` takes it in. From this call on
+    /// the connection's events are no longer polled here, so what has not
+    /// been delivered yet is delivered by the new server; datagrams arriving
+    /// meanwhile are dropped. Don't use this Session, or a copy, again.
+    ///
+    /// A connection that starts closing before the pass ends stays here and
+    /// closes as usual, with no `onHandover`. Errors when this server has no
+    /// `moved_cids` or no `onHandover`, or `to` is not a sibling's id.
+    pub fn handOver(self: *Session, to: []const u8) !void {
+        const mgr = self.entry.mgr orelse return error.NotConnected;
+        if (!mgr.can_hand_over) return error.HandoverNotConfigured;
+        try mgr.requestHandover(self.entry, to);
+        self.entry.wake(); // the pass that lets go, if no callback's is under way
+    }
+};
+
+/// What `Server.drain` tells the peers.
+pub const DrainOptions = struct {
+    /// A GOAWAY on each HTTP/3 connection and a WT_DRAIN_SESSION on each
+    /// WebTransport session; see `Session.drainConnection`. Browsers resolve
+    /// `WebTransport.draining` on one or the other.
+    ///
+    /// Off for an application that tells its clients in band before it
+    /// closes their sessions, since a GOAWAY costs browsers more than it
+    /// says to them (measured headless, October 2026): Firefox 158 then
+    /// drops a page's own session close, sending CONNECTION_CLOSE without its
+    /// WT_CLOSE_SESSION, and Firefox 155-158 can crash outright when the
+    /// GOAWAY lands as a session is being accepted (fixed in 159); Chrome
+    /// 155-158 lose a session whose page opens a stream after one. New
+    /// connections are refused either way. A connection whose WebTransport
+    /// sessions are over still closes, as `Config.wt_close_after_sessions`
+    /// says; a plain HTTP/3 one waits for its idle timeout or `stop()`.
+    signal_peers: bool = true,
+};
+
+/// What `requestStop` or `requestDrain` asked of a server or client that owns
+/// its loop, from outside the loop thread, and the wakeup that carries it
+/// there. A shared loop's owner has a wakeup of its own for this.
+const Shutdown = struct {
+    const stop: u8 = 1;
+    const drain: u8 = 2;
+    /// `DrainOptions.signal_peers` off.
+    const drain_quietly: u8 = 4;
+
+    pending: std.atomic.Value(u8) = .init(0),
+    wakeup: xev.Async,
+    completion: xev.Completion = .{},
+
+    fn init() !Shutdown {
+        return .{ .wakeup = try xev.Async.init() };
+    }
+
+    fn deinit(self: *Shutdown) void {
+        self.wakeup.deinit();
+    }
+
+    /// Async-signal-safe; see `Server.requestStop`.
+    fn post(self: *Shutdown, what: u8) void {
+        _ = self.pending.fetchOr(what, .release);
+        self.wakeup.notify() catch {}; // nothing a signal handler could do with an error
+    }
+
+    fn take(self: *Shutdown) u8 {
+        return self.pending.swap(0, .acquire);
+    }
+};
+
+/// Begin one connection's HTTP/3 shutdown; see `Session.drainConnection`.
+/// Its sessions get WT_DRAIN_SESSION now and the connection its GOAWAY once
+/// the peer has acked what its CONNECT streams carry, or 3 PTO on: Firefox
+/// 155-158 crash when a GOAWAY comes with the 200 that accepts a session.
+fn beginDrain(entry: *ConnEntry, now: i64) void {
+    const conn = entry.conn;
+    if (conn.state == .closing or conn.state == .draining or conn.isClosed()) return;
+    // Still handshaking, it gets GOAWAY(0) once it can; raw QUIC has none.
+    const h3c = entry.h3_conn orelse return;
+    if (h3c.shutdown_state != .active or entry.drain_goaway_due != null) return;
+    drainSessions(entry);
+    entry.drain_goaway_due = now + 3 * conn.pkt_handler.rtt_stats.pto();
+    sendDrainGoaway(entry, now);
+}
+
+fn drainSessions(entry: *ConnEntry) void {
+    const wtc = entry.wt_conn orelse return;
+    for (&wtc.sessions) |*sess| {
+        if (sess.occupied and sess.state == .active) wtc.drainSession(sess.session_id) catch {};
+    }
+}
+
+/// The held GOAWAY of a drain, once its time has come.
+fn sendDrainGoaway(entry: *ConnEntry, now: i64) void {
+    const due = entry.drain_goaway_due orelse return;
+    const conn = entry.conn;
+    if (now < due and connectStreamsUnacked(entry)) return;
+    entry.drain_goaway_due = null;
+    if (conn.state != .connected) return;
+    const h3c = entry.h3_conn orelse return;
+    drainSessions(entry); // one accepted meanwhile
+    h3c.initiateShutdown() catch {
+        conn.close(@backingInt(h3.H3Error.no_error), "server shutdown");
+        return;
+    };
+    entry.drain_final_goaway_at = now + conn.pkt_handler.rtt_stats.pto();
+}
+
+fn connectStreamsUnacked(entry: *ConnEntry) bool {
+    const wtc = entry.wt_conn orelse return false;
+    for (wtc.sessions) |sess| {
+        if (!sess.occupied or sess.state != .active) continue;
+        const st = entry.conn.streams.getStream(sess.session_id) orelse continue;
+        if (st.send.ack_offset < st.send.write_offset) return true;
+    }
+    return false;
+}
+
+/// When an entry next needs a pass: its connection's timers, and those of
+/// a drain's GOAWAYs.
+fn entryDeadline(entry: *const ConnEntry, now: i64) ?i64 {
+    var at = entry.conn.nextTimeoutNsAt(now);
+    for ([_]?i64{ entry.drain_goaway_due, entry.drain_final_goaway_at }) |d| {
+        const t = d orelse continue;
+        at = if (at) |a| @min(a, t) else t;
+    }
+    return at;
+}
+
+pub fn Server(comptime Handler: type) type {
+    // A WebTransport handler may also take native-QUIC protocols on the same
+    // port (MoQT's `moqt-NN` beside `h3`): each connection's ALPN picks.
+    const serves_raw_quic = Handler.protocol == .webtransport and
+        @hasDecl(Handler, "raw_quic") and Handler.raw_quic;
+    comptime {
+        // Each callback-like decl is checked against every known name.
+        @setEvalBranchQuota(10_000);
+        if (!@hasDecl(Handler, "protocol")) {
+            @compileError("Handler must declare 'pub const protocol: event_loop.Protocol'");
+        }
+
+        const known = [_][]const u8{
+            "onConnectRequest",   "onSessionReady",     "onStreamData",
+            "onDatagram",         "onSessionClosed",    "onSessionDraining",
+            "onBidiStream",       "onUniStream",        "onStreamReset",
+            "onStopSending",      "onPollComplete",     "onRequest",
+            "onData",             "onH0Request",        "onH0Data",
+            "onH0Finished",       "onWritable",         "onRequestEnd",
+            "onRequestCancelled", "onConnectionClosed", "onQuicConnected",
+            "onWsUpgrade",        "onWsMessage",        "onWsClose",
+            "onPass",             "onHandover",         "onWsHandover",
+            "onHttpRequest",      "onRawOpen",          "onRawData",
+            "onRawClose",         "onRawDrain",         "onRawEnd",
+            "onHttpExchange",     "onHttpExchangeGone", "onHttpHead",
+            "onHttpBody",         "onHttpEnd",          "onHttpGone",
+            "onHttpWritable",
+        };
+
+        for (@typeInfo(Handler).@"struct".decl_names) |decl_name| {
+            if (decl_name.len >= 2 and decl_name[0] == 'o' and decl_name[1] == 'n') {
+                var found = false;
+                for (known) |k| {
+                    if (std.mem.eql(u8, decl_name, k)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    @compileError("Handler has unrecognized callback '" ++ decl_name ++
+                        "'. Known callbacks: onRequest, onData, onRequestEnd, " ++
+                        "onRequestCancelled, onConnectRequest, " ++
+                        "onSessionReady, onStreamData, onDatagram, onSessionClosed, " ++
+                        "onSessionDraining, onBidiStream, onUniStream, onStreamReset, " ++
+                        "onStopSending, onWritable, onPollComplete, onConnectionClosed, " ++
+                        "onQuicConnected, onH0Request, onH0Data, onH0Finished, " ++
+                        "onWsUpgrade, onWsMessage, onWsClose, onPass, onHandover, onWsHandover, " ++
+                        "onHttpRequest, onRawOpen, onRawData, onRawClose, onRawDrain, onRawEnd, " ++
+                        "onHttpExchange, onHttpExchangeGone, onHttpHead, onHttpBody, onHttpEnd, " ++
+                        "onHttpGone, onHttpWritable");
+                }
+            }
+        }
+
+        if (@hasDecl(Handler, "onQuicConnected") and !serves_raw_quic) {
+            @compileError("onQuicConnected needs protocol = .webtransport and raw_quic = true");
+        }
+
+        if (@hasDecl(Handler, "onStreamData")) {
+            const params = @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".param_types;
+            if (params.len != 4 and params.len != 5) {
+                @compileError("onStreamData must have 4 params (self, session, stream_id, data) " ++
+                    "or 5 params (self, session, stream_id, data, fin)");
+            }
+        }
+        if (@hasDecl(Handler, "onSessionClosed")) {
+            const n = @typeInfo(@TypeOf(Handler.onSessionClosed)).@"fn".param_types.len;
+            if (n != 5 and n != 6) {
+                @compileError("onSessionClosed must have 5 params (self, session, session_id, error_code, reason) " ++
+                    "or 6 params (self, session, session_id, error_code, reason, abrupt)");
+            }
+        }
+
+        if ((@hasDecl(Handler, "onWsMessage") or @hasDecl(Handler, "onWsClose") or @hasDecl(Handler, "onWsHandover")) and !@hasDecl(Handler, "onWsUpgrade")) {
+            @compileError("onWsMessage, onWsClose and onWsHandover need onWsUpgrade, which accepts the WebSockets they serve");
+        }
+        if (@hasDecl(Handler, "onWsUpgrade") and @typeInfo(@TypeOf(Handler.onWsUpgrade)).@"fn".param_types.len != 3) {
+            @compileError("onWsUpgrade must have 3 params (self, req: *WsRequest, path)");
+        }
+        if (@hasDecl(Handler, "onWsMessage")) {
+            const n = @typeInfo(@TypeOf(Handler.onWsMessage)).@"fn".param_types.len;
+            if (n != 3 and n != 4) {
+                @compileError("onWsMessage must have 3 params (self, ws: *WsConn, data) " ++
+                    "or 4 params (self, ws, data, kind: WsMessageKind)");
+            }
+        }
+        if (@hasDecl(Handler, "onWsClose") and @typeInfo(@TypeOf(Handler.onWsClose)).@"fn".param_types.len != 4) {
+            @compileError("onWsClose must have 4 params (self, ws: *WsConn, code: u16, reason)");
+        }
+        if (@hasDecl(Handler, "onPass") and @TypeOf(Handler.onPass) != fn (*Handler, i64) ?i64) {
+            @compileError("onPass must be fn (self: *Handler, now_ns: i64) ?i64");
+        }
+        if (@hasDecl(Handler, "onHandover") and @TypeOf(Handler.onHandover) != fn (*Handler, Handover) void) {
+            @compileError("onHandover must be fn (self: *Handler, handover: Handover) void");
+        }
+        if (@hasDecl(Handler, "onWsHandover") and @TypeOf(Handler.onWsHandover) != fn (*Handler, WsHandover) void) {
+            @compileError("onWsHandover must be fn (self: *Handler, handover: WsHandover) void");
+        }
+        if (@hasDecl(Handler, "onHttpRequest") and @TypeOf(Handler.onHttpRequest) != fn (*Handler, *HttpRequest, []const u8) void) {
+            @compileError("onHttpRequest must be fn (self: *Handler, req: *HttpRequest, target: []const u8) void");
+        }
+        const raw_any = @hasDecl(Handler, "onRawOpen") or @hasDecl(Handler, "onRawData") or
+            @hasDecl(Handler, "onRawClose") or @hasDecl(Handler, "onRawDrain") or @hasDecl(Handler, "onRawEnd");
+        const raw_all = @hasDecl(Handler, "onRawOpen") and @hasDecl(Handler, "onRawData") and @hasDecl(Handler, "onRawClose");
+        if (raw_any and !raw_all) {
+            @compileError("a handler that serves raw connections needs all of onRawOpen, onRawData and onRawClose");
+        }
+        if (@hasDecl(Handler, "onRawOpen") and @TypeOf(Handler.onRawOpen) != fn (*Handler, *RawConn) void) {
+            @compileError("onRawOpen must be fn (self: *Handler, raw: *RawConn) void");
+        }
+        if (@hasDecl(Handler, "onRawData") and @TypeOf(Handler.onRawData) != fn (*Handler, *RawConn, []const u8) void) {
+            @compileError("onRawData must be fn (self: *Handler, raw: *RawConn, data: []const u8) void");
+        }
+        if (@hasDecl(Handler, "onRawClose") and @TypeOf(Handler.onRawClose) != fn (*Handler, *RawConn) void) {
+            @compileError("onRawClose must be fn (self: *Handler, raw: *RawConn) void");
+        }
+        if (@hasDecl(Handler, "onRawDrain") and @TypeOf(Handler.onRawDrain) != fn (*Handler, *RawConn) void) {
+            @compileError("onRawDrain must be fn (self: *Handler, raw: *RawConn) void");
+        }
+        if (@hasDecl(Handler, "onRawEnd") and @TypeOf(Handler.onRawEnd) != fn (*Handler, *RawConn) void) {
+            @compileError("onRawEnd must be fn (self: *Handler, raw: *RawConn) void");
+        }
+        if (@hasDecl(Handler, "onHttpExchange") != @hasDecl(Handler, "onHttpExchangeGone")) {
+            @compileError("a handler that takes exchanges needs both onHttpExchange and onHttpExchangeGone");
+        }
+        if (@hasDecl(Handler, "onHttpExchange") and @TypeOf(Handler.onHttpExchange) != fn (*Handler, *HttpExchange) void) {
+            @compileError("onHttpExchange must be fn (self: *Handler, ex: *HttpExchange) void");
+        }
+        if (@hasDecl(Handler, "onHttpExchangeGone") and @TypeOf(Handler.onHttpExchangeGone) != fn (*Handler, *HttpExchange) void) {
+            @compileError("onHttpExchangeGone must be fn (self: *Handler, ex: *HttpExchange) void");
+        }
+        // The rest of onHttpHead's rules are http1.handlersFor's.
+        if (@hasDecl(Handler, "onHttpHead") and (@hasDecl(Handler, "onRequest") or @hasDecl(Handler, "onData") or @hasDecl(Handler, "onRequestEnd"))) {
+            @compileError("onHttpHead takes HTTP/3 requests too: drop onRequest, onData and onRequestEnd");
+        }
+    }
+
+    return struct {
+        const Self = @This();
+        const takes_heads = @hasDecl(Handler, "onHttpHead");
+
+        allocator: std.mem.Allocator,
+        handler: *Handler,
+        conn_mgr: connection_manager.ConnectionManager,
+
+        // libxev. `own_loop` is unused when the caller supplied one; the
+        // active loop comes from eventLoop(), as init() returns by value.
+        own_loop: xev.Loop,
+        shared_loop: ?*xev.Loop,
+        file: xev.File,
+        timer: xev.Timer,
+        poll_completion: xev.Completion,
+        timer_completion: xev.Completion,
+        timer_cancel_completion: xev.Completion,
+        timer_armed: bool,
+        started: bool,
+        stopping: bool,
+        /// `drain()` was called; see there.
+        draining: bool,
+        /// ... with `DrainOptions.signal_peers`.
+        drain_signals: bool = true,
+
+        /// Zero-delay timer that services connections written to from outside
+        /// our callbacks; see `ConnEntry.wake`.
+        wake_completion: xev.Completion,
+        wake_armed: bool,
+        /// Set while one of our callbacks runs: its own send pass covers
+        /// whatever the handler queues, so no wakeup is needed.
+        in_callback: bool,
+        /// A handler wrote during a callback after the send pass began, maybe
+        /// to a connection whose turn had passed — another's
+        /// onConnectionClosed writing to it, say. Wakes us once it is over.
+        written_in_pass: bool,
+        /// Stream ids snapshotted per raw-QUIC poll: a handler may open or
+        /// close streams from onStreamData, which would invalidate an
+        /// iterator over the stream maps.
+        quic_poll_ids: std.ArrayList(u64),
+        /// Connections polled for events so far, one per connection per pass
+        /// that looked. Writes alone add nothing; see `wantsPoll`.
+        polls: u64 = 0,
+        /// Entries the passes have gone through, skipped ones included: on a
+        /// sparse server, what is active rather than what is connected.
+        examined: u64 = 0,
+        /// Socket and timer wakeups served, and the time their passes took,
+        /// the handler's callbacks included: how busy the loop is with this
+        /// server.
+        passes: u64 = 0,
+        pass_ns: u64 = 0,
+        /// What the handler's last `onPass` returned; see `runOnPass`.
+        pass_deadline: ?i64 = null,
+        /// The earliest `wakeAt` no pass has reached yet.
+        wake_at: ?i64 = null,
+        /// A stopped server on a shared loop: every completion is cancelled or
+        /// on its way off the loop, and nothing may re-arm.
+        halted: bool,
+        cancel_completions: [4]xev.Completion,
+        /// Unused on a shared loop, like `own_loop`.
+        shutdown: Shutdown,
+
+        // I/O (our own, for ECN support)
+        sockfd: posix.socket_t,
+        local_addr: posix.sockaddr.storage,
+        batch: ecn_socket.SendBatch,
+        recv_batch: ecn_socket.RecvBatch,
+        out_buf: [1500]u8,
+        /// How long datagrams waited in the kernel before the loop read them.
+        /// Only filled when the socket was stamped (a qlog run); reported and
+        /// cleared once a second.
+        rx_wait: RxWait = .{},
+
+        /// Shared by every H3Connection on this loop — one 16 KB buffer for
+        /// the whole server rather than one per connection. Safe because a
+        /// loop decodes one header block at a time and never holds the
+        /// resulting slices past the poll that produced them.
+        qpack_scratch: [qpack.SCRATCH_SIZE]u8,
+        qpack_headers: [h3.MAX_HEADERS]qpack.Header,
+
+        /// Optional second socket for preferred_address (connectionmigration).
+        /// When the server advertises a preferred_address on a different port,
+        /// clients migrate there. This socket receives and responds on that port.
+        /// The TLS material read off disk in init(), when we loaded it rather
+        /// than the caller supplying an in-memory config. Freed in deinit().
+        owned_tls: ?OwnedTlsMaterial,
+
+        preferred: ?PreferredSocket,
+
+        /// Optional HTTP/1.1 listener on the same loop; see `Config.http1`.
+        http1_server: ?http1.Server,
+        /// HTTP/3 requests offered at their head (`onHttpHead`), not yet answered.
+        h3_streams: if (takes_heads) std.AutoHashMapUnmanaged(StreamKey, *H3Stream) else void = if (takes_heads) .empty else {},
+        /// The HTTP/3 exchanges' (`Exchange.mailbox`).
+        mailbox: if (takes_heads) Mailbox else void,
+        /// `Config.min_body_rate` and `stall_timeout_ms`, for `h3_streams`.
+        min_body_rate: u32,
+        stall_timeout_ms: u32,
+        /// When `sweepStreams` looks at `h3_streams` next.
+        next_sweep_ns: i64 = 0,
+
+        foreign_hook: ?ForeignDatagramHook,
+        new_hook: ?NewDatagramHook,
+
+        /// WebTransport SETTINGS advertised to every peer, and what is done
+        /// with a connection its sessions are over with, from Config.
+        wt_settings: struct {
+            max_sessions: u64,
+            legacy: bool,
+            advertise_credits: bool,
+            credits: wt_fc.Credits,
+            close_after_sessions: bool,
+        },
+
+        const PreferredSocket = struct {
+            sockfd: posix.socket_t,
+            local_addr: posix.sockaddr.storage,
+            port: u16,
+            file: xev.File,
+            poll_completion: xev.Completion,
+            batch: ecn_socket.SendBatch,
+        };
+
+        pub fn init(alloc: std.mem.Allocator, handler: *Handler, config: Config) !Self {
+            if (@hasDecl(Handler, "onWsUpgrade") and config.http1 == null) return error.WebSocketNeedsHttp1;
+
+            // Determine TLS config: use advanced or build from cert/key paths
+            var owned_tls: ?OwnedTlsMaterial = null;
+            const tls_config: tls13.TlsConfig = if (config.tls_config) |tc| tc else blk: {
+                // Read cert files
+                const server_cert_pem = try sys.readFileAlloc(alloc, config.cert_path, 8192);
+                const server_key_pem = try sys.readFileAlloc(alloc, config.key_path, 8192);
+
+                // Parse PEM -> DER (supports certificate chains, e.g. Let's Encrypt fullchain.pem)
+                const cert_chain = try tls13.parsePemCertChain(alloc, server_cert_pem);
+
+                var key_der_buf: [4096]u8 = undefined;
+                const key_der = try tls13.parsePemPrivateKey(server_key_pem, &key_der_buf);
+                const key = try tls13.extractPrivateKey(key_der);
+                const private_key = try alloc.dupe(u8, key.bytes);
+
+                const default_alpn = [_][]const u8{"h3"};
+                const alpn = try alloc.dupe([]const u8, config.alpn orelse &default_alpn);
+
+                var ticket_key: [16]u8 = undefined;
+                sys.randomBytes(&ticket_key);
+
+                owned_tls = .{
+                    .cert_pem = server_cert_pem,
+                    .key_pem = server_key_pem,
+                    .cert_chain = cert_chain,
+                    .private_key = private_key,
+                    .alpn = alpn,
+                };
+
+                break :blk .{
+                    .cert_chain_der = cert_chain,
+                    .private_key_bytes = private_key,
+                    .private_key_algorithm = key.algorithm,
+                    .alpn = alpn,
+                    .ticket_key = ticket_key,
+                };
+            };
+            errdefer if (owned_tls) |*o| o.deinit(alloc);
+
+            var retry_token_key: [16]u8 = if (config.retry_token_key) |k| k else undefined;
+            if (config.retry_token_key == null) sys.randomBytes(&retry_token_key);
+
+            const shared_reset_key = config.static_reset_key != null or config.derive_reset_key;
+
+            // Connection config
+            var conn_config: connection.ConnectionConfig = if (config.conn_config) |cc| cc else blk: {
+                var cc: connection.ConnectionConfig = .{
+                    .token_key = retry_token_key,
+                    .max_ack_delay = config.max_ack_delay,
+                    .ack_bytes_threshold = config.ack_bytes_threshold,
+                    .request_ack_frequency = config.request_ack_frequency,
+                    .datagrams_before_streams = config.datagrams_before_streams,
+                    .max_idle_timeout = config.max_idle_timeout,
+                };
+                if (Handler.protocol == .webtransport or Handler.protocol == .quic) {
+                    cc.max_datagram_frame_size = config.max_datagram_frame_size;
+                }
+                break :blk cc;
+            };
+            if (config.quic_lb) |lb| conn_config.quic_lb = lb;
+            if (conn_config.quic_lb) |*lb| try quic_lb.validate(lb);
+            if (config.foreign_datagram != null and conn_config.quic_lb == null) return error.ForeignDatagramNeedsQuicLb;
+            if (config.moved_cids != null and (config.foreign_datagram == null or !shared_reset_key)) return error.MovedCidsNeedsSteering;
+
+            const sockfd, const local_addr = if (config.socket) |fd| .{ fd, try boundAddress(fd) } else try openUdpSocket(config, config.port);
+            errdefer if (config.socket == null) sys.close(sockfd);
+
+            // After binding: a derived key takes the port the socket got.
+            const static_reset_key: [16]u8 = config.static_reset_key orelse if (config.derive_reset_key) blk: {
+                const pk = if (tls_config.certs.len > 0) tls_config.certs[0].cert.private_key_bytes else tls_config.private_key_bytes;
+                if (pk.len == 0) return error.ResetKeyNeedsPrivateKey;
+                break :blk stateless_reset.deriveKey(pk, local_addr.getPort());
+            } else blk: {
+                var k: [16]u8 = undefined;
+                sys.randomBytes(&k);
+                break :blk k;
+            };
+
+            // A qlog run is a diagnostic run: stamp arrivals too, so the time a
+            // datagram spent queued can be told apart from the time spent
+            // answering it. Costs a cmsg per recvmsg, so it is not on otherwise.
+            if (conn_config.qlog_dir != null) ecn_socket.enableRxTimestamps(sockfd);
+
+            // Optional second socket for preferred_address (connectionmigration)
+            const preferred: ?PreferredSocket = if (config.preferred_port) |pp| blk: {
+                const pfd, const paddr = try openUdpSocket(config, pp);
+                break :blk .{
+                    .sockfd = pfd,
+                    .local_addr = connection.sockaddrToStorage(&paddr.any),
+                    .port = pp,
+                    .file = xev.File.initFd(pfd),
+                    .poll_completion = .{},
+                    .batch = ecn_socket.SendBatch.init(pfd),
+                };
+            } else null;
+            errdefer if (preferred) |p| sys.close(p.sockfd);
+            var recv_batch = try ecn_socket.RecvBatch.init(alloc, MAX_RECV_DATAGRAM);
+            errdefer recv_batch.deinit(alloc);
+
+            var conn_mgr = connection_manager.ConnectionManager.init(
+                alloc,
+                tls_config,
+                conn_config,
+                retry_token_key,
+                static_reset_key,
+            );
+            conn_mgr.require_retry = config.require_retry;
+            conn_mgr.retry_threshold = config.retry_threshold;
+            conn_mgr.max_connections = config.max_connections;
+            conn_mgr.max_handshakes = config.max_handshakes orelse @max(config.max_connections / 4, 1);
+            conn_mgr.max_handshakes_per_source = config.max_handshakes_per_source orelse @max(conn_mgr.max_handshakes / 4, 1);
+            conn_mgr.source_filter = config.source_filter;
+            conn_mgr.reply_limits = .init(config.stateless_reply_rate);
+            conn_mgr.steer_foreign = config.foreign_datagram != null;
+            conn_mgr.moved = config.moved_cids;
+            conn_mgr.can_hand_over = config.moved_cids != null and @hasDecl(Handler, "onHandover");
+            conn_mgr.next_entry_id = config.id_base + 1;
+            conn_mgr.reset_unknown = !(config.reuse_port and shared_reset_key and config.foreign_datagram == null);
+
+            // Init libxev
+            const loop = if (config.loop == null) try xev.Loop.init(.{}) else undefined;
+            const file_handle = xev.File.initFd(sockfd);
+            const timer_handle = try xev.Timer.init();
+            var shutdown: Shutdown = if (config.loop == null) try Shutdown.init() else undefined;
+            errdefer if (config.loop == null) shutdown.deinit();
+
+            const http1_server: ?http1.Server = if (config.http1) |h1cfg|
+                try http1.Server.init(alloc, h1cfg, .{
+                    .address = config.address,
+                    .ipv6 = config.ipv6,
+                    .quic_port = local_addr.getPort(), // the kernel's pick for port 0
+                    .reuse_port = config.reuse_port,
+                    .certs = .{
+                        .entries = tls_config.certs,
+                        .single = .{
+                            .cert_chain_der = tls_config.cert_chain_der,
+                            .private_key_bytes = tls_config.private_key_bytes,
+                            .private_key_algorithm = tls_config.private_key_algorithm,
+                        },
+                        .client_auth = tls_config.client_auth,
+                    },
+                })
+            else
+                null;
+
+            return .{
+                .allocator = alloc,
+                .handler = handler,
+                .conn_mgr = conn_mgr,
+                .own_loop = loop,
+                .shared_loop = config.loop,
+                .file = file_handle,
+                .timer = timer_handle,
+                .poll_completion = .{},
+                .timer_completion = .{},
+                .timer_cancel_completion = .{},
+                .timer_armed = false,
+                .started = false,
+                .stopping = false,
+                .draining = false,
+                .wake_completion = .{},
+                .wake_armed = false,
+                .in_callback = false,
+                .written_in_pass = false,
+                .quic_poll_ids = .empty,
+                .halted = false,
+                .cancel_completions = .{ .{}, .{}, .{}, .{} },
+                .shutdown = shutdown,
+                .sockfd = sockfd,
+                .local_addr = connection.sockaddrToStorage(&local_addr.any),
+                .batch = ecn_socket.SendBatch.init(sockfd),
+                .recv_batch = recv_batch,
+                .qpack_scratch = undefined,
+                .qpack_headers = undefined,
+                .out_buf = undefined,
+                .owned_tls = owned_tls,
+                .preferred = preferred,
+                .http1_server = http1_server,
+                .mailbox = if (comptime takes_heads) try Mailbox.init() else {},
+                .min_body_rate = config.min_body_rate,
+                .stall_timeout_ms = config.stall_timeout_ms,
+                .foreign_hook = config.foreign_datagram,
+                .new_hook = config.new_while_draining,
+                .wt_settings = .{
+                    .max_sessions = config.webtransport_max_sessions,
+                    .legacy = config.wt_legacy_settings,
+                    .advertise_credits = config.wt_advertise_credits,
+                    .credits = config.wt_credits,
+                    .close_after_sessions = config.wt_close_after_sessions,
+                },
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            // On a shared loop our completions must be off it first; see
+            // Config.loop.
+            if (self.shared_loop != null) std.debug.assert(self.isStopped());
+            if (self.http1_server) |*h1| h1.deinit();
+
+            // Whatever is still live goes now; the handler hears about each
+            // one first, as it would had the connection closed on its own.
+            self.halted = true;
+            for (self.conn_mgr.entries.items) |entry| {
+                var session = Session{ .entry = entry };
+                self.endConnection(&session);
+            }
+
+            self.timer.deinit();
+            if (self.shared_loop == null) {
+                self.own_loop.deinit();
+                self.shutdown.deinit();
+            }
+            sys.close(self.sockfd);
+            if (self.preferred) |p| sys.close(p.sockfd);
+            self.conn_mgr.deinit();
+            if (comptime takes_heads) {
+                self.h3_streams.deinit(self.allocator);
+                self.mailbox.deinit();
+            }
+            self.quic_poll_ids.deinit(self.allocator);
+            self.recv_batch.deinit(self.allocator);
+            // Last: live connections hold slices into this material.
+            if (self.owned_tls) |*o| o.deinit(self.allocator);
+        }
+
+        /// The loop this server runs on, ours or the caller's.
+        pub fn eventLoop(self: *Self) *xev.Loop {
+            return self.shared_loop orelse &self.own_loop;
+        }
+
+        /// The UDP port the server is bound to: the one the kernel picked for
+        /// `Config.port` 0.
+        pub fn port(self: *const Self) u16 {
+            return connection.sockaddrPort(&self.local_addr);
+        }
+
+        /// Register watchers and start the event loop. Call once before tick().
+        pub fn start(self: *Self) void {
+            if (!std.crypto.core.aes.has_hardware_support and sys.cpuHasAes()) {
+                log.warn("built without the AES instructions this CPU has, so TLS uses ChaCha20 in software: build with -Dcpu=native, or a CPU model that has AES", .{});
+            }
+            const loop = self.eventLoop();
+            // Register socket readability watch
+            self.file.poll(loop, &self.poll_completion, .read, Self, self, onReadable);
+            // Register preferred socket if present
+            if (self.preferred) |*p| {
+                p.file.poll(loop, &p.poll_completion, .read, Self, self, onReadable);
+            }
+            if (self.http1_server) |*h1| {
+                // WebSocket ids share the QUIC connection counter.
+                h1.start(loop, http1.handlersFor(Handler, self.handler), &self.conn_mgr.next_entry_id) catch |err| {
+                    log.err("Failed to start HTTP/1.1 listener: {any}", .{err});
+                };
+            }
+            if (comptime takes_heads) self.mailbox.loop = loop;
+            // Arm initial timer (1ms to kick things off)
+            self.timer.run(loop, &self.timer_completion, 1, Self, self, onTimer);
+            if (self.shared_loop == null) self.shutdown.wakeup.wait(loop, &self.shutdown.completion, Self, self, onShutdownPosted);
+            self.timer_armed = true;
+            self.started = true;
+        }
+
+        /// Blocking run: registers watchers and runs the event loop until
+        /// `stop()` completes. Only for a server that owns its loop; on a
+        /// shared one, run the loop yourself.
+        pub fn run(self: *Self) !void {
+            std.debug.assert(self.shared_loop == null);
+            self.start();
+            try self.own_loop.run(.until_done);
+        }
+
+        /// Non-blocking tick: process all pending events and return immediately.
+        /// Call start() once before the first tick(). On a shared loop this
+        /// drives everything else on it too.
+        pub fn tick(self: *Self) !void {
+            if (!self.started) self.start();
+            try self.eventLoop().run(.no_wait);
+        }
+
+        /// True from the moment `stop()` is called, on either kind of loop.
+        /// A caller's own completion on the server's loop — a room tick,
+        /// say — should stop re-arming then: a shared loop can't run dry
+        /// while it does.
+        pub fn isStopping(self: *const Self) bool {
+            return self.stopping;
+        }
+
+        /// On a shared loop: true once `stop()` has finished and none of the
+        /// server's completions remain on the loop, so `deinit()` is safe.
+        pub fn isStopped(self: *Self) bool {
+            if (!self.started) return true;
+            if (!self.halted) return false;
+            const pending = [_]*const xev.Completion{
+                &self.poll_completion,
+                &self.timer_completion,
+                &self.timer_cancel_completion,
+                &self.wake_completion,
+            };
+            for (pending) |c| if (c.state() != .dead) return false;
+            if (self.preferred) |*p| if (p.poll_completion.state() != .dead) return false;
+            for (&self.cancel_completions) |*c| if (c.state() != .dead) return false;
+            if (self.http1_server) |*h1| if (!h1.isStopped()) return false;
+            if (comptime takes_heads) if (self.mailbox.watching) return false;
+            return true;
+        }
+
+        /// Explicitly drain the socket, process connections, and handle timeouts.
+        /// Use this from C API tick loops to avoid missing events between
+        /// non-blocking event loop polls (edge-triggered race in kqueue/epoll).
+        pub fn pollDirect(self: *Self) void {
+            self.in_callback = true;
+            _ = self.recvAllPackets();
+            self.processConnections();
+            self.runOnPass();
+            self.tickAndSend();
+            self.endPass();
+            self.endCallback();
+            if (self.stopping and self.allConnectionsClosed()) self.finishStop(null);
+        }
+
+        /// Build and send whatever is queued, now. Writes made through a
+        /// Session outside our callbacks already schedule a send for the next
+        /// loop iteration; call this to skip that wait, or when the loop is
+        /// not being run (a C API caller between ticks). Visits only the
+        /// connections a Session wrote to since the last pass, or every one
+        /// while draining or stopping, and for a handler with
+        /// `onPollComplete`.
+        pub fn flush(self: *Self) void {
+            // Sparse, only what was written to since the last pass: a host
+            // flushing after each batch of commands would otherwise pay for
+            // every connection on every batch. The marks stay for that pass.
+            const all = self.visitsAll();
+            const list = self.passList();
+            var i: usize = 0;
+            while (i < list.items.len) : (i += 1) {
+                const entry = list.items[i];
+                if (!all and !entry.needs_visit) continue;
+                self.examined += 1;
+                const conn = entry.conn;
+                if (conn.isClosed()) continue;
+                const batch = self.batchForConn(conn);
+                var send_count: usize = 0;
+                conn.beginBurst();
+                defer conn.endBurst();
+                while (send_count < 1000) : (send_count += 1) {
+                    const bytes_written = conn.send(batch.reserve()) catch break;
+                    if (bytes_written == 0) break;
+                    const send_addr = conn.peerAddress();
+                    batch.commit(
+                        bytes_written,
+                        @ptrCast(send_addr),
+                        connection.sockaddrLen(send_addr),
+                        conn.getEcnMark(),
+                    );
+                }
+                // What it sent armed timers rescheduleTimer reads from the cache.
+                self.conn_mgr.setDeadline(entry, entryDeadline(entry, sys.nanoTimestamp()));
+            }
+            self.batch.flush();
+            if (self.preferred) |*p| p.batch.flush();
+            self.rescheduleTimer();
+        }
+
+        /// Have a pass, and so the handler's `onPass`, run by `deadline_ns`
+        /// (`sys.nanoTimestamp()`); one already past runs it within a
+        /// millisecond. For work whose deadline came up outside the server's
+        /// own callbacks, where no pass follows to ask `onPass` for it: a
+        /// WebSocket callback, or a completion of the caller's own on the
+        /// loop. Loop thread only.
+        pub fn wakeAt(self: *Self, deadline_ns: i64) void {
+            if (comptime !@hasDecl(Handler, "onPass")) @compileError("wakeAt needs the handler's onPass");
+            if (self.stopping) return;
+            if (self.wake_at == null or deadline_ns < self.wake_at.?) self.wake_at = deadline_ns;
+            // A callback's pass reschedules once it is over.
+            if (!self.in_callback) self.rescheduleTimer();
+        }
+
+        /// Turn `Config.require_retry` on or off, for an embedder with its own
+        /// idea of load — CPU, memory, handshakes per second. Loop thread only.
+        pub fn setRequireRetry(self: *Self, on: bool) void {
+            self.conn_mgr.require_retry = on;
+        }
+
+        /// Begin a graceful shutdown: the first of its two steps, and what a
+        /// server under a process manager does on SIGTERM. It closes nothing
+        /// in use:
+        ///
+        /// - New QUIC connections are refused, each Initial answered with
+        ///   CONNECTION_REFUSED (RFC 9000 §5.2.2) unless
+        ///   `Config.new_while_draining` hands it on, and the HTTP/1.1 listener
+        ///   closes its socket, so new TCP connections are refused by the
+        ///   kernel, or under `reuse_port` go to another server on the port.
+        /// - Every HTTP/3 connection gets a GOAWAY (RFC 9114 §5.2) and every
+        ///   WebTransport session a WT_DRAIN_SESSION; see `Session.drainConnection`.
+        ///   Both, because a browser's `WebTransport.draining` follows one or
+        ///   the other: Firefox's only GOAWAY, Safari's only the capsule. Not
+        ///   with `options.signal_peers` off, for an application that tells its
+        ///   clients itself: see `DrainOptions` for what a GOAWAY costs them.
+        ///
+        /// Requests in flight carry on: the first GOAWAY names no limit, and a
+        /// PTO later a second one names the last request served, after which
+        /// new ones are rejected with H3_REQUEST_REJECTED. A connection whose
+        /// requests have finished, and whose peer has acked every response
+        /// byte, is closed with H3_NO_ERROR; idle HTTP/1.1 keep-alive
+        /// connections close now, and a response still in flight goes out with
+        /// `Connection: close`. WebTransport sessions and WebSockets stay open
+        /// until the handler or the peer ends them, and a connection whose
+        /// sessions are over closes as `Config.wt_close_after_sessions` says.
+        /// Raw-QUIC and HTTP/0.9 connections have no graceful signal: they are
+        /// the handler's to end.
+        ///
+        /// The sequence for an application:
+        ///
+        /// 1. `drain()`.
+        /// 2. End its sessions: tell each client why, in band; let a last
+        ///    message go on a stream with its FIN, and close the session (or
+        ///    let the client close it) once it has been read, since a close
+        ///    resets every stream of its session. The same for WebSockets.
+        /// 3. Run the loop until `isDrained()`, or a deadline passes.
+        /// 4. `stop()`, which closes whatever is left.
+        ///
+        /// Both may be called from the handler's own callbacks, `onPass`
+        /// included, as from outside them, on the server's own loop or a
+        /// shared one: checking `isDrained()` and the deadline in `onPass`
+        /// and calling `stop()` there is the intended shape. Loop thread
+        /// only: from a signal handler or another thread, see `requestDrain()`.
+        pub fn drain(self: *Self, options: DrainOptions) void {
+            if (self.draining or self.stopping) return;
+            self.draining = true;
+            self.drain_signals = options.signal_peers;
+            self.conn_mgr.refuse_new = true;
+            // Set here, not at init: `self` has stopped moving by now.
+            if (self.new_hook != null) self.conn_mgr.hand_new = .{ .ctx = self, .func = offerNew };
+            if (self.http1_server) |*h1| h1.drain();
+            if (options.signal_peers) {
+                const now: i64 = sys.nanoTimestamp();
+                for (self.conn_mgr.entries.items) |entry| beginDrain(entry, now);
+            }
+            self.flush();
+        }
+
+        fn offerNew(ctx: ?*anyopaque, bytes: []const u8, peer: *const posix.sockaddr.storage, local: *const posix.sockaddr.storage, ecn: u2) bool {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            const hook = self.new_hook orelse return false;
+            const dg: ForeignDatagram = .{ .bytes = bytes, .peer = peer.*, .local = local.*, .ecn = ecn, .server_id = &.{} };
+            return hook.func(hook.ctx, &dg);
+        }
+
+        /// True once `drain()` has left nothing in flight: every QUIC
+        /// connection has closed or is closing, and no HTTP/1.1 request or
+        /// WebSocket is open. `stop()` then finishes promptly.
+        pub fn isDrained(self: *Self) bool {
+            if (!self.draining) return false;
+            if (self.http1_server) |*h1| if (!h1.isDrained()) return false;
+            for (self.conn_mgr.entries.items) |entry| {
+                if (entry.conn.state != .closing and entry.conn.state != .draining and
+                    entry.conn.state != .terminated) return false;
+            }
+            return true;
+        }
+
+        /// One drain step for a connection whose HTTP/3 shutdown has begun:
+        /// the final GOAWAY once its time comes, then CONNECTION_CLOSE once
+        /// nothing is left in flight.
+        fn advanceDrain(entry: *ConnEntry, now: i64) void {
+            const conn = entry.conn;
+            if (conn.state == .closing or conn.state == .draining or conn.isClosed()) {
+                entry.drain_final_goaway_at = null; // a past deadline would spin the timer
+                return;
+            }
+            const h3c = entry.h3_conn orelse return;
+            if (h3c.shutdown_state == .going_away_initial) {
+                if (now < (entry.drain_final_goaway_at orelse now)) return;
+                entry.drain_final_goaway_at = null;
+                h3c.completeShutdown() catch {
+                    conn.close(@backingInt(h3.H3Error.no_error), "server shutdown");
+                    return;
+                };
+            }
+            const done = h3c.shutdown_state == .drain_complete or
+                (h3c.shutdown_state == .going_away_final and h3c.isDrainComplete());
+            if (!done) return;
+            // Closing drops whatever the peer has not acked yet, and the
+            // close path sends no RESET_STREAM for a request still to reject.
+            var it = conn.streams.streams.valueIterator();
+            while (it.next()) |s| {
+                const send = &s.*.send;
+                if (send.hasUnackedData()) return;
+                if (send.reset_err != null and !send.reset_stream_sent) return;
+            }
+            conn.close(@backingInt(h3.H3Error.no_error), "");
+        }
+
+        /// Close everything now: the second step of a graceful shutdown (see
+        /// `drain`), or the only one. Every QUIC connection gets its
+        /// CONNECTION_CLOSE at once, H3_NO_ERROR on HTTP/3 and application
+        /// error 0 on raw QUIC: what the peer has not acked is lost, and a
+        /// browser's `WebTransport.closed` rejects. Every open WebSocket gets
+        /// a Close with 1001 (going away), sent if its socket takes it at
+        /// once, and the handler `onWsClose(1001)`; other TCP connections are
+        /// dropped. The CONNECTION_CLOSEs are flushed before this returns.
+        /// Once the connections' closing periods are over, the loop exits,
+        /// or on a shared loop the server takes itself off it: keep running
+        /// it until `isStopped()`. Callable from a handler callback, `onPass`
+        /// included: the pass it is called in finishes first. Loop thread
+        /// only: from a signal handler or another thread, see `requestStop()`.
+        pub fn stop(self: *Self) void {
+            self.stopping = true;
+            if (self.http1_server) |*h1| h1.stop();
+            self.conn_mgr.refuse_new = true; // or arrivals keep stop() from finishing
+            self.conn_mgr.hand_new = null;
+            for (self.conn_mgr.entries.items) |entry| {
+                const conn = entry.conn;
+                if (!conn.isClosed() and conn.state != .closing and conn.state != .draining) {
+                    const code: u64 = if (entry.h3_conn != null) @backingInt(h3.H3Error.no_error) else 0;
+                    conn.close(code, "server shutdown");
+                }
+            }
+            // close() only queues the frame. Waiting for the loop to send it
+            // is fine when the caller goes on to run(), and silently wrong
+            // when it exits instead — the peer then holds the connection
+            // until its idle timeout rather than learning we are gone.
+            self.flush();
+            // In a callback, the pass's own end finishes it: a watch can't
+            // be cancelled from inside its callback.
+            if (self.started and !self.in_callback and self.allConnectionsClosed()) self.finishStop(null);
+        }
+
+        /// `stop()`, for a signal handler or another thread: it wakes the
+        /// loop and returns, and `stop()` runs on the loop thread. The way
+        /// to end `run()` on SIGINT or SIGTERM. Nothing else here may be
+        /// called from those places, `stop()` included: it would run the
+        /// shutdown in the middle of whatever the loop was doing, and a loop
+        /// waiting in the kernel would not wake to finish it.
+        ///
+        /// Async-signal-safe, and safe from any thread (a Windows console
+        /// control handler runs on one of its own), any time from `init()`
+        /// until `deinit()`: clear the pointer a signal handler calls it
+        /// through before then. Made before `start()`, it takes effect as
+        /// the loop starts.
+        ///
+        /// Only for a server that owns its loop, like `run()`. A shared
+        /// loop's owner wakes it with an `xev.Async` of its own, once for
+        /// everything on it, and calls `stop()` there.
+        pub fn requestStop(self: *Self) void {
+            std.debug.assert(self.shared_loop == null);
+            self.shutdown.post(Shutdown.stop);
+        }
+
+        /// `drain(options)`, for a signal handler or another thread: the
+        /// usual answer to SIGTERM under a process manager. See
+        /// `requestStop`.
+        pub fn requestDrain(self: *Self, options: DrainOptions) void {
+            std.debug.assert(self.shared_loop == null);
+            self.shutdown.post(Shutdown.drain | if (options.signal_peers) 0 else Shutdown.drain_quietly);
+        }
+
+        fn onShutdownPosted(
+            self_opt: ?*Self,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            _: xev.Async.WaitError!void, // the flags say what was asked
+        ) xev.CallbackAction {
+            const self = self_opt orelse return .disarm;
+            const asked = self.shutdown.take();
+            if (asked & Shutdown.drain != 0) self.drain(.{ .signal_peers = asked & Shutdown.drain_quietly == 0 });
+            if (asked & Shutdown.stop != 0) self.stop();
+            return .rearm; // an own loop ends by stopping, armed or not
+        }
+
+        /// The last step of `stop()`, once every connection has closed. Our
+        /// own loop just stops; a shared one keeps running, so everything we
+        /// have on it is cancelled instead.
+        ///
+        /// `running` is the socket watch whose callback we are in, if any: it
+        /// leaves by returning `.disarm` instead, as cancelling it from inside
+        /// its own callback does not take.
+        fn finishStop(self: *Self, running: ?*xev.Completion) void {
+            if (self.shared_loop == null) {
+                self.own_loop.stop();
+                return;
+            }
+            if (self.halted) return;
+            self.halted = true;
+            const loop = self.eventLoop();
+            if (running != &self.poll_completion) {
+                cancelCompletion(loop, &self.poll_completion, &self.cancel_completions[0]);
+            }
+            if (self.preferred) |*p| if (running != &p.poll_completion) {
+                cancelCompletion(loop, &p.poll_completion, &self.cancel_completions[1]);
+            };
+            cancelCompletion(loop, &self.timer_completion, &self.cancel_completions[2]);
+            cancelCompletion(loop, &self.wake_completion, &self.cancel_completions[3]);
+        }
+
+        // A zero-delay pass for writes made outside our callbacks.
+        fn scheduleWake(self: *Self) void {
+            if (self.in_callback) {
+                self.written_in_pass = true;
+                return;
+            }
+            self.armWake();
+        }
+
+        fn endCallback(self: *Self) void {
+            self.in_callback = false;
+            if (self.written_in_pass) {
+                self.written_in_pass = false;
+                self.armWake();
+            }
+        }
+
+        fn armWake(self: *Self) void {
+            if (self.halted or self.wake_armed or !self.started) return;
+            self.timer.run(self.eventLoop(), &self.wake_completion, 0, Self, self, onWake);
+            self.wake_armed = true;
+        }
+
+        fn wakeFromEntry(ctx: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.scheduleWake();
+        }
+
+        // Unlike a write, nothing in the current pass would pick this up.
+        fn repollFromEntry(ctx: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.armWake();
+        }
+
+        fn onWake(
+            self_opt: ?*Self,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            r: xev.Timer.RunError!void,
+        ) xev.CallbackAction {
+            const self = self_opt orelse return .disarm;
+            self.wake_armed = false;
+            _ = r catch return .disarm;
+            if (self.halted) return .disarm;
+            self.service();
+            return .disarm;
+        }
+
+        /// After a pass's sends: let go of the connections handed over, and
+        /// free the ones that closed. Freed only now so that stale Session
+        /// pointers from processConnections, which may still be on the stack,
+        /// safely see wt_conn == null instead of freed memory.
+        fn endPass(self: *Self) void {
+            if (self.conn_mgr.handovers.items.len > 0) self.detachHandovers();
+            self.conn_mgr.freeDeadEntries();
+        }
+
+        fn detachHandovers(self: *Self) void {
+            const mgr = &self.conn_mgr;
+            while (mgr.handovers.pop()) |h| {
+                const entry = h.entry;
+                entry.handing_over = false;
+                const conn = entry.conn;
+                // Closing, or we are: it ends here, with the rest.
+                if (self.stopping or self.draining or conn.isClosed() or
+                    conn.state == .closing or conn.state == .draining) continue;
+                // Its requests' streams stay on this server: they end here.
+                self.dropStreams(entry.id);
+                mgr.detach(entry, h.to);
+                if (comptime @hasDecl(Handler, "onHandover")) self.handler.onHandover(.{ .entry = entry, .moved = mgr.moved.? });
+            }
+        }
+
+        /// Take in a connection a sibling server let go of (`Session.handOver`),
+        /// and serve it from here on: its handler is ours, and its next
+        /// events, the rest of what it had received included, come to ours.
+        /// The peer is given CIDs carrying our QUIC-LB id and told to retire
+        /// the old server's, which route here until it does (RFC 9000
+        /// §5.1.2); a peer that never switches is still steered here.
+        ///
+        /// The connection is ours either way: on error it is closed without
+        /// a word, and its next packet draws a stateless reset. Errors when
+        /// this server has no `moved_cids`, or does not share the old one's
+        /// `static_reset_key` or CID length. `max_connections` does not
+        /// apply: the connection was admitted where it began.
+        ///
+        /// Loop thread only, outside the server's callbacks. Writes made
+        /// through the Session it returns go out on the next pass.
+        pub fn adopt(self: *Self, h: Handover) !Session {
+            const entry = h.entry;
+            const conn = entry.conn;
+            errdefer h.discard();
+            if (self.conn_mgr.moved == null) return error.HandoverNotConfigured;
+            if (!std.mem.eql(u8, &conn.static_reset_key, &self.conn_mgr.static_reset_key)) return error.ResetKeyMismatch;
+            try self.conn_mgr.adopt(entry);
+            errdefer unreachable; // adopted: nothing below fails
+            _ = conn.rotateLocalCids(self.conn_mgr.conn_config.quic_lb);
+            self.conn_mgr.syncCids(entry);
+
+            if (entry.h3_initialized) {
+                entry.wake_fn = wakeFromEntry;
+                entry.repoll_fn = repollFromEntry;
+                entry.wake_ctx = self;
+            }
+            // Shared per loop, so the old server's would be read on two threads.
+            if (entry.h3_conn) |h3c| if (!h3c.qpack_scratch_owned) {
+                h3c.qpack_scratch = &self.qpack_scratch;
+                h3c.headers_buf = &self.qpack_headers;
+            };
+            if (entry.wt_conn != null and @hasDecl(Handler, "onDatagram")) {
+                conn.datagram_recv_callback = datagramRecvCallback;
+                conn.datagram_recv_ctx = @ptrCast(entry);
+                entry.datagram_handler_ctx = @ptrCast(self.handler);
+            } else {
+                conn.datagram_recv_callback = null;
+                entry.datagram_handler_ctx = null;
+            }
+            if (self.stopping) conn.close(0, "server shutdown");
+            self.armWake();
+            return .{ .entry = entry };
+        }
+
+        /// One pass over everything: read, dispatch, send, reap. Shared by
+        /// the timer and wakeup callbacks.
+        fn service(self: *Self) void {
+            const began = sys.nanoTimestamp();
+            self.in_callback = true;
+            _ = self.recvAllPackets();
+            self.processConnections();
+            self.runOnPass();
+            self.tickAndSend();
+            self.endPass();
+            self.endCallback();
+            self.timePass(began);
+
+            if (self.stopping and self.allConnectionsClosed()) {
+                self.finishStop(null);
+                return;
+            }
+            self.rescheduleTimer();
+        }
+
+        fn timePass(self: *Self, began: i64) void {
+            self.passes += 1;
+            self.pass_ns += @intCast(@max(sys.nanoTimestamp() - began, 0));
+        }
+
+        // ---- Internal callbacks ----
+
+        fn onReadable(
+            self_opt: ?*Self,
+            _: *xev.Loop,
+            c: *xev.Completion,
+            _: xev.File,
+            r: xev.PollError!xev.PollEvent,
+        ) xev.CallbackAction {
+            forgetPollResult(c);
+            const self = self_opt orelse return .disarm;
+            // Before the result: a cancelled watch gets its error on some
+            // backends, and rearming it would put the watch back.
+            if (self.halted) return halted_poll_action;
+            _ = r catch return .rearm;
+            const began = sys.nanoTimestamp();
+            self.in_callback = true;
+
+            // Process loop: receive → dispatch events → send responses.
+            // Loop to catch packets that arrive during processing (critical for
+            // edge-triggered I/O where we'd otherwise miss them until the next
+            // timer fires, causing ~30ms latency spikes).
+            var iterations: usize = 0;
+            while (iterations < 4) : (iterations += 1) {
+                const received = self.recvAllPackets();
+                self.processConnections();
+                self.runOnPass();
+                self.tickAndSend();
+                self.endPass();
+
+                // If no new packets arrived during this cycle, we're done.
+                // On the first iteration we always process (triggered by poll event).
+                if (iterations > 0 and !received) break;
+            }
+            self.endCallback();
+            self.timePass(began);
+
+            if (self.stopping and self.allConnectionsClosed()) {
+                self.finishStop(c);
+                return .disarm;
+            }
+
+            // Reschedule timer
+            self.rescheduleTimer();
+
+            return .rearm;
+        }
+
+        fn onTimer(
+            self_opt: ?*Self,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            r: xev.Timer.RunError!void,
+        ) xev.CallbackAction {
+            _ = r catch return .disarm;
+            const self = self_opt orelse return .disarm;
+            self.timer_armed = false;
+            if (self.halted) return .disarm;
+
+            // Drains the socket too: an edge-triggered poll may not re-fire
+            // for data that arrived while we were processing.
+            self.service();
+
+            return .disarm; // one-shot; rescheduled via rescheduleTimer
+        }
+
+        fn recvAllPackets(self: *Self) bool {
+            var received = self.drainSocket(self.sockfd, self.local_addr, &self.batch);
+            if (self.preferred) |*p| {
+                if (self.drainSocket(p.sockfd, p.local_addr, &p.batch)) received = true;
+            }
+            return received;
+        }
+
+        /// `replies` takes the answers to datagrams that get one at once.
+        fn drainSocket(self: *Self, sockfd: posix.socket_t, local_addr: posix.sockaddr.storage, replies: *ecn_socket.SendBatch) bool {
+            var n: usize = 0;
+            while (n < max_recv_per_pass) {
+                const got = self.recv_batch.recv(sockfd, max_recv_per_pass - n) catch break;
+                // One clock read a batch: each of its datagrams had arrived by then.
+                self.conn_mgr.recv_time = sys.nanoTimestamp();
+                for (self.recv_batch.results[0..got], 0..) |*recv_result, i| {
+                    self.dispatchDatagram(self.recv_batch.datagram(i), recv_result, local_addr, replies);
+                }
+                n += got;
+            }
+            self.conn_mgr.recv_time = null;
+            // The rest on the next pass, without waiting for another edge.
+            if (n == max_recv_per_pass) self.armWake();
+
+            return n > 0;
+        }
+
+        fn dispatchDatagram(self: *Self, bytes: []u8, recv_result: *const ecn_socket.RecvResult, local_addr: posix.sockaddr.storage, replies: *ecn_socket.SendBatch) void {
+            if (recv_result.kernel_ns != 0) {
+                // SO_TIMESTAMPNS stamps the wall clock, so the comparison
+                // has to be made on it rather than on the monotonic one.
+                const now_ns: i64 = sys.realtimeNs();
+                self.rx_wait.record(now_ns - recv_result.kernel_ns);
+                self.rx_wait.maybeReport(now_ns);
+            }
+            if (recv_result.truncated) {
+                std.log.warn("datagram truncated at {d} bytes — raise MAX_RECV_DATAGRAM", .{recv_result.bytes_read});
+            }
+
+            switch (self.conn_mgr.recvDatagram(
+                bytes,
+                recv_result.from_addr,
+                local_addr,
+                recv_result.ecn,
+                &self.out_buf,
+            )) {
+                .processed => {},
+                .send_response => |data| {
+                    replies.add(data, @ptrCast(&recv_result.from_addr), recv_result.addr_len, 0);
+                },
+                .dropped => {},
+                .foreign => |server_id| if (self.foreign_hook) |hook| {
+                    const dg: ForeignDatagram = .{
+                        .bytes = bytes,
+                        .peer = recv_result.from_addr,
+                        .local = local_addr,
+                        .ecn = recv_result.ecn,
+                        .server_id = server_id,
+                    };
+                    hook.func(hook.ctx, &dg);
+                },
+            }
+        }
+
+        /// Process a datagram another server received for one of our
+        /// connections (see `Config.foreign_datagram`) as if it had arrived
+        /// on our own socket: the connection sees `peer` as its source, and
+        /// replies go out on our socket — the one whose address is `local`
+        /// if it is our preferred-address socket, else the main one.
+        ///
+        /// Must be called on this server's loop thread, and not from inside
+        /// one of its callbacks. `bytes` is decrypted in place.
+        ///
+        /// A datagram we do not recognise either is answered with a stateless
+        /// reset, never handed on again.
+        pub fn injectDatagram(
+            self: *Self,
+            bytes: []u8,
+            peer: posix.sockaddr.storage,
+            local: posix.sockaddr.storage,
+            ecn: u2,
+        ) void {
+            if (!self.started or self.halted) return;
+            var batch = &self.batch;
+            var on = self.local_addr;
+            if (self.preferred) |*p| {
+                if (connection.sockaddrPort(&local) == p.port) {
+                    batch = &p.batch;
+                    on = p.local_addr;
+                }
+            }
+            self.in_callback = true;
+            switch (self.conn_mgr.recvHandedOver(bytes, peer, on, ecn, &self.out_buf)) {
+                .send_response => |data| batch.add(data, @ptrCast(&peer), connection.sockaddrLen(&peer), 0),
+                .processed, .dropped => {},
+                // Its connection moved on from here.
+                .foreign => |server_id| if (self.foreign_hook) |hook| {
+                    const dg: ForeignDatagram = .{ .bytes = bytes, .peer = peer, .local = local, .ecn = ecn, .server_id = server_id };
+                    hook.func(hook.ctx, &dg);
+                },
+            }
+            self.in_callback = false;
+            // One pass covers every datagram handed over this loop tick.
+            self.armWake();
+        }
+
+        /// Pick the correct SendBatch for a connection based on its local port.
+        /// After preferred_address migration, the connection's local_addr will
+        /// have the preferred port, so we send from the preferred socket.
+        fn batchForConn(self: *Self, conn: *connection.Connection) *ecn_socket.SendBatch {
+            if (self.preferred) |*p| {
+                if (connection.sockaddrPort(conn.localAddress()) == p.port) return &p.batch;
+            }
+            return &self.batch;
+        }
+
+        /// A handler with `onPollComplete` expects it for every connection on
+        /// every pass. Without one, a pass looks only at connections that
+        /// received, were written to or have a deadline due, so a pass costs
+        /// what is active rather than everything connected: those are the
+        /// manager's `to_visit` and the due end of its `timers`.
+        const sparse_passes = !@hasDecl(Handler, "onPollComplete");
+
+        fn visitsAll(self: *const Self) bool {
+            return !sparse_passes or self.draining or self.stopping;
+        }
+
+        /// The entries a pass goes through.
+        fn passList(self: *Self) *std.ArrayList(*ConnEntry) {
+            return if (self.visitsAll()) &self.conn_mgr.entries else &self.conn_mgr.to_visit;
+        }
+
+        /// Whether a visit has to poll `entry`'s protocol layers. A write alone
+        /// does not: it only needs sending.
+        fn wantsPoll(entry: *const ConnEntry) bool {
+            if (entry.needs_poll or entry.conn.app_frames) return true;
+            // Through the handshake, its last pass included, and once closing.
+            if (!entry.h3_initialized or !entry.conn.isEstablished()) return true;
+            // These can come true with no frame: our own sends drain a backlog,
+            // a lower layer reclaims a held stream's session.
+            if (entry.wt_conn) |wtc| {
+                if (wtc.writable_waits.items.len > 0 or wtc.held_streams.count() > 0) return true;
+            }
+            if (entry.h3_conn) |h3c| if (h3c.writable_waits.items.len > 0) return true;
+            return false;
+        }
+
+        fn processConnections(self: *Self) void {
+            const all = self.visitsAll();
+            const list = self.passList();
+            // By index: a handler marking another entry appends it.
+            var i: usize = 0;
+            while (i < list.items.len) : (i += 1) {
+                const entry = list.items[i];
+                self.examined += 1;
+                // Due timers alone are tickAndSend's; events need a packet or the app.
+                if (!all and !entry.needs_visit and !entry.needs_poll) continue;
+                const conn = entry.conn;
+                const poll = all or wantsPoll(entry);
+
+                // Initialize protocol layer once handshake completes
+                if (conn.isEstablished() and !entry.h3_initialized) {
+                    self.initProtocol(entry);
+                }
+
+                if (poll) {
+                    // Cleared first: a handler asking for another poll gets one.
+                    entry.needs_poll = false;
+                    conn.app_frames = false;
+                    entry.needs_visit = true; // what polling queues goes out this pass
+                    self.polls += 1;
+                    switch (Handler.protocol) {
+                        .webtransport => if (entry.raw_quic) self.pollQuicEvents(entry) else self.pollWtEvents(entry),
+                        .h3 => self.pollH3Events(entry),
+                        .h0 => self.pollH0Events(entry),
+                        .quic => self.pollQuicEvents(entry),
+                    }
+                }
+
+                // Remove streams that were queued for disposal during this cycle.
+                // WT layer reads the queue first (to clean its own maps), then
+                // QUIC layer drains it (actually removing stream objects).
+                if (entry.wt_conn) |wtc| {
+                    wtc.drainDisposalQueue(); // chains to its H3 layer
+                } else if (entry.h3_conn) |h3c| {
+                    h3c.drainDisposalQueue();
+                }
+                for (conn.streams.disposal_queue[0..conn.streams.disposal_count]) |id| {
+                    _ = entry.finished_streams.swapRemove(id);
+                }
+                conn.streams.drainDisposalQueue();
+            }
+        }
+
+        /// Zero-copy datagram callback: fires during QUIC packet processing,
+        /// before the data is copied to any ring buffer. `data` is a slice into
+        /// the decrypted packet and is only valid for the duration of this call.
+        fn datagramRecvCallback(data: []const u8, ctx: ?*anyopaque) void {
+            const entry: *ConnEntry = @ptrCast(@alignCast(ctx orelse return));
+            if (entry.handing_over) return;
+            const wtc = entry.wt_conn orelse return;
+
+            // Parse WT quarter_stream_id prefix inline
+            var reader: std.Io.Reader = .fixed(data);
+            const quarter_id = packet.readVarInt(&reader) catch return;
+            const session_id = quarter_id * 4;
+
+            if (!wtc.sessionActive(session_id)) return;
+            const payload = data[reader.seek..];
+
+            // Deliver directly to handler — bypasses ring buffer + poll chain entirely.
+            const handler_ptr: *Handler = @ptrCast(@alignCast(entry.datagram_handler_ctx orelse return));
+            var session = Session{ .entry = entry };
+            handler_ptr.onDatagram(&session, session_id, payload);
+        }
+
+        fn initProtocol(self: *Self, entry: *ConnEntry) void {
+            self.buildLayers(entry) catch |err| {
+                // Left half-built, the next pass would build another over it.
+                connection_manager.destroyProtocols(self.allocator, entry.wt_conn, entry.h3_conn, entry.h0_conn);
+                entry.wt_conn = null;
+                entry.h3_conn = null;
+                entry.h0_conn = null;
+                const code: h3.H3Error = if (err == error.StreamLimitError) .general_protocol_error else .internal_error;
+                entry.conn.close(@backingInt(code), "protocol setup failed");
+                return;
+            };
+
+            entry.wake_fn = wakeFromEntry;
+            entry.repoll_fn = repollFromEntry;
+            entry.wake_ctx = self;
+            entry.h3_initialized = true;
+
+            if (serves_raw_quic and entry.raw_quic and @hasDecl(Handler, "onQuicConnected")) {
+                var session = Session{ .entry = entry };
+                self.handler.onQuicConnected(&session);
+            }
+
+            // Finished its handshake after drain() began: it may send nothing.
+            if (self.draining and self.drain_signals) if (entry.h3_conn) |h3c| {
+                h3c.sendGoaway(0) catch entry.conn.close(@backingInt(h3.H3Error.no_error), "server shutdown");
+            };
+        }
+
+        /// A layer is the entry's as soon as it is built, so a failure part
+        /// way leaves the caller everything to free.
+        fn buildLayers(self: *Self, entry: *ConnEntry) !void {
+            if (serves_raw_quic and !std.mem.eql(u8, entry.conn.negotiatedAlpn(), "h3")) {
+                entry.raw_quic = true;
+                return;
+            }
+            switch (Handler.protocol) {
+                .webtransport => {
+                    const h3c = try self.allocator.create(h3.H3Connection);
+                    h3c.* = h3.H3Connection.init(self.allocator, entry.conn, true);
+                    entry.h3_conn = h3c;
+                    h3c.qpack_scratch = &self.qpack_scratch;
+                    h3c.headers_buf = &self.qpack_headers;
+                    h3c.local_settings = .{
+                        .enable_connect_protocol = true,
+                        .h3_datagram = true,
+                        .enable_webtransport = self.wt_settings.legacy,
+                        .webtransport_max_sessions = if (self.wt_settings.legacy) self.wt_settings.max_sessions else null,
+                        .wt_max_sessions_v13 = self.wt_settings.max_sessions,
+                        .wt_initial_max_data = announced(self.wt_settings.advertise_credits, self.wt_settings.credits.max_data),
+                        .wt_initial_max_streams_bidi = announced(self.wt_settings.advertise_credits, self.wt_settings.credits.max_streams_bidi),
+                        .wt_initial_max_streams_uni = announced(self.wt_settings.advertise_credits, self.wt_settings.credits.max_streams_uni),
+                    };
+                    try h3c.initConnection();
+
+                    const wtc = try self.allocator.create(wt.WebTransportConnection);
+                    wtc.* = wt.WebTransportConnection.init(self.allocator, h3c, entry.conn, true);
+                    wtc.grants = self.wt_settings.credits;
+                    entry.wt_conn = wtc;
+
+                    // Install zero-copy datagram callback on the QUIC connection.
+                    // Datagrams will be delivered directly during packet processing,
+                    // bypassing the recv ring buffer entirely.
+                    if (@hasDecl(Handler, "onDatagram")) {
+                        entry.conn.datagram_recv_callback = datagramRecvCallback;
+                        entry.conn.datagram_recv_ctx = @ptrCast(entry);
+                        entry.datagram_handler_ctx = @ptrCast(self.handler);
+                    }
+                },
+                .h3 => {
+                    const h3c = try self.allocator.create(h3.H3Connection);
+                    h3c.* = h3.H3Connection.init(self.allocator, entry.conn, true);
+                    entry.h3_conn = h3c;
+                    h3c.qpack_scratch = &self.qpack_scratch;
+                    h3c.headers_buf = &self.qpack_headers;
+                    try h3c.initConnection();
+                },
+                .h0 => {
+                    const h0c = try self.allocator.create(h0.H0Connection);
+                    h0c.* = h0.H0Connection.init(self.allocator, entry.conn, true);
+                    entry.h0_conn = h0c;
+                },
+                .quic => {},
+            }
+        }
+
+        fn pollWtEvents(self: *Self, entry: *ConnEntry) void {
+            if (entry.wt_conn == null) return;
+            const wtc = entry.wt_conn.?;
+            var session = Session{ .entry = entry };
+
+            // Allow handler to run deferred work each poll cycle
+            if (@hasDecl(Handler, "onPollComplete")) {
+                self.handler.onPollComplete(&session);
+            }
+
+            // Fast-path: drain datagrams directly without going through the
+            // full wt.poll() chain. This avoids O(event_types) overhead per
+            // datagram by calling pollDatagrams() directly.
+            if (@hasDecl(Handler, "onDatagram")) {
+                while (!entry.handing_over) {
+                    const dg_event = wtc.pollDatagrams() orelse break;
+                    switch (dg_event) {
+                        .datagram => |dg| self.handler.onDatagram(&session, dg.session_id, dg.data),
+                        else => unreachable,
+                    }
+                }
+            }
+
+            // A handover leaves the rest for the new server to deliver.
+            while (!entry.handing_over) {
+                const event = wtc.poll() catch break;
+                if (event == null) break;
+
+                switch (event.?) {
+                    .connect_request => |req| {
+                        self.dispatchConnectRequest(&session, req.session_id, req.path, req.headers);
+                    },
+                    .session_ready => |sr| {
+                        self.dispatchSessionReady(&session, sr.session_id, sr.headers);
+                    },
+                    .stream_data => |sd| {
+                        self.dispatchStreamData(&session, sd.stream_id, sd.data, sd.fin);
+                        if (sd.data.len > 0) self.allocator.free(sd.data);
+                    },
+                    .datagram => |dg| {
+                        if (@hasDecl(Handler, "onDatagram")) {
+                            self.handler.onDatagram(&session, dg.session_id, dg.data);
+                        }
+                    },
+                    .session_closed => |cls| {
+                        self.dispatchSessionClosed(&session, cls.session_id, cls.error_code, cls.reason, cls.abrupt);
+                    },
+                    .session_draining => |sd| {
+                        if (@hasDecl(Handler, "onSessionDraining")) {
+                            self.handler.onSessionDraining(&session, sd.session_id);
+                        }
+                    },
+                    .bidi_stream => |bs| {
+                        if (@hasDecl(Handler, "onBidiStream")) {
+                            self.handler.onBidiStream(&session, bs.session_id, bs.stream_id);
+                        }
+                    },
+                    .uni_stream => |us| {
+                        if (@hasDecl(Handler, "onUniStream")) {
+                            self.handler.onUniStream(&session, us.session_id, us.stream_id);
+                        }
+                    },
+                    .stream_reset => |rst| {
+                        if (@hasDecl(Handler, "onStreamReset")) {
+                            self.handler.onStreamReset(&session, rst.session_id, rst.stream_id, rst.error_code);
+                        }
+                    },
+                    .stream_stop_sending => |ss| {
+                        if (@hasDecl(Handler, "onStopSending")) {
+                            self.handler.onStopSending(&session, ss.session_id, ss.stream_id, ss.error_code);
+                        }
+                    },
+                    .writable => |w| {
+                        if (w.stream_id) |sid| if (self.streamWritable(&session, sid)) continue;
+                        if (@hasDecl(Handler, "onWritable")) {
+                            self.handler.onWritable(&session, w.session_id, w.stream_id);
+                        }
+                    },
+                    .session_rejected => {},
+                    .request => |req| self.dispatchRequest(&session, req.stream_id, req.headers),
+                    .request_data => |d| self.dispatchRequestData(&session, d.stream_id, d.data),
+                    .request_end => |sid| self.dispatchRequestEnd(&session, sid),
+                    .request_cancelled => |rc| self.dispatchRequestCancelled(&session, rc.stream_id, rc.error_code),
+                }
+            }
+        }
+
+        /// Header slices end with their callback: every connection on the
+        /// loop decodes into `qpack_scratch`. Safe builds poison it, so a
+        /// handler that kept one reads 0xAA in its tests rather than, in
+        /// production, the next client's headers.
+        fn forgetHeaders(self: *Self) void {
+            @memset(&self.qpack_scratch, undefined);
+        }
+
+        fn dispatchRequest(self: *Self, session: *Session, stream_id: u64, headers: []const qpack.Header) void {
+            defer self.forgetHeaders();
+            if (comptime takes_heads) {
+                self.startStream(session, stream_id, headers);
+            } else if (@hasDecl(Handler, "onRequest")) {
+                self.handler.onRequest(session, stream_id, headers);
+            } else {
+                // Nobody will answer it, so say so instead of leaving it open.
+                session.resetRequest(stream_id, @backingInt(h3.H3Error.request_rejected));
+            }
+        }
+
+        fn dispatchRequestEnd(self: *Self, session: *Session, stream_id: u64) void {
+            if (comptime takes_heads) {
+                if (self.h3Stream(session, stream_id)) |st| {
+                    st.body_window = null;
+                    self.handler.onHttpEnd(&st.ex);
+                }
+            } else if (@hasDecl(Handler, "onRequestEnd")) self.handler.onRequestEnd(session, stream_id);
+        }
+
+        fn dispatchRequestCancelled(self: *Self, session: *Session, stream_id: u64, error_code: u64) void {
+            if (comptime takes_heads) {
+                if (self.h3Stream(session, stream_id)) |st| st.hearGone();
+            }
+            if (@hasDecl(Handler, "onRequestCancelled")) self.handler.onRequestCancelled(session, stream_id, error_code);
+        }
+
+        fn dispatchRequestData(self: *Self, session: *Session, stream_id: u64, data: []const u8) void {
+            if (comptime takes_heads) {
+                if (self.h3Stream(session, stream_id)) |st| {
+                    if (st.body_window) |*w| w.got += data.len;
+                    self.handler.onHttpBody(&st.ex, data);
+                }
+            } else if (@hasDecl(Handler, "onData")) self.handler.onData(session, stream_id, data);
+        }
+
+        const StreamKey = struct { conn: u64, stream: u64 };
+
+        fn h3Stream(self: *Self, session: *const Session, stream_id: u64) ?*H3Stream {
+            return self.h3_streams.get(.{ .conn = session.id(), .stream = stream_id });
+        }
+
+        /// An HTTP/3 request offered at its head (`onHttpHead`). Freed once
+        /// answered or gone; its connection's entry outlives it, since
+        /// `endConnection` ends the streams first.
+        const H3Stream = struct {
+            ex: Exchange,
+            server: *Self,
+            session: Session,
+            stream_id: u64,
+            /// Its body on its way in; null once it has ended.
+            body_window: ?http.BodyWindow,
+            /// Since when its answer has waited for the client to make room.
+            stalled_ms: ?i64 = null,
+
+            /// Below this much unsent, `onHttpWritable` says go on.
+            const writable_mark = 64 * 1024;
+
+            const vtable: Exchange.VTable = .{
+                .peer = peer,
+                .head = head,
+                .body = body,
+                .end = end,
+                .reset = reset,
+                .buffered = buffered,
+                .cork = cork,
+            };
+
+            fn of(ptr: *anyopaque) *H3Stream {
+                return @ptrCast(@alignCast(ptr));
+            }
+
+            fn release(self: *H3Stream) void {
+                _ = self.server.h3_streams.remove(.{ .conn = self.session.id(), .stream = self.stream_id });
+                self.server.allocator.destroy(self);
+            }
+
+            fn hearGone(self: *H3Stream) void {
+                self.ex.answer = .done;
+                self.server.handler.onHttpGone(&self.ex);
+                self.release();
+            }
+
+            fn peer(ptr: *anyopaque) *const posix.sockaddr.storage {
+                return of(ptr).session.entry.conn.peerAddress();
+            }
+
+            fn head(ptr: *anyopaque, status: u16, headers: []const http.Header, framing: Exchange.Framing) Exchange.WriteError!void {
+                const self = of(ptr);
+                var fields: [h3.MAX_HEADERS]qpack.Header = undefined;
+                var names: [4096]u8 = undefined;
+                var status_text: [3]u8 = undefined;
+                var length_text: [20]u8 = undefined;
+                fields[0] = .{ .name = ":status", .value = std.fmt.bufPrint(&status_text, "{d}", .{status}) catch return error.Closed };
+                var n: usize = 1;
+                var used: usize = 0;
+                for (headers) |h| {
+                    if (http.transportsOwn(h.name)) continue;
+                    if (n + 1 == fields.len or used + h.name.len > names.len) return error.Closed;
+                    fields[n] = .{ .name = std.ascii.lowerString(names[used..][0..h.name.len], h.name), .value = h.value };
+                    used += h.name.len;
+                    n += 1;
+                }
+                if (framing == .length) {
+                    fields[n] = .{ .name = "content-length", .value = std.fmt.bufPrint(&length_text, "{d}", .{framing.length}) catch unreachable };
+                    n += 1;
+                }
+                self.session.sendResponseHeaders(self.stream_id, fields[0..n]) catch return error.Closed;
+            }
+
+            fn body(ptr: *anyopaque, data: []const u8) Exchange.WriteError!void {
+                const self = of(ptr);
+                self.session.sendResponseData(self.stream_id, data) catch return error.Closed;
+                if ((self.session.streamBufferedBytes(self.stream_id) orelse 0) >= writable_mark) {
+                    self.session.notifyWritable(0, self.stream_id, writable_mark) catch {};
+                    if (self.stalled_ms == null) self.stalled_ms = nowMs();
+                }
+            }
+
+            fn end(ptr: *anyopaque) void {
+                const self = of(ptr);
+                self.session.finishResponse(self.stream_id, null) catch {};
+                self.release();
+            }
+
+            fn reset(ptr: *anyopaque) void {
+                const self = of(ptr);
+                self.session.resetRequest(self.stream_id, @backingInt(h3.H3Error.internal_error));
+                self.release();
+            }
+
+            fn buffered(ptr: *anyopaque) usize {
+                const self = of(ptr);
+                return @intCast(self.session.streamBufferedBytes(self.stream_id) orelse 0);
+            }
+
+            /// A pass's writes leave together already.
+            fn cork(_: *anyopaque, _: bool) void {}
+        };
+
+        /// Offers an HTTP/3 request to `onHttpHead`; its head's slices are
+        /// valid only there.
+        fn startStream(self: *Self, session: *Session, stream_id: u64, headers: []const qpack.Header) void {
+            var method: []const u8 = "";
+            var path: []const u8 = "";
+            // Pseudo-headers come first: what follows them is the request's own.
+            var first: usize = 0;
+            for (headers, 0..) |h, i| {
+                if (h.name.len == 0 or h.name[0] != ':') break;
+                if (std.mem.eql(u8, h.name, ":method")) method = h.value;
+                if (std.mem.eql(u8, h.name, ":path")) path = h.value;
+                first = i + 1;
+            }
+            if (method.len == 0 or path.len == 0) return session.resetRequest(stream_id, @backingInt(h3.H3Error.message_error));
+            const st = self.allocator.create(H3Stream) catch return session.resetRequest(stream_id, @backingInt(h3.H3Error.internal_error));
+            st.* = .{
+                .server = self,
+                .session = session.*,
+                .stream_id = stream_id,
+                .body_window = .start(nowMs(), self.stall_timeout_ms),
+                .ex = .{
+                    .method = method,
+                    .target = path,
+                    .headers = headers[first..],
+                    .content_length = h3.H3Connection.contentLength(headers) catch null,
+                    .head_only = std.mem.eql(u8, method, "HEAD"),
+                    .mailbox = &self.mailbox,
+                    .impl = st,
+                    .vtable = &H3Stream.vtable,
+                },
+            };
+            self.h3_streams.put(self.allocator, .{ .conn = session.id(), .stream = stream_id }, st) catch {
+                self.allocator.destroy(st);
+                return session.resetRequest(stream_id, @backingInt(h3.H3Error.internal_error));
+            };
+            self.handler.onHttpHead(&st.ex);
+            const live = self.h3Stream(session, stream_id) orelse return; // answered already
+            live.ex.method = "";
+            live.ex.target = "";
+            live.ex.headers = &.{};
+            if (live.ex.passed) live.ex.respond(404, &.{.{ .name = "content-type", .value = "text/plain; charset=utf-8" }}, "Not found\n");
+        }
+
+        /// Whether `stream_id` was an exchange's, told it may write again.
+        fn streamWritable(self: *Self, session: *Session, stream_id: u64) bool {
+            if (comptime !takes_heads) return false;
+            const st = self.h3Stream(session, stream_id) orelse return false;
+            st.stalled_ms = null;
+            if (@hasDecl(Handler, "onHttpWritable")) self.handler.onHttpWritable(&st.ex);
+            return true;
+        }
+
+        const sweep_every_ns = 500 * std.time.ns_per_ms;
+
+        /// Resets the requests whose body fell under `min_body_rate` over its
+        /// last window, or whose answer has waited `stall_timeout_ms` for its client;
+        /// their handler hears they're gone. At most every `sweep_every_ns`.
+        fn sweepStreams(self: *Self, now_ns: i64) void {
+            if (comptime !takes_heads) return;
+            if (now_ns < self.next_sweep_ns or self.h3_streams.count() == 0) return;
+            self.next_sweep_ns = now_ns + sweep_every_ns;
+            const now_ms = @divTrunc(now_ns, std.time.ns_per_ms);
+            var doomed: [32]struct { st: *H3Stream, code: h3.H3Error } = undefined;
+            var n: usize = 0;
+            var it = self.h3_streams.valueIterator();
+            while (it.next()) |p| {
+                const st = p.*;
+                const code: h3.H3Error = if (st.body_window) |*w| code: {
+                    if (now_ms < w.ends_ms) continue;
+                    if (w.keptUp(now_ms, self.min_body_rate, self.stall_timeout_ms)) continue;
+                    break :code .request_incomplete;
+                } else code: {
+                    const since = st.stalled_ms orelse continue;
+                    if (now_ms - since < self.stall_timeout_ms) continue;
+                    break :code .request_cancelled;
+                };
+                doomed[n] = .{ .st = st, .code = code };
+                n += 1;
+                if (n == doomed.len) {
+                    self.next_sweep_ns = now_ns; // the rest on the next pass
+                    break;
+                }
+            }
+            for (doomed[0..n]) |d| {
+                d.st.session.resetRequest(d.st.stream_id, @backingInt(d.code));
+                d.st.hearGone();
+            }
+        }
+
+        /// `onHttpGone` for every exchange on connection `conn`.
+        fn dropStreams(self: *Self, conn: u64) void {
+            if (comptime !takes_heads) return;
+            while (self.h3_streams.count() > 0) {
+                var it = self.h3_streams.iterator();
+                const st = while (it.next()) |e| {
+                    if (e.key_ptr.conn == conn) break e.value_ptr.*;
+                } else return;
+                st.hearGone();
+            }
+        }
+
+        fn dispatchStreamData(self: *Self, session: *Session, stream_id: u64, data: []const u8, fin: bool) void {
+            if (!@hasDecl(Handler, "onStreamData")) return;
+
+            if (comptime @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".param_types.len == 5) {
+                self.handler.onStreamData(session, stream_id, data, fin);
+            } else if (data.len > 0) {
+                self.handler.onStreamData(session, stream_id, data);
+            }
+        }
+
+        // The 5-arity form also receives the CONNECT request headers, which
+        // is where WebTransport carries the application-protocol offer.
+        fn dispatchConnectRequest(self: *Self, session: *Session, session_id: u64, path: []const u8, headers: []const qpack.Header) void {
+            defer self.forgetHeaders();
+            if (!@hasDecl(Handler, "onConnectRequest")) return;
+
+            if (comptime @typeInfo(@TypeOf(Handler.onConnectRequest)).@"fn".param_types.len == 5) {
+                self.handler.onConnectRequest(session, session_id, path, headers);
+            } else {
+                self.handler.onConnectRequest(session, session_id, path);
+            }
+        }
+
+        fn dispatchSessionReady(self: *Self, session: *Session, session_id: u64, headers: []const qpack.Header) void {
+            defer self.forgetHeaders();
+            if (!@hasDecl(Handler, "onSessionReady")) return;
+
+            if (comptime @typeInfo(@TypeOf(Handler.onSessionReady)).@"fn".param_types.len == 4) {
+                self.handler.onSessionReady(session, session_id, headers);
+            } else {
+                self.handler.onSessionReady(session, session_id);
+            }
+        }
+
+        // The 6-arity form also learns whether the session ended abruptly.
+        fn dispatchSessionClosed(self: *Self, session: *Session, session_id: u64, code: u32, reason: []const u8, abrupt: bool) void {
+            if (!@hasDecl(Handler, "onSessionClosed")) return;
+
+            if (comptime @typeInfo(@TypeOf(Handler.onSessionClosed)).@"fn".param_types.len == 6) {
+                self.handler.onSessionClosed(session, session_id, code, reason, abrupt);
+            } else {
+                self.handler.onSessionClosed(session, session_id, code, reason);
+            }
+        }
+
+        /// The handler's last word on a connection before its entry goes:
+        /// each WebTransport session it still holds ends, then the connection.
+        fn endConnection(self: *Self, session: *Session) void {
+            self.dropStreams(session.id());
+            if (session.entry.wt_conn) |wtc| {
+                while (wtc.nextLostSession()) |ev| switch (ev) {
+                    .session_closed => |c| self.dispatchSessionClosed(session, c.session_id, c.error_code, c.reason, c.abrupt),
+                    else => {},
+                };
+            }
+            if (@hasDecl(Handler, "onConnectionClosed")) self.handler.onConnectionClosed(session);
+        }
+
+        fn pollH3Events(self: *Self, entry: *ConnEntry) void {
+            if (entry.h3_conn == null) return;
+            const h3c = entry.h3_conn.?;
+            var session = Session{ .entry = entry };
+
+            while (!entry.handing_over) {
+                const event = h3c.poll() catch break;
+                if (event == null) break;
+
+                switch (event.?) {
+                    .headers => |hdr| self.dispatchRequest(&session, hdr.stream_id, hdr.headers),
+                    // We never offer Extended CONNECT, so this is a peer's own idea.
+                    .connect_request => |req| self.dispatchRequest(&session, req.stream_id, req.headers),
+                    .data => |d| {
+                        if (comptime takes_heads or @hasDecl(Handler, "onData")) {
+                            var body_buf: [8192]u8 = undefined;
+                            while (true) {
+                                const n = h3c.recvBody(&body_buf);
+                                if (n == 0) break;
+                                self.dispatchRequestData(&session, d.stream_id, body_buf[0..n]);
+                            }
+                        } else {
+                            // Drain body even if handler doesn't consume it
+                            var sink: [4096]u8 = undefined;
+                            while (h3c.recvBody(&sink) > 0) {}
+                        }
+                    },
+                    .finished => |sid| self.dispatchRequestEnd(&session, sid),
+                    .request_cancelled => |rc| self.dispatchRequestCancelled(&session, rc.stream_id, rc.error_code),
+                    .writable => |sid| {
+                        if (self.streamWritable(&session, sid)) continue;
+                        if (@hasDecl(Handler, "onWritable")) self.handler.onWritable(&session, sid, sid);
+                    },
+                    .settings, .goaway, .shutdown_complete => {},
+                }
+            }
+        }
+
+        fn pollH0Events(self: *Self, entry: *ConnEntry) void {
+            const h0c = entry.h0_conn orelse return;
+            var session = Session{ .entry = entry };
+
+            while (!entry.handing_over) {
+                const event = h0c.poll() catch break;
+                if (event == null) break;
+
+                switch (event.?) {
+                    .request => |req| {
+                        if (@hasDecl(Handler, "onH0Request")) {
+                            self.handler.onH0Request(&session, req.stream_id, req.path);
+                        }
+                    },
+                    .data => |d| {
+                        if (@hasDecl(Handler, "onH0Data")) {
+                            self.handler.onH0Data(&session, d.stream_id, d.data);
+                        }
+                    },
+                    .finished => |stream_id| {
+                        if (@hasDecl(Handler, "onH0Finished")) {
+                            self.handler.onH0Finished(&session, stream_id);
+                        }
+                    },
+                }
+            }
+        }
+
+        fn pollQuicEvents(self: *Self, entry: *ConnEntry) void {
+            const conn = entry.conn;
+            var session = Session{ .entry = entry };
+
+            if (@hasDecl(Handler, "onPollComplete")) {
+                self.handler.onPollComplete(&session);
+            }
+
+            // Raw QUIC has no session id to report, so 0 stands in.
+            // WebTransport installs a zero-copy callback instead and does
+            // not reach here.
+            if (@hasDecl(Handler, "onDatagram")) {
+                while (!entry.handing_over) {
+                    const dg = conn.peekDatagram() orelse break;
+                    self.handler.onDatagram(&session, 0, dg);
+                    conn.consumeDatagram();
+                }
+            }
+
+            // Poll bidirectional streams. Everything readable goes now: a
+            // pass happens only on I/O, and data left behind stays unread —
+            // withholding flow-control credit — until the peer sends again.
+            const ids = &self.quic_poll_ids;
+            ids.clearRetainingCapacity();
+            ids.ensureTotalCapacity(self.allocator, conn.streams.streams.count() + conn.streams.recv_streams.count()) catch return;
+            var key_it = conn.streams.streams.keyIterator();
+            while (key_it.next()) |k| ids.appendAssumeCapacity(k.*);
+            var recv_key_it = conn.streams.recv_streams.keyIterator();
+            while (recv_key_it.next()) |k| ids.appendAssumeCapacity(k.*);
+
+            // Looked up again each time: the handler may have closed it.
+            for (ids.items) |stream_id| {
+                if (entry.handing_over) break;
+                while (conn.streams.getRecvStream(stream_id)) |rs| {
+                    const data = rs.read() orelse break;
+                    const fin = rs.finished;
+                    if (fin) entry.finished_streams.put(self.allocator, stream_id, {}) catch {};
+                    self.dispatchStreamData(&session, stream_id, data, fin);
+                    self.allocator.free(data);
+                }
+                const rs = conn.streams.getRecvStream(stream_id) orelse continue;
+                if (rs.finished and !entry.finished_streams.contains(stream_id)) {
+                    entry.finished_streams.put(self.allocator, stream_id, {}) catch {};
+                    self.dispatchStreamData(&session, stream_id, &[_]u8{}, true);
+                }
+                // Raw QUIC has no session: 0 stands in, as for datagrams.
+                if (rs.reset_err) |code| if (!entry.finished_streams.contains(stream_id)) {
+                    entry.finished_streams.put(self.allocator, stream_id, {}) catch {};
+                    if (@hasDecl(Handler, "onStreamReset")) self.handler.onStreamReset(&session, 0, stream_id, @truncate(code));
+                };
+                // A peer's uni stream has no send side left to wait on.
+                if ((rs.finished or rs.reset_err != null) and !stream_mod.isBidi(stream_id)) conn.streams.releaseRecvStream(stream_id);
+            }
+        }
+
+        /// `pub fn onPass(self: *Handler, now_ns: i64) ?i64`, optional: the
+        /// handler's own timed work, such as a game's fixed-step ticks or a
+        /// publisher's frames. The loop calls it once per pass, after
+        /// dispatching what arrived and before sending, so what it writes
+        /// leaves in that pass's send batch rather than costing a pass of its
+        /// own. `now_ns` is `sys.nanoTimestamp()`.
+        ///
+        /// It returns when it next needs a pass, on that clock, or null for no
+        /// deadline. The loop wakes for it then, never earlier, even with
+        /// nothing else to do; packets and QUIC timers bring other passes, and
+        /// each calls it too. A server with nothing due sleeps. Not called
+        /// once `stop()` has begun. A deadline that comes up between passes,
+        /// outside the server's callbacks, goes to `wakeAt`.
+        fn runOnPass(self: *Self) void {
+            if (comptime !@hasDecl(Handler, "onPass")) return;
+            if (self.stopping) return;
+            const now: i64 = sys.nanoTimestamp();
+            if (self.wake_at) |t| {
+                if (t <= now) self.wake_at = null;
+            }
+            self.pass_deadline = self.handler.onPass(now);
+        }
+
+        /// The earliest pass the handler asked for, through `onPass` or `wakeAt`.
+        fn handlerDeadline(self: *const Self) ?i64 {
+            if (comptime !@hasDecl(Handler, "onPass")) return null;
+            if (self.stopping) return null;
+            const asked = self.pass_deadline orelse return self.wake_at;
+            return @min(asked, self.wake_at orelse asked);
+        }
+
+        fn tickAndSend(self: *Self) void {
+            // What was written before this point goes out below.
+            self.written_in_pass = false;
+            // One clock read for the pass: a deadline check does not need a
+            // fresher now than this, and reading it per connection showed up.
+            const pass_now_ns: i64 = sys.nanoTimestamp();
+            self.sweepStreams(pass_now_ns);
+            // Send times share a read across connections too, refreshed every
+            // `packets_per_clock_read` packets or connections with nothing to send.
+            var now_ns: i64 = pass_now_ns;
+            var clock_uses: usize = 1;
+            const all = self.visitsAll();
+            if (!all) {
+                self.conn_mgr.queueDue(pass_now_ns);
+                self.conn_mgr.orderVisits();
+            }
+            const list = self.passList();
+            var i: usize = 0;
+            while (i < list.items.len) {
+                const entry = list.items[i];
+                self.examined += 1;
+                // As of its last visit. A packet since can have brought a timer
+                // forward: the deadline this visit stores is then overdue, and
+                // the next pass takes it.
+                const deadline = if (all) entry.conn.nextTimeoutNsAt(pass_now_ns) else entry.deadline;
+                const due = if (deadline) |first| first <= pass_now_ns else false;
+                if (!all and !entry.needs_visit and !due) {
+                    i += 1;
+                    continue;
+                }
+
+                // fireTimers calls onTimeout() again while one of its deadlines
+                // has passed, to fire ALL expired PTO deadlines.
+                // quic-go fires PTO for each space independently; without this loop,
+                // we only fire the earliest space per tick, requiring separate timer
+                // events for each space. Under burst loss, coalescing all PTO fires
+                // sends more diverse packets in one burst.
+                // Only when a deadline has actually passed, or the connection is
+                // waiting to close once its streams drain: `close_when_idle` has
+                // no deadline of its own and relies on being looked at each pass.
+                // Otherwise onTimeout does nothing, and reaching it costs a call
+                // and a clock read for every connection on every pass.
+                if (due or entry.conn.close_when_idle) {
+                    _ = entry.conn.fireTimers() catch 0;
+                    now_ns = sys.nanoTimestamp();
+                }
+                if (entry.conn.isClosed()) {
+                    var session = Session{ .entry = entry };
+                    self.endConnection(&session);
+                    self.conn_mgr.removeConnection(entry);
+                    continue;
+                }
+
+                const conn = entry.conn;
+                if (entry.drain_goaway_due != null) sendDrainGoaway(entry, pass_now_ns);
+                if (entry.h3_conn) |h| if (h.shutdown_state != .active) advanceDrain(entry, pass_now_ns);
+                if (self.wt_settings.close_after_sessions) if (entry.wt_conn) |wtc| wtc.closeIfUnused();
+                const batch = self.batchForConn(conn);
+                const max_burst_packets = 1000;
+                var send_count: usize = 0;
+                conn.beginBurst();
+                defer conn.endBurst();
+                while (send_count < max_burst_packets) : (send_count += 1) {
+                    const buf = batch.reserve();
+                    // An empty batch mid-burst was just flushed, and the syscall took time.
+                    if (clock_uses % packets_per_clock_read == 0 or (send_count > 0 and batch.count == 0)) now_ns = sys.nanoTimestamp();
+                    clock_uses += 1;
+                    const bytes_written = conn.sendAt(buf, now_ns) catch break;
+                    if (bytes_written == 0) break;
+                    const send_addr = conn.peerAddress();
+                    batch.commit(
+                        bytes_written,
+                        @ptrCast(send_addr),
+                        connection.sockaddrLen(send_addr),
+                        conn.getEcnMark(),
+                    );
+                }
+
+                self.conn_mgr.setDeadline(entry, entryDeadline(entry, now_ns));
+                // close_when_idle waits on its streams with no deadline: keep looking.
+                entry.needs_visit = conn.close_when_idle;
+                i += 1;
+            }
+            self.conn_mgr.settleVisits();
+
+            self.batch.flush();
+            if (self.preferred) |*p| p.batch.flush();
+        }
+
+        fn rescheduleTimer(self: *Self) void {
+            // Before start() the timer is not ours to arm: start() arms it.
+            if (self.halted or !self.started) return;
+            const next_ms = self.computeNextTimeoutMs() orelse return;
+
+            if (!self.timer_armed and self.timer_cancel_completion.state() != .dead) {
+                // The timer fired with a reset's cancel still queued against
+                // it. Re-adding it now would let that cancel kill the new timer
+                // and leave it linked in libxev's submission queue, where the
+                // next add corrupts the queue. Retry once the cancel is through.
+                self.armWake();
+                return;
+            }
+            if (self.timer_armed) {
+                self.timer.reset(
+                    self.eventLoop(),
+                    &self.timer_completion,
+                    &self.timer_cancel_completion,
+                    next_ms,
+                    Self,
+                    self,
+                    onTimer,
+                );
+            } else {
+                self.timer.run(
+                    self.eventLoop(),
+                    &self.timer_completion,
+                    next_ms,
+                    Self,
+                    self,
+                    onTimer,
+                );
+            }
+            self.timer_armed = true;
+        }
+
+        fn allConnectionsClosed(self: *Self) bool {
+            for (self.conn_mgr.entries.items) |entry| {
+                if (!entry.conn.isClosed()) return false;
+            }
+            return true;
+        }
+
+        fn computeNextTimeoutMs(self: *Self) ?u64 {
+            const now: i64 = sys.nanoTimestamp();
+            var earliest: ?i64 = null;
+
+            if (self.visitsAll()) {
+                for (self.conn_mgr.entries.items) |entry| {
+                    if (entry.conn.nextTimeoutNsAt(now)) |deadline| {
+                        if (earliest == null or deadline < earliest.?) {
+                            earliest = deadline;
+                        }
+                    }
+                    for ([_]?i64{ entry.drain_goaway_due, entry.drain_final_goaway_at }) |d| {
+                        const deadline = d orelse continue;
+                        if (earliest == null or deadline < earliest.?) earliest = deadline;
+                    }
+                }
+            } else earliest = self.conn_mgr.nextDeadline();
+            if (self.handlerDeadline()) |deadline| {
+                if (earliest == null or deadline < earliest.?) earliest = deadline;
+            }
+            // Swept on time though no packet comes.
+            if (comptime takes_heads) if (self.h3_streams.count() > 0) {
+                if (earliest == null or self.next_sweep_ns < earliest.?) earliest = self.next_sweep_ns;
+            };
+
+            // A handler with its own deadlines — a publisher on a tick, a
+            // relay holding a subscription open — cannot rely on QUIC having
+            // a timer pending, so let it name a cadence to be woken on.
+            const floor: ?u64 = if (@hasDecl(Handler, "poll_interval_ms")) Handler.poll_interval_ms else null;
+
+            const deadline = earliest orelse return floor;
+            const delta_ns = deadline - now;
+            if (delta_ns <= 0) return 1; // overdue — fire on next tick
+            // Rounded up: a timer short of the deadline finds nothing due and
+            // is re-armed at 0 ms, polling without waiting until it comes.
+            const ms: u64 = @intCast(@divFloor(delta_ns - 1, std.time.ns_per_ms) + 1);
+            return if (floor) |f| @min(ms, f) else ms;
+        }
+    };
+}
+
+/// The address `fd` is bound to.
+fn boundAddress(fd: posix.socket_t) !net.Address {
+    var addr: net.Address = undefined;
+    var len: posix.socklen_t = @sizeOf(net.Address);
+    try sys.getsockname(fd, &addr.any, &len);
+    return addr;
+}
+
+/// A bound, non-blocking UDP socket for the server, with Config's socket
+/// options applied.
+fn openUdpSocket(config: Config, port: u16) !struct { posix.socket_t, net.Address } {
+    const addr = if (config.ipv6)
+        try net.Address.parseIp6("::", port)
+    else
+        try net.Address.parseIp4(config.address, port);
+    const family: u32 = if (config.ipv6) posix.AF.INET6 else posix.AF.INET;
+    const fd = try sys.udpSocket(family, .{ .reuse_addr = true });
+    errdefer sys.close(fd);
+
+    // Asked for explicitly, so a failure is the caller's to see.
+    if (config.reuse_port) try sys.setReusePort(fd);
+    if (config.recv_buffer_size) |n| try setBufferSize(fd, .recv, n);
+    if (config.send_buffer_size) |n| try setBufferSize(fd, .send, n);
+
+    try sys.bind(fd, &addr.any, addr.getOsSockLen());
+    ecn_socket.enableEcnRecv(fd) catch {};
+    ecn_socket.setDontFragment(fd);
+    return .{ fd, try boundAddress(fd) }; // port 0 is the kernel's pick
+}
+
+/// Ask for `n` bytes of socket buffer, and say so when less is granted.
+/// Linux clamps the request to `net.core.rmem_max` / `wmem_max` without an
+/// error, unless the process may force it (CAP_NET_ADMIN), and the drops
+/// that follow are silent too.
+fn setBufferSize(fd: posix.socket_t, comptime which: enum { recv, send }, n: u32) !void {
+    const opt = if (which == .recv) posix.SO.RCVBUF else posix.SO.SNDBUF;
+    const v: c_int = @intCast(@min(n, std.math.maxInt(c_int)));
+    try sys.setsockopt(fd, posix.SOL.SOCKET, opt, std.mem.asBytes(&v));
+    if (builtin.target.os.tag != .linux or bufferSize(fd, opt) >= n) return;
+    const force: u32 = if (which == .recv) 33 else 32; // SO_RCVBUFFORCE, SO_SNDBUFFORCE
+    posix.setsockopt(fd, posix.SOL.SOCKET, force, std.mem.asBytes(&v)) catch {};
+    const got = bufferSize(fd, opt);
+    // Linux reports twice what it grants: half of it is bookkeeping.
+    if (got < n) log.warn("UDP {s} buffer is {d} KB, not the {d} KB asked for: raise net.core.{s}mem_max", .{
+        @tagName(which), @divTrunc(got, 2048), @divTrunc(n, 1024), if (which == .recv) "r" else "w",
+    });
+}
+
+fn bufferSize(fd: posix.socket_t, opt: u32) u32 {
+    var v: c_int = 0;
+    var len: posix.socklen_t = @sizeOf(c_int);
+    if (std.c.getsockopt(fd, posix.SOL.SOCKET, opt, @ptrCast(&v), &len) != 0) return 0;
+    return @intCast(@max(v, 0));
+}
+
+/// Receive-queue delay, summarised rather than kept per datagram: the question
+/// it answers is whether a request waited to be read at all, not which one did.
+const RxWait = struct {
+    count: u64 = 0,
+    sum_ns: u64 = 0,
+    max_ns: u64 = 0,
+    over_1ms: u64 = 0,
+    report_at: i64 = 0,
+
+    fn record(self: *RxWait, wait_ns: i64) void {
+        if (wait_ns < 0) return; // clocks disagree; nothing to learn from it
+        const w: u64 = @intCast(wait_ns);
+        self.count += 1;
+        self.sum_ns += w;
+        if (w > self.max_ns) self.max_ns = w;
+        if (w > std.time.ns_per_ms) self.over_1ms += 1;
+    }
+
+    fn maybeReport(self: *RxWait, now: i64) void {
+        if (self.count == 0) return;
+        if (self.report_at == 0) {
+            self.report_at = now + std.time.ns_per_s;
+            return;
+        }
+        if (now < self.report_at) return;
+        // Straight to stderr: this is a diagnostic run's output, and a
+        // dependency's std.log does not reach the host's log writer.
+        std.debug.print("rx wait: n={d} mean={d}us max={d}us over_1ms={d}\n", .{
+            self.count,
+            self.sum_ns / self.count / std.time.ns_per_us,
+            self.max_ns / std.time.ns_per_us,
+            self.over_1ms,
+        });
+        self.* = .{ .report_at = now + std.time.ns_per_s };
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
+
+/// draft-13 §5.5: a credit is announced in SETTINGS only when we chose to.
+/// Absent means the peer starts at zero and waits for the per-session capsule.
+fn announced(advertise: bool, credit: u64) ?u64 {
+    return if (advertise) credit else null;
+}
+
+pub const ClientConfig = struct {
+    // Target server
+    address: []const u8 = "127.0.0.1",
+    port: u16 = 4433,
+    server_name: []const u8 = "localhost",
+
+    // WebTransport session path (auto-CONNECT on handshake complete)
+    path: []const u8 = "/.well-known/webtransport",
+
+    // Extra headers on the extended CONNECT — this is where
+    // WT-Available-Protocols goes. The slices must outlive the client.
+    connect_headers: []const qpack.Header = &.{},
+
+    // TLS ALPN override (when null, derived from handler protocol: "h3" for h3/webtransport)
+    alpn: ?[]const u8 = null,
+    /// Several ALPNs to offer, most preferred first; wins over `alpn` when
+    /// non-empty. The server's pick is `conn.negotiatedAlpn()`.
+    alpns: []const []const u8 = &.{},
+
+    // TLS verification
+    /// Where the trust anchors come from. The server's chain must end at one,
+    /// besides naming `server_name` and being in date, or the handshake fails.
+    /// `.system` is the platform's store, loaded once per process and shared;
+    /// `.file` a PEM bundle of your own, such as a private CA or an interop
+    /// peer's.
+    ///
+    /// `.pinned_hashes` is the browsers' `serverCertificateHashes`: SHA-256
+    /// fingerprints of leaf certificates to accept outright. The fingerprint
+    /// replaces the chain, the hostname and the validity dates, so it reaches
+    /// a self-signed server the trust store knows nothing about — the same
+    /// bargain that lets a browser talk to our test server.
+    ca: union(enum) {
+        system,
+        file: []const u8,
+        pinned_hashes: []const [32]u8,
+    } = .system,
+    /// Accept any certificate, whatever `ca` says. For a test server;
+    /// `.pinned_hashes` is the way to reach one without trusting everyone.
+    skip_cert_verify: bool = false,
+
+    // QUIC transport
+    max_datagram_frame_size: u64 = 65536,
+
+    /// draft-13 §5.6 session flow control. See the identically named `Config`
+    /// fields.
+    wt_credits: wt_fc.Credits = wt_fc.Credits.default,
+    wt_advertise_credits: bool = false,
+    /// Close the connection once its session is over, as Firefox does; see
+    /// the identically named `Config` field. `run()` returns then.
+    wt_close_after_sessions: bool = true,
+
+    // Advanced overrides
+    tls_config: ?tls13.TlsConfig = null,
+    conn_config: ?connection.ConnectionConfig = null,
+
+    // IPv6
+    ipv6: bool = false,
+
+    /// An event loop to join rather than create. Several clients sharing one
+    /// loop is how you drive more than one connection at a time without
+    /// spinning `tick()` over each of them in turn: the caller owns the loop,
+    /// calls `start()` on each client, and then runs it. A client that joined
+    /// a loop never stops it, so one shutting down leaves the others running.
+    ///
+    /// The loop outlives the client, so the client's completions have to be
+    /// off it before `deinit()`: `stop()`, then `tick()` until
+    /// `conn.isClosed()`. Deinitialising every client before the loop and not
+    /// running it again does just as well.
+    loop: ?*xev.Loop = null,
+};
+
+/// ClientSession wraps a single client-side connection and provides the same
+/// convenience methods as the server-side Session.
+/// TLS material a Server allocated for itself in init(), so deinit() can give
+/// it back. Absent when the caller supplied an in-memory `tls_config`.
+const OwnedTlsMaterial = struct {
+    cert_pem: []u8,
+    key_pem: []u8,
+    cert_chain: [][]const u8,
+    private_key: []u8,
+    alpn: [][]const u8,
+
+    fn deinit(self: *OwnedTlsMaterial, alloc: std.mem.Allocator) void {
+        alloc.free(self.cert_pem);
+        alloc.free(self.key_pem);
+        for (self.cert_chain) |der| alloc.free(der); // each DER is its own alloc
+        alloc.free(self.cert_chain);
+        alloc.free(self.private_key);
+        alloc.free(self.alpn);
+    }
+};
+
+pub const ClientSession = struct {
+    conn: *connection.Connection,
+    h3_conn: ?*h3.H3Connection = null,
+    wt_conn: ?*wt.WebTransportConnection = null,
+
+    /// The owning Client's `stopping` flag. A client has exactly one
+    /// connection, so closing it from a handler is a request to shut down —
+    /// the run loop only leaves once this is set and the connection has
+    /// finished draining.
+    stopping: ?*bool = null,
+
+    /// The owning Client's wakeup, so a write made outside its callbacks is
+    /// sent on the next loop iteration.
+    wake_fn: ?*const fn (ctx: *anyopaque) void = null,
+    wake_ctx: ?*anyopaque = null,
+    /// Asks for another poll pass even from inside a callback, for data
+    /// already received that became deliverable. Takes `wake_ctx`.
+    repoll_fn: ?*const fn (ctx: *anyopaque) void = null,
+
+    fn wake(self: *ClientSession) void {
+        if (self.wake_fn) |f| f(self.wake_ctx orelse return);
+    }
+
+    fn repoll(self: *ClientSession) void {
+        if (self.repoll_fn) |f| f(self.wake_ctx orelse return);
+    }
+
+    // --- H3 methods ---
+
+    pub fn sendRequest(self: *ClientSession, headers: []const qpack.Header, body: ?[]const u8) !u64 {
+        defer self.wake();
+        if (self.h3_conn) |h3c| {
+            return try h3c.sendRequest(headers, body);
+        }
+        return error.NoH3Connection;
+    }
+
+    pub fn sendResponse(self: *ClientSession, stream_id: u64, headers: []const qpack.Header, body: []const u8) !void {
+        defer self.wake();
+        if (self.h3_conn) |h3c| {
+            try h3c.sendResponse(stream_id, headers, body);
+        } else return error.NoH3Connection;
+    }
+
+    pub fn recvBody(self: *ClientSession, buf: []u8) usize {
+        if (self.h3_conn) |h3c| {
+            return h3c.recvBody(buf);
+        }
+        return 0;
+    }
+
+    // --- Raw QUIC methods ---
+
+    pub fn openStream(self: *ClientSession) !u64 {
+        const stream = try self.conn.openStream();
+        return stream.stream_id;
+    }
+
+    pub fn openQuicUniStream(self: *ClientSession) !u64 {
+        const send_stream = try self.conn.openUniStream();
+        return send_stream.stream_id;
+    }
+
+    pub fn writeStream(self: *ClientSession, stream_id: u64, data: []const u8) !void {
+        defer self.wake();
+        if (self.conn.streams.getStream(stream_id)) |stream| {
+            return stream.send.writeData(data);
+        }
+        if (self.conn.streams.send_streams.get(stream_id)) |ss| {
+            return ss.writeData(data);
+        }
+        return error.StreamNotFound;
+    }
+
+    pub fn closeQuicStream(self: *ClientSession, stream_id: u64) void {
+        defer self.wake();
+        if (self.conn.streams.getStream(stream_id)) |stream| {
+            stream.send.close();
+        } else if (self.conn.streams.send_streams.get(stream_id)) |ss| {
+            ss.close();
+        }
+    }
+
+    /// RESET_STREAM on a native QUIC stream's sending half.
+    pub fn resetQuicStream(self: *ClientSession, stream_id: u64, error_code: u64) void {
+        defer self.wake();
+        if (self.conn.streams.getStream(stream_id)) |stream| {
+            stream.send.reset(error_code);
+        } else if (self.conn.streams.send_streams.get(stream_id)) |ss| {
+            ss.reset(error_code);
+        }
+    }
+
+    /// STOP_SENDING on a native QUIC stream's receiving half.
+    pub fn stopSendingQuicStream(self: *ClientSession, stream_id: u64, error_code: u64) void {
+        defer self.wake();
+        if (self.conn.streams.getStream(stream_id)) |stream| stream.recv.stopSending(error_code);
+    }
+
+    pub fn readStream(self: *ClientSession, stream_id: u64) ?[]const u8 {
+        if (self.conn.streams.getStream(stream_id)) |stream| {
+            return stream.recv.read();
+        }
+        if (self.conn.streams.recv_streams.get(stream_id)) |rs| {
+            return rs.read();
+        }
+        return null;
+    }
+
+    // --- WebTransport methods ---
+
+    /// `Session.pauseStream`, for a client: stop `onStreamData` for a
+    /// WebTransport stream and let flow control hold the server back.
+    pub fn pauseStream(self: *ClientSession, stream_id: u64) !void {
+        const wtc = self.wt_conn orelse return error.NoWebTransportConnection;
+        try wtc.pauseStream(stream_id);
+    }
+
+    /// `Session.resumeStream`, for a client.
+    pub fn resumeStream(self: *ClientSession, stream_id: u64) void {
+        const wtc = self.wt_conn orelse return;
+        wtc.resumeStream(stream_id);
+        self.repoll();
+    }
+
+    pub fn sendStreamData(self: *ClientSession, stream_id: u64, data: []const u8) !void {
+        defer self.wake();
+        if (self.wt_conn) |wtc| {
+            try wtc.sendStreamData(stream_id, data);
+        } else return error.NoWtConnection;
+    }
+
+    /// `session_id` names the WebTransport session; on raw QUIC there is
+    /// none and it is ignored.
+    pub fn sendDatagram(self: *ClientSession, session_id: u64, data: []const u8) !void {
+        defer self.wake();
+        if (self.wt_conn) |wtc| {
+            return wtc.sendDatagram(session_id, data);
+        }
+        return self.conn.sendDatagram(data);
+    }
+
+    pub fn closeStream(self: *ClientSession, stream_id: u64) void {
+        defer self.wake();
+        if (self.wt_conn) |wtc| {
+            wtc.closeStream(stream_id);
+        }
+    }
+
+    pub fn openBidiStream(self: *ClientSession, session_id: u64, send_order: ?i64) !u64 {
+        if (self.wt_conn) |wtc| {
+            return try wtc.openBidiStream(session_id, send_order);
+        }
+        return error.NoWtConnection;
+    }
+
+    pub fn openUniStream(self: *ClientSession, session_id: u64, send_order: ?i64) !u64 {
+        if (self.wt_conn) |wtc| {
+            return try wtc.openUniStream(session_id, send_order);
+        }
+        return error.NoWtConnection;
+    }
+
+    pub fn setSendOrder(self: *ClientSession, stream_id: u64, send_order: ?i64) void {
+        if (self.wt_conn) |wtc| {
+            wtc.setSendOrder(stream_id, send_order);
+        }
+    }
+
+    pub fn closeSession(self: *ClientSession, session_id: u64) void {
+        defer self.wake();
+        if (self.wt_conn) |wtc| {
+            wtc.closeSession(session_id);
+        }
+    }
+
+    pub fn closeSessionWithError(self: *ClientSession, session_id: u64, error_code: u32, reason: []const u8) !void {
+        defer self.wake();
+        if (self.wt_conn) |wtc| {
+            try wtc.closeSessionWithError(session_id, error_code, reason);
+        }
+    }
+
+    pub fn resetStream(self: *ClientSession, stream_id: u64, error_code: u32) void {
+        defer self.wake();
+        if (self.wt_conn) |wtc| {
+            wtc.resetStream(stream_id, error_code);
+        }
+    }
+
+    pub fn stopSending(self: *ClientSession, stream_id: u64, error_code: u32) void {
+        defer self.wake();
+        if (self.wt_conn) |wtc| {
+            wtc.stopSending(stream_id, error_code);
+        }
+    }
+
+    pub fn drainSession(self: *ClientSession, session_id: u64) !void {
+        defer self.wake();
+        if (self.wt_conn) |wtc| {
+            try wtc.drainSession(session_id);
+        }
+    }
+
+    pub fn closeConnection(self: *ClientSession) void {
+        defer self.wake();
+        self.conn.close(0, "");
+        if (self.stopping) |flag| flag.* = true;
+    }
+
+    pub fn getStats(self: *const ClientSession) connection.Connection.Stats {
+        return self.conn.getStats();
+    }
+
+    pub fn getSendStreamStats(self: *const ClientSession, stream_id: u64) ?wt.SendStreamStats {
+        if (self.wt_conn) |wtc| return wtc.getSendStreamStats(stream_id);
+        return null;
+    }
+
+    pub fn getRecvStreamStats(self: *const ClientSession, stream_id: u64) ?wt.RecvStreamStats {
+        if (self.wt_conn) |wtc| return wtc.getRecvStreamStats(stream_id);
+        return null;
+    }
+
+    /// Bytes `session_id` can still write before the peer's credit is spent;
+    /// see `WebTransportConnection.sendCapacity`. On raw QUIC, the connection's.
+    pub fn sendCapacity(self: *const ClientSession, session_id: u64) u64 {
+        if (self.wt_conn) |wtc| return wtc.sendCapacity(session_id);
+        return self.conn.sendCapacity();
+    }
+
+    pub fn streamSendCapacity(self: *const ClientSession, stream_id: u64) ?u64 {
+        if (self.wt_conn) |wtc| return wtc.streamSendCapacity(stream_id);
+        return self.conn.streamSendCapacity(stream_id);
+    }
+
+    /// One `onWritable` once `min_bytes` fit; see
+    /// `WebTransportConnection.notifyWritable`.
+    pub fn notifyWritable(self: *ClientSession, session_id: u64, stream_id: ?u64, min_bytes: u64) !void {
+        const wtc = self.wt_conn orelse return error.NoWtConnection;
+        try wtc.notifyWritable(session_id, stream_id, min_bytes);
+    }
+
+    pub fn isDatagramSendQueueFull(self: *const ClientSession) bool {
+        if (self.wt_conn) |wtc| {
+            return wtc.isDatagramSendQueueFull();
+        }
+        return true;
+    }
+
+    pub fn maxDatagramPayloadSize(self: *const ClientSession, session_id: u64) ?usize {
+        if (self.wt_conn) |wtc| {
+            return wtc.maxDatagramPayloadSize(session_id);
+        }
+        return null;
+    }
+
+    pub fn setIncomingDatagramMaxAge(self: *ClientSession, max_age_ms: ?u64) void {
+        self.conn.setIncomingDatagramMaxAge(max_age_ms);
+    }
+
+    pub fn setOutgoingDatagramMaxAge(self: *ClientSession, max_age_ms: ?u64) void {
+        self.conn.setOutgoingDatagramMaxAge(max_age_ms);
+    }
+
+    pub fn setIncomingDatagramHighWaterMark(self: *ClientSession, count: usize) void {
+        self.conn.setIncomingDatagramHighWaterMark(count);
+    }
+
+    pub fn setOutgoingDatagramHighWaterMark(self: *ClientSession, count: usize) void {
+        self.conn.setOutgoingDatagramHighWaterMark(count);
+    }
+
+    pub fn sendKeepAlive(self: *ClientSession) void {
+        defer self.wake();
+        self.conn.sendKeepAlive();
+    }
+};
+
+pub fn Client(comptime Handler: type) type {
+    comptime {
+        if (!@hasDecl(Handler, "protocol")) {
+            @compileError("Handler must declare 'pub const protocol: event_loop.Protocol'");
+        }
+
+        const known = [_][]const u8{
+            // Common
+            "onConnected",       "onPollComplete",
+            // H3
+            "onHeaders",         "onData",
+            "onFinished",        "onSettings",
+            "onGoaway",          "onRequestCancelled",
+            // Raw QUIC
+            "onStreamData",
+            // WebTransport
+                 "onSessionReady",
+            "onSessionRejected", "onDatagram",
+            "onSessionClosed",   "onSessionDraining",
+            "onBidiStream",      "onUniStream",
+            "onStreamReset",     "onStopSending",
+            "onWritable",
+        };
+
+        for (@typeInfo(Handler).@"struct".decl_names) |decl_name| {
+            if (decl_name.len >= 2 and decl_name[0] == 'o' and decl_name[1] == 'n') {
+                var found = false;
+                for (known) |k| {
+                    if (std.mem.eql(u8, decl_name, k)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    @compileError("Handler has unrecognized callback '" ++ decl_name ++
+                        "'. Known client callbacks: onConnected, onPollComplete, " ++
+                        "onHeaders, onData, onFinished, onSettings, onGoaway, onRequestCancelled, " ++
+                        "onStreamData, " ++
+                        "onSessionReady, onSessionRejected, onDatagram, onSessionClosed, " ++
+                        "onSessionDraining, onBidiStream, onUniStream, onStreamReset, " ++
+                        "onStopSending, onWritable");
+                }
+            }
+        }
+
+        if (@hasDecl(Handler, "onStreamData")) {
+            const params = @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".param_types;
+            if (params.len != 4 and params.len != 5) {
+                @compileError("onStreamData must have 4 params (self, session, stream_id, data) " ++
+                    "or 5 params (self, session, stream_id, data, fin)");
+            }
+        }
+        if (@hasDecl(Handler, "onSessionClosed")) {
+            const n = @typeInfo(@TypeOf(Handler.onSessionClosed)).@"fn".param_types.len;
+            if (n != 5 and n != 6) {
+                @compileError("onSessionClosed must have 5 params (self, session, session_id, error_code, reason) " ++
+                    "or 6 params (self, session, session_id, error_code, reason, abrupt)");
+            }
+        }
+    }
+
+    return struct {
+        const Self = @This();
+
+        allocator: std.mem.Allocator,
+        handler: *Handler,
+
+        // libxev. `own_loop` is unused when the caller supplied one, and the
+        // active loop comes from eventLoop() rather than a stored pointer:
+        // init() returns by value, so a pointer into self would dangle.
+        own_loop: xev.Loop,
+        shared_loop: ?*xev.Loop,
+        file: xev.File,
+        timer: xev.Timer,
+        poll_completion: xev.Completion,
+        timer_completion: xev.Completion,
+        timer_cancel_completion: xev.Completion,
+        timer_armed: bool,
+        started: bool,
+        stopping: bool,
+
+        /// Zero-delay pass for writes made outside our callbacks; the same
+        /// scheme as the server's.
+        wake_completion: xev.Completion,
+        wake_armed: bool,
+        in_callback: bool,
+        /// Stopped on a shared loop: our completions are cancelled or leaving,
+        /// and nothing may re-arm.
+        halted: bool,
+        cancel_completions: [3]xev.Completion,
+        /// Unused on a shared loop, like `own_loop`.
+        shutdown: Shutdown,
+
+        // I/O
+        sockfd: posix.socket_t,
+        local_addr: posix.sockaddr.storage,
+        batch: ecn_socket.SendBatch,
+        recv_buf: [MAX_RECV_DATAGRAM]u8,
+
+        /// Shared by every H3Connection on this loop — one 16 KB buffer for
+        /// the whole server rather than one per connection. Safe because a
+        /// loop decodes one header block at a time and never holds the
+        /// resulting slices past the poll that produced them.
+        qpack_scratch: [qpack.SCRATCH_SIZE]u8,
+        qpack_headers: [h3.MAX_HEADERS]qpack.Header,
+
+        // Single QUIC connection
+        conn: *connection.Connection,
+        remote_addr: posix.sockaddr.storage,
+
+        // Protocol layers (initialized after handshake). Pointers, so a raw-QUIC
+        // client does not carry ~27 KB of H3/WT state it never touches — Client
+        // is returned by value from init().
+        h3_conn: ?*h3.H3Connection,
+        wt_conn: ?*wt.WebTransportConnection,
+        protocol_initialized: bool,
+        session_id: ?u64,
+
+        // For raw QUIC: track streams whose fin has been delivered via onStreamData(..., fin)
+        /// Array-backed: one entry per stream for the connection's life, and
+        /// `std.HashMap` never clears the tombstones removals leave.
+        finished_streams: std.AutoArrayHashMapUnmanaged(u64, void) = .empty,
+        /// See the server's `quic_poll_ids`.
+        quic_poll_ids: std.ArrayList(u64),
+
+        // Config retained for protocol init
+        server_name: []const u8,
+        path: []const u8,
+        connect_headers: []const qpack.Header,
+
+        /// draft-13 §5.6 session windows, mirrored from ClientConfig.
+        wt_credits: wt_fc.Credits,
+        wt_advertise_credits: bool,
+        wt_close_after_sessions: bool,
+
+        /// The default ALPN list, when we built it rather than the caller.
+        owned_alpn: ?[][]const u8,
+
+        /// The trust anchors, when `ClientConfig.ca` asked us to load them.
+        owned_ca: ?*Certificate.Bundle,
+
+        pub fn init(alloc: std.mem.Allocator, handler: *Handler, config: ClientConfig) !Self {
+            // Build TLS config
+            var owned_alpn: ?[][]const u8 = null;
+            var owned_ca: ?*Certificate.Bundle = null;
+            const tls_config: tls13.TlsConfig = if (config.tls_config) |tc| tc else blk: {
+                const alpn = try alloc.alloc([]const u8, @max(config.alpns.len, 1));
+                owned_alpn = alpn;
+                if (config.alpns.len > 0) {
+                    @memcpy(alpn, config.alpns);
+                } else alpn[0] = if (config.alpn) |a| a else switch (Handler.protocol) {
+                    .h3, .webtransport => "h3",
+                    .quic, .h0 => "h3", // default; override via config.alpn for custom protocols
+                };
+
+                var anchors: ?*const Certificate.Bundle = null;
+                var pins: ?[]const [32]u8 = null;
+                if (!config.skip_cert_verify) switch (config.ca) {
+                    .system => anchors = try ca_bundle.system(),
+                    .file => |path| {
+                        // On the heap: init() returns by value, so a bundle
+                        // stored in the client would move out from under
+                        // this pointer.
+                        const b = try alloc.create(Certificate.Bundle);
+                        errdefer alloc.destroy(b);
+                        b.* = try ca_bundle.loadFile(alloc, path);
+                        owned_ca = b;
+                        anchors = b;
+                    },
+                    .pinned_hashes => |h| pins = h,
+                };
+
+                break :blk .{
+                    .cert_chain_der = &.{},
+                    .private_key_bytes = &.{},
+                    .alpn = alpn,
+                    .server_name = config.server_name,
+                    .skip_cert_verify = config.skip_cert_verify,
+                    .cert_hashes = pins,
+                    .ca_bundle = anchors,
+                };
+            };
+
+            // Connection config
+            const conn_config: connection.ConnectionConfig = if (config.conn_config) |cc| cc else cc_blk: {
+                var cc: connection.ConnectionConfig = .{};
+                if (Handler.protocol == .webtransport or Handler.protocol == .quic) {
+                    cc.max_datagram_frame_size = config.max_datagram_frame_size;
+                }
+                break :cc_blk cc;
+            };
+
+            // Heap-allocate for pointer stability, then build in place: the
+            // by-value connect() would stage all ~137 KB on the stack first.
+            errdefer if (owned_alpn) |a| alloc.free(a);
+            errdefer if (owned_ca) |b| {
+                b.deinit(alloc);
+                alloc.destroy(b);
+            };
+
+            const conn_ptr = try alloc.create(connection.Connection);
+            errdefer alloc.destroy(conn_ptr);
+            try connection.connectInto(
+                conn_ptr,
+                alloc,
+                config.server_name,
+                conn_config,
+                tls_config,
+                null,
+            );
+            errdefer conn_ptr.deinit();
+
+            // Resolve remote address
+            const remote_addr = if (config.ipv6) blk: {
+                const addr6 = try net.Address.parseIp6(config.address, config.port);
+                break :blk connection.sockaddrToStorage(&addr6.any);
+            } else blk: {
+                const addr4 = try net.Address.parseIp4(config.address, config.port);
+                break :blk connection.sockaddrToStorage(&addr4.any);
+            };
+
+            // Create non-blocking UDP socket, bind to ephemeral port
+            const local_addr = if (config.ipv6)
+                try net.Address.parseIp6("::", 0)
+            else
+                try net.Address.parseIp4("0.0.0.0", 0);
+            const sockfd = try bindUdp(local_addr, .{});
+            errdefer sys.close(sockfd);
+            ecn_socket.enableEcnRecv(sockfd) catch {};
+            ecn_socket.setDontFragment(sockfd);
+
+            // Init libxev
+            const loop = if (config.loop == null) try xev.Loop.init(.{}) else undefined;
+            const file_handle = xev.File.initFd(sockfd);
+            const timer_handle = try xev.Timer.init();
+            const shutdown: Shutdown = if (config.loop == null) try Shutdown.init() else undefined;
+
+            return .{
+                .allocator = alloc,
+                .handler = handler,
+                .own_loop = loop,
+                .shared_loop = config.loop,
+                .file = file_handle,
+                .timer = timer_handle,
+                .poll_completion = .{},
+                .timer_completion = .{},
+                .timer_cancel_completion = .{},
+                .timer_armed = false,
+                .started = false,
+                .stopping = false,
+                .wake_completion = .{},
+                .wake_armed = false,
+                .in_callback = false,
+                .halted = false,
+                .cancel_completions = .{ .{}, .{}, .{} },
+                .shutdown = shutdown,
+                .sockfd = sockfd,
+                .local_addr = connection.sockaddrToStorage(&local_addr.any),
+                .batch = ecn_socket.SendBatch.init(sockfd),
+                .recv_buf = undefined,
+                .qpack_scratch = undefined,
+                .qpack_headers = undefined,
+                .conn = conn_ptr,
+                .remote_addr = remote_addr,
+                .h3_conn = null,
+                .wt_conn = null,
+                .protocol_initialized = false,
+                .session_id = null,
+                .quic_poll_ids = .empty,
+                .server_name = config.server_name,
+                .path = config.path,
+                .connect_headers = config.connect_headers,
+                .wt_credits = config.wt_credits,
+                .wt_advertise_credits = config.wt_advertise_credits,
+                .wt_close_after_sessions = config.wt_close_after_sessions,
+                .owned_alpn = owned_alpn,
+                .owned_ca = owned_ca,
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            // See ClientConfig.loop: stop, then run the loop until isStopped().
+            if (self.shared_loop != null) std.debug.assert(self.isStopped());
+            connection_manager.destroyProtocols(self.allocator, self.wt_conn, self.h3_conn, null);
+            self.wt_conn = null;
+            self.h3_conn = null;
+            if (self.owned_alpn) |a| self.allocator.free(a);
+            if (self.owned_ca) |b| {
+                b.deinit(self.allocator);
+                self.allocator.destroy(b);
+            }
+            self.finished_streams.deinit(self.allocator);
+            self.quic_poll_ids.deinit(self.allocator);
+            self.timer.deinit();
+            if (self.shared_loop == null) {
+                self.own_loop.deinit();
+                self.shutdown.deinit();
+            }
+            sys.close(self.sockfd);
+            self.conn.deinit();
+            self.allocator.destroy(self.conn);
+        }
+
+        /// The loop this client runs on, ours or the caller's.
+        pub fn eventLoop(self: *Self) *xev.Loop {
+            return self.shared_loop orelse &self.own_loop;
+        }
+
+        pub fn start(self: *Self) void {
+            const loop = self.eventLoop();
+            self.file.poll(loop, &self.poll_completion, .read, Self, self, onReadable);
+            self.timer.run(loop, &self.timer_completion, 1, Self, self, onTimer);
+            if (self.shared_loop == null) self.shutdown.wakeup.wait(loop, &self.shutdown.completion, Self, self, onShutdownPosted);
+            self.timer_armed = true;
+            self.started = true;
+        }
+
+        /// Runs until this client's connection closes. Only for a client that
+        /// owns its loop: on a shared one this would drive the other clients
+        /// too and return when the last of them finished.
+        pub fn run(self: *Self) !void {
+            std.debug.assert(self.shared_loop == null);
+            self.start();
+            try self.own_loop.run(.until_done);
+        }
+
+        pub fn tick(self: *Self) !void {
+            if (!self.started) self.start();
+            try self.eventLoop().run(.no_wait);
+        }
+
+        /// A ClientSession for use outside callbacks — writes through it are
+        /// sent on the next loop iteration, or at once with `flush()`.
+        pub fn clientSession(self: *Self) ClientSession {
+            return self.makeSession();
+        }
+
+        /// On a shared loop: true once `stop()` has finished and none of this
+        /// client's completions remain on the loop, so `deinit()` is safe
+        /// while the loop keeps running for everything else.
+        pub fn isStopped(self: *Self) bool {
+            if (!self.started) return true;
+            if (!self.halted) return false;
+            const pending = [_]*const xev.Completion{
+                &self.poll_completion,
+                &self.timer_completion,
+                &self.timer_cancel_completion,
+                &self.wake_completion,
+            };
+            for (pending) |c| if (c.state() != .dead) return false;
+            for (&self.cancel_completions) |*c| if (c.state() != .dead) return false;
+            return true;
+        }
+
+        /// The last step of stopping, once the connection has closed. A shared
+        /// loop belongs to the caller and keeps running, so instead of stopping
+        /// it we take everything of ours off it. `running` is the socket
+        /// watch whose callback we are in, which leaves by `.disarm` instead.
+        fn finishStop(self: *Self, running: ?*xev.Completion) void {
+            if (self.shared_loop == null) {
+                self.own_loop.stop();
+                return;
+            }
+            if (self.halted) return;
+            self.halted = true;
+            const loop = self.eventLoop();
+            if (running != &self.poll_completion) {
+                cancelCompletion(loop, &self.poll_completion, &self.cancel_completions[0]);
+            }
+            cancelCompletion(loop, &self.timer_completion, &self.cancel_completions[1]);
+            cancelCompletion(loop, &self.wake_completion, &self.cancel_completions[2]);
+        }
+
+        fn scheduleWake(self: *Self) void {
+            if (self.in_callback) return;
+            self.armWake();
+        }
+
+        fn armWake(self: *Self) void {
+            if (self.halted or self.wake_armed or !self.started) return;
+            self.timer.run(self.eventLoop(), &self.wake_completion, 0, Self, self, onWake);
+            self.wake_armed = true;
+        }
+
+        fn wakeFromSession(ctx: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.scheduleWake();
+        }
+
+        // Unlike a write, nothing in the current pass would pick this up.
+        fn repollFromSession(ctx: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.armWake();
+        }
+
+        fn onWake(
+            self_opt: ?*Self,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            r: xev.Timer.RunError!void,
+        ) xev.CallbackAction {
+            const self = self_opt orelse return .disarm;
+            self.wake_armed = false;
+            _ = r catch return .disarm;
+            if (self.halted) return .disarm;
+            self.service();
+            return .disarm;
+        }
+
+        /// One pass: read, dispatch, send. Shared by the timer and wakeup.
+        fn service(self: *Self) void {
+            self.in_callback = true;
+            _ = self.recvAllPackets();
+            self.processConnection();
+            self.tickAndSend();
+            self.in_callback = false;
+
+            // Closed by stop() or on its own (idle timeout, the peer's
+            // close): either way there is nothing left to run for.
+            if (self.conn.isClosed()) {
+                self.finishStop(null);
+                return;
+            }
+            self.rescheduleTimer();
+        }
+
+        pub fn flush(self: *Self) void {
+            const conn = self.conn;
+            if (conn.isClosed()) return;
+            const send_addr: *const posix.sockaddr.storage = if (conn.isEstablished())
+                conn.peerAddress()
+            else
+                &self.remote_addr;
+            var send_count: usize = 0;
+            conn.beginBurst();
+            defer conn.endBurst();
+            while (send_count < 1000) : (send_count += 1) {
+                const bytes_written = conn.send(self.batch.reserve()) catch break;
+                if (bytes_written == 0) break;
+                self.batch.commit(
+                    bytes_written,
+                    @ptrCast(send_addr),
+                    connection.sockaddrLen(send_addr),
+                    conn.getEcnMark(),
+                );
+            }
+            self.batch.flush();
+            self.rescheduleTimer();
+        }
+
+        /// Closes the connection and puts the CONNECTION_CLOSE on the wire.
+        /// See the note on the server's stop() for why it flushes here.
+        ///
+        /// On a shared loop, keep running the loop until `isStopped()` before
+        /// `deinit()`: the closing period still needs the loop. Loop thread
+        /// only: from a signal handler or another thread, see `requestStop()`.
+        pub fn stop(self: *Self) void {
+            self.stopping = true;
+            const conn = self.conn;
+            if (!conn.isClosed() and conn.state != .closing and conn.state != .draining) {
+                conn.close(0, "client shutdown");
+            }
+            self.flush();
+            if (self.shared_loop != null and self.started and conn.isClosed()) self.finishStop(null);
+        }
+
+        /// `stop()`, for a signal handler or another thread, on a client
+        /// that owns its loop; see `Server.requestStop`.
+        pub fn requestStop(self: *Self) void {
+            std.debug.assert(self.shared_loop == null);
+            self.shutdown.post(Shutdown.stop);
+        }
+
+        fn onShutdownPosted(
+            self_opt: ?*Self,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            _: xev.Async.WaitError!void, // the flags say what was asked
+        ) xev.CallbackAction {
+            const self = self_opt orelse return .disarm;
+            if (self.shutdown.take() & Shutdown.stop != 0) self.stop();
+            return .rearm; // an own loop ends by stopping, armed or not
+        }
+
+        // ---- Internal callbacks ----
+
+        fn onReadable(
+            self_opt: ?*Self,
+            _: *xev.Loop,
+            c: *xev.Completion,
+            _: xev.File,
+            r: xev.PollError!xev.PollEvent,
+        ) xev.CallbackAction {
+            forgetPollResult(c);
+            const self = self_opt orelse return .disarm;
+            // Before the result: a cancelled watch gets its error on some
+            // backends, and rearming it would put the watch back.
+            if (self.halted) return halted_poll_action;
+            _ = r catch return .rearm;
+            self.in_callback = true;
+
+            // Process loop: catch packets arriving during processing
+            var iterations: usize = 0;
+            while (iterations < 4) : (iterations += 1) {
+                const received = self.recvAllPackets();
+                self.processConnection();
+                self.tickAndSend();
+
+                if (iterations > 0 and !received) break;
+            }
+            self.in_callback = false;
+
+            if (self.conn.isClosed()) {
+                self.finishStop(c);
+                return .disarm;
+            }
+
+            self.rescheduleTimer();
+            return .rearm;
+        }
+
+        fn onTimer(
+            self_opt: ?*Self,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            r: xev.Timer.RunError!void,
+        ) xev.CallbackAction {
+            _ = r catch return .disarm;
+            const self = self_opt orelse return .disarm;
+            self.timer_armed = false;
+            if (self.halted) return .disarm;
+            self.service();
+            return .disarm;
+        }
+
+        fn recvAllPackets(self: *Self) bool {
+            var received = false;
+            var n: usize = 0;
+            while (n < max_recv_per_pass) : (n += 1) {
+                const recv_result = ecn_socket.recvmsgEcn(self.sockfd, &self.recv_buf) catch |err| {
+                    if (err == error.WouldBlock) break;
+                    break;
+                };
+                received = true;
+                if (recv_result.truncated) {
+                    std.log.warn("datagram truncated at {d} bytes — raise MAX_RECV_DATAGRAM", .{recv_result.bytes_read});
+                }
+
+                // remote_addr stays the configured server's: before the
+                // handshake nothing received is authenticated, and after it
+                // the connection's own path (migration, preferred_address)
+                // is where we send.
+                self.conn.handleDatagram(self.recv_buf[0..recv_result.bytes_read], .{
+                    .to = self.local_addr,
+                    .from = recv_result.from_addr,
+                    .ecn = recv_result.ecn,
+                    .datagram_size = recv_result.bytes_read,
+                });
+
+                // Don't send here — tickAndSend will coalesce ACKs with
+                // stream data into a single QUIC packet, reducing round-trips.
+            }
+            if (n == max_recv_per_pass) self.armWake();
+            // No flush — tickAndSend handles it
+            return received;
+        }
+
+        fn processConnection(self: *Self) void {
+            const conn = self.conn;
+
+            // Initialize protocol layer once handshake completes
+            if (conn.isEstablished() and !self.protocol_initialized) {
+                self.initProtocol();
+
+                if (self.protocol_initialized and @hasDecl(Handler, "onConnected")) {
+                    var session = self.makeSession();
+                    self.handler.onConnected(&session);
+                }
+            }
+
+            // Poll events and dispatch to handler
+            switch (Handler.protocol) {
+                .webtransport => self.pollWtEvents(),
+                .h3 => self.pollH3Events(),
+                .quic => self.pollQuicEvents(),
+                .h0 => {},
+            }
+
+            // Drain disposal queues
+            if (self.wt_conn) |wtc| {
+                wtc.drainDisposalQueue(); // chains to its H3 layer
+            } else if (self.h3_conn) |h3c| {
+                h3c.drainDisposalQueue();
+            }
+            for (conn.streams.disposal_queue[0..conn.streams.disposal_count]) |id| {
+                _ = self.finished_streams.swapRemove(id);
+            }
+            conn.streams.drainDisposalQueue();
+        }
+
+        fn initProtocol(self: *Self) void {
+            self.buildLayers() catch |err| {
+                // Left half-built, the next pass would build another over it.
+                connection_manager.destroyProtocols(self.allocator, self.wt_conn, self.h3_conn, null);
+                self.wt_conn = null;
+                self.h3_conn = null;
+                const code: h3.H3Error = if (err == error.StreamLimitError) .general_protocol_error else .internal_error;
+                self.conn.close(@backingInt(code), "protocol setup failed");
+                return;
+            };
+            self.protocol_initialized = true;
+        }
+
+        /// A layer is the client's as soon as it is built, so a failure part
+        /// way leaves the caller everything to free.
+        fn buildLayers(self: *Self) !void {
+            switch (Handler.protocol) {
+                .webtransport => {
+                    const h3c = try self.allocator.create(h3.H3Connection);
+                    h3c.* = h3.H3Connection.init(self.allocator, self.conn, false);
+                    self.h3_conn = h3c;
+                    h3c.qpack_scratch = &self.qpack_scratch;
+                    h3c.headers_buf = &self.qpack_headers;
+                    h3c.local_settings = .{
+                        .enable_connect_protocol = true,
+                        .h3_datagram = true,
+                        .enable_webtransport = true,
+                        // §5.1 reads a WT_MAX_SESSIONS above one as "this
+                        // endpoint supports several sessions, and therefore
+                        // flow control". A client receives no sessions, but the
+                        // setting is the mutual signal and the number is the
+                        // truth: that many session slots exist.
+                        .webtransport_max_sessions = wt.MAX_SESSIONS,
+                        .wt_max_sessions_v13 = wt.MAX_SESSIONS,
+                        .wt_initial_max_data = announced(self.wt_advertise_credits, self.wt_credits.max_data),
+                        .wt_initial_max_streams_bidi = announced(self.wt_advertise_credits, self.wt_credits.max_streams_bidi),
+                        .wt_initial_max_streams_uni = announced(self.wt_advertise_credits, self.wt_credits.max_streams_uni),
+                    };
+                    try h3c.initConnection();
+
+                    const wtc = try self.allocator.create(wt.WebTransportConnection);
+                    wtc.* = wt.WebTransportConnection.init(self.allocator, h3c, self.conn, false);
+                    wtc.grants = self.wt_credits;
+                    self.wt_conn = wtc;
+
+                    // Send Extended CONNECT to establish WebTransport session
+                    self.session_id = try wtc.connectWithHeaders(
+                        self.server_name,
+                        self.path,
+                        self.connect_headers,
+                    );
+                },
+                .h3 => {
+                    const h3c = try self.allocator.create(h3.H3Connection);
+                    h3c.* = h3.H3Connection.init(self.allocator, self.conn, false);
+                    self.h3_conn = h3c;
+                    h3c.qpack_scratch = &self.qpack_scratch;
+                    h3c.headers_buf = &self.qpack_headers;
+                    try h3c.initConnection();
+                },
+                .quic, .h0 => {},
+            }
+        }
+
+        fn pollWtEvents(self: *Self) void {
+            if (self.wt_conn == null) return;
+            const wtc = self.wt_conn.?;
+            var session = self.makeSession();
+
+            if (@hasDecl(Handler, "onPollComplete")) {
+                self.handler.onPollComplete(&session);
+            }
+
+            while (true) {
+                const event = wtc.poll() catch break;
+                if (event == null) break;
+
+                switch (event.?) {
+                    .session_ready => |sr| {
+                        self.dispatchSessionReady(&session, sr.session_id, sr.headers);
+                    },
+                    .session_rejected => |rej| {
+                        if (@hasDecl(Handler, "onSessionRejected")) {
+                            self.handler.onSessionRejected(&session, rej.session_id, rej.status);
+                        }
+                    },
+                    .stream_data => |sd| {
+                        self.dispatchStreamData(&session, sd.stream_id, sd.data, sd.fin);
+                        if (sd.data.len > 0) self.allocator.free(sd.data);
+                    },
+                    .datagram => |dg| {
+                        if (@hasDecl(Handler, "onDatagram")) {
+                            self.handler.onDatagram(&session, dg.session_id, dg.data);
+                        }
+                    },
+                    .session_closed => |cls| {
+                        self.dispatchSessionClosed(&session, cls.session_id, cls.error_code, cls.reason, cls.abrupt);
+                    },
+                    .session_draining => |drain| {
+                        if (@hasDecl(Handler, "onSessionDraining")) {
+                            self.handler.onSessionDraining(&session, drain.session_id);
+                        }
+                    },
+                    .bidi_stream => |bs| {
+                        if (@hasDecl(Handler, "onBidiStream")) {
+                            self.handler.onBidiStream(&session, bs.session_id, bs.stream_id);
+                        }
+                    },
+                    .uni_stream => |us| {
+                        if (@hasDecl(Handler, "onUniStream")) {
+                            self.handler.onUniStream(&session, us.session_id, us.stream_id);
+                        }
+                    },
+                    .stream_reset => |rst| {
+                        if (@hasDecl(Handler, "onStreamReset")) {
+                            self.handler.onStreamReset(&session, rst.session_id, rst.stream_id, rst.error_code);
+                        }
+                    },
+                    .stream_stop_sending => |ss| {
+                        if (@hasDecl(Handler, "onStopSending")) {
+                            self.handler.onStopSending(&session, ss.session_id, ss.stream_id, ss.error_code);
+                        }
+                    },
+                    .writable => |w| {
+                        if (@hasDecl(Handler, "onWritable")) {
+                            self.handler.onWritable(&session, w.session_id, w.stream_id);
+                        }
+                    },
+                    // Server-side only.
+                    .connect_request, .request, .request_data, .request_end, .request_cancelled => {},
+                }
+            }
+        }
+
+        // The 4-arity form also receives the CONNECT response headers, which
+        // is where WebTransport names the negotiated application protocol.
+        fn dispatchSessionReady(self: *Self, session: *ClientSession, session_id: u64, headers: []const qpack.Header) void {
+            if (!@hasDecl(Handler, "onSessionReady")) return;
+
+            if (comptime @typeInfo(@TypeOf(Handler.onSessionReady)).@"fn".param_types.len == 4) {
+                self.handler.onSessionReady(session, session_id, headers);
+            } else {
+                self.handler.onSessionReady(session, session_id);
+            }
+        }
+
+        // The 6-arity form also learns whether the session ended abruptly.
+        fn dispatchSessionClosed(self: *Self, session: *ClientSession, session_id: u64, code: u32, reason: []const u8, abrupt: bool) void {
+            if (!@hasDecl(Handler, "onSessionClosed")) return;
+
+            if (comptime @typeInfo(@TypeOf(Handler.onSessionClosed)).@"fn".param_types.len == 6) {
+                self.handler.onSessionClosed(session, session_id, code, reason, abrupt);
+            } else {
+                self.handler.onSessionClosed(session, session_id, code, reason);
+            }
+        }
+
+        /// The connection is over: each session not yet reported ends with
+        /// it, for one that closed with no poll in between (an idle timeout).
+        fn reportLostSessions(self: *Self) void {
+            const wtc = self.wt_conn orelse return;
+            var session = self.makeSession();
+            while (wtc.nextLostSession()) |ev| switch (ev) {
+                .session_closed => |c| self.dispatchSessionClosed(&session, c.session_id, c.error_code, c.reason, c.abrupt),
+                .session_rejected => |r| if (@hasDecl(Handler, "onSessionRejected")) {
+                    self.handler.onSessionRejected(&session, r.session_id, r.status);
+                },
+                else => {},
+            };
+        }
+
+        fn dispatchStreamData(self: *Self, session: *ClientSession, stream_id: u64, data: []const u8, fin: bool) void {
+            if (!@hasDecl(Handler, "onStreamData")) return;
+
+            if (comptime @typeInfo(@TypeOf(Handler.onStreamData)).@"fn".param_types.len == 5) {
+                self.handler.onStreamData(session, stream_id, data, fin);
+            } else if (data.len > 0) {
+                self.handler.onStreamData(session, stream_id, data);
+            }
+        }
+
+        fn pollH3Events(self: *Self) void {
+            if (self.h3_conn == null) return;
+            const h3c = self.h3_conn.?;
+            var session = self.makeSession();
+
+            if (@hasDecl(Handler, "onPollComplete")) {
+                self.handler.onPollComplete(&session);
+            }
+
+            while (true) {
+                const event = h3c.poll() catch break;
+                if (event == null) break;
+
+                switch (event.?) {
+                    .headers => |hdr| {
+                        if (@hasDecl(Handler, "onHeaders")) {
+                            self.handler.onHeaders(&session, hdr.stream_id, hdr.headers);
+                        }
+                    },
+                    .data => |d| {
+                        if (@hasDecl(Handler, "onData")) {
+                            self.handler.onData(&session, d.stream_id, d.len);
+                        } else {
+                            // Drain body even if handler doesn't consume it
+                            var sink: [4096]u8 = undefined;
+                            while (h3c.recvBody(&sink) > 0) {}
+                        }
+                    },
+                    .finished => |stream_id| {
+                        if (@hasDecl(Handler, "onFinished")) {
+                            self.handler.onFinished(&session, stream_id);
+                        }
+                    },
+                    .settings => |settings| {
+                        if (@hasDecl(Handler, "onSettings")) {
+                            self.handler.onSettings(&session, settings);
+                        }
+                    },
+                    .goaway => |id| {
+                        if (@hasDecl(Handler, "onGoaway")) {
+                            self.handler.onGoaway(&session, id);
+                        }
+                    },
+                    .writable => |sid| {
+                        if (@hasDecl(Handler, "onWritable")) self.handler.onWritable(&session, sid, sid);
+                    },
+                    // The server reset our request: H3_REQUEST_REJECTED says
+                    // it was never processed and may be retried elsewhere.
+                    .request_cancelled => |rc| {
+                        if (@hasDecl(Handler, "onRequestCancelled")) {
+                            self.handler.onRequestCancelled(&session, rc.stream_id, rc.error_code);
+                        }
+                    },
+                    .connect_request, .shutdown_complete => {},
+                }
+            }
+        }
+
+        fn pollQuicEvents(self: *Self) void {
+            const conn = self.conn;
+            var session = self.makeSession();
+
+            if (@hasDecl(Handler, "onPollComplete")) {
+                self.handler.onPollComplete(&session);
+            }
+
+            // Raw QUIC has no session id to report, so 0 stands in.
+            if (@hasDecl(Handler, "onDatagram")) {
+                while (conn.peekDatagram()) |dg| {
+                    self.handler.onDatagram(&session, 0, dg);
+                    conn.consumeDatagram();
+                }
+            }
+
+            // Snapshot ids: see `quic_poll_ids`.
+            const ids = &self.quic_poll_ids;
+            ids.clearRetainingCapacity();
+            ids.ensureTotalCapacity(self.allocator, conn.streams.streams.count() + conn.streams.recv_streams.count()) catch return;
+            var key_it = conn.streams.streams.keyIterator();
+            while (key_it.next()) |k| ids.appendAssumeCapacity(k.*);
+            var recv_key_it = conn.streams.recv_streams.keyIterator();
+            while (recv_key_it.next()) |k| ids.appendAssumeCapacity(k.*);
+
+            for (ids.items) |stream_id| {
+                while (conn.streams.getRecvStream(stream_id)) |rs| {
+                    const data = rs.read() orelse break;
+                    const fin = rs.finished;
+                    if (fin) self.finished_streams.put(self.allocator, stream_id, {}) catch {};
+                    self.dispatchStreamData(&session, stream_id, data, fin);
+                    self.allocator.free(data);
+                }
+                const rs = conn.streams.getRecvStream(stream_id) orelse continue;
+                if (rs.finished and !self.finished_streams.contains(stream_id)) {
+                    self.finished_streams.put(self.allocator, stream_id, {}) catch {};
+                    self.dispatchStreamData(&session, stream_id, &[_]u8{}, true);
+                }
+                if (rs.finished and !stream_mod.isBidi(stream_id)) conn.streams.releaseRecvStream(stream_id);
+            }
+        }
+
+        fn tickAndSend(self: *Self) void {
+            const conn = self.conn;
+            _ = conn.fireTimers() catch |err| blk: {
+                std.log.warn("client onTimeout error: {}", .{err});
+                break :blk 0;
+            };
+
+            if (conn.isClosed()) {
+                self.reportLostSessions();
+                // A shared loop is left to our callers' finishStop.
+                if (self.stopping and self.shared_loop == null) self.own_loop.stop();
+                return;
+            }
+
+            if (self.wt_close_after_sessions) if (self.wt_conn) |wtc| wtc.closeIfUnused();
+
+            // Use remote_addr for pre-handshake, peer address after connection established
+            const send_addr: *const posix.sockaddr.storage = if (conn.isEstablished())
+                conn.peerAddress()
+            else
+                &self.remote_addr;
+
+            const max_burst_packets = 1000;
+            var send_count: usize = 0;
+            var now_ns: i64 = undefined;
+            conn.beginBurst();
+            defer conn.endBurst();
+            while (send_count < max_burst_packets) : (send_count += 1) {
+                const buf = self.batch.reserve();
+                if (send_count % packets_per_clock_read == 0 or self.batch.count == 0) now_ns = sys.nanoTimestamp();
+                const bytes_written = conn.sendAt(buf, now_ns) catch break;
+                if (bytes_written == 0) break;
+                self.batch.commit(
+                    bytes_written,
+                    @ptrCast(send_addr),
+                    connection.sockaddrLen(send_addr),
+                    conn.getEcnMark(),
+                );
+            }
+            self.batch.flush();
+        }
+
+        fn rescheduleTimer(self: *Self) void {
+            // Before start() the timer is not ours to arm: start() arms it.
+            if (self.halted or !self.started) return;
+            const next_ms = self.computeNextTimeoutMs() orelse return;
+
+            // See the server's rescheduleTimer: never re-add the timer while a
+            // reset's cancel is still queued against it.
+            if (!self.timer_armed and self.timer_cancel_completion.state() != .dead) {
+                self.armWake();
+                return;
+            }
+
+            const loop = self.eventLoop();
+            if (self.timer_armed) {
+                self.timer.reset(
+                    loop,
+                    &self.timer_completion,
+                    &self.timer_cancel_completion,
+                    next_ms,
+                    Self,
+                    self,
+                    onTimer,
+                );
+            } else {
+                self.timer.run(
+                    loop,
+                    &self.timer_completion,
+                    next_ms,
+                    Self,
+                    self,
+                    onTimer,
+                );
+            }
+            self.timer_armed = true;
+        }
+
+        fn computeNextTimeoutMs(self: *Self) ?u64 {
+            const floor: ?u64 = if (@hasDecl(Handler, "poll_interval_ms")) Handler.poll_interval_ms else null;
+            const now: i64 = sys.nanoTimestamp();
+            const deadline = self.conn.nextTimeoutNsAt(now) orelse return floor;
+            const delta_ns = deadline - now;
+            if (delta_ns <= 0) return 1;
+            // Rounded up, as the server's: rounded down, it fires early, then again.
+            const ms: u64 = @intCast(@divFloor(delta_ns - 1, std.time.ns_per_ms) + 1);
+            const clamped = if (floor) |f| @min(ms, f) else ms;
+            return if (clamped == 0) 1 else clamped;
+        }
+
+        fn makeSession(self: *Self) ClientSession {
+            return .{
+                .conn = self.conn,
+                .h3_conn = self.h3_conn,
+                .wt_conn = self.wt_conn,
+                .stopping = &self.stopping,
+                .wake_fn = wakeFromSession,
+                .repoll_fn = repollFromSession,
+                .wake_ctx = self,
+            };
+        }
+    };
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────
+
+const testing = std.testing;
+const crypto = std.crypto;
+const EcdsaP256Sha256 = crypto.sign.ecdsa.EcdsaP256Sha256;
+
+fn makeTestTlsConfig() tls13.TlsConfig {
+    const server_key_pair = EcdsaP256Sha256.KeyPair.generate(std.testing.io);
+    const S = struct {
+        var secret_key_bytes: [32]u8 = undefined;
+        var pub_key_bytes: [65]u8 = undefined;
+        var cert_chain: [1][]const u8 = undefined;
+        var alpn: [1][]const u8 = undefined;
+        var ticket_key: [16]u8 = undefined;
+    };
+    S.secret_key_bytes = server_key_pair.secret_key.toBytes();
+    S.pub_key_bytes = server_key_pair.public_key.toUncompressedSec1();
+    S.cert_chain = .{&S.pub_key_bytes};
+    S.alpn = .{"h3"};
+    sys.randomBytes(&S.ticket_key);
+    return .{
+        .cert_chain_der = &S.cert_chain,
+        .private_key_bytes = &S.secret_key_bytes,
+        .alpn = &S.alpn,
+        .ticket_key = S.ticket_key,
+    };
+}
+
+// Handler with compile-time validation
+const TestWtHandler = struct {
+    pub const protocol: Protocol = .webtransport;
+    session_ready_count: u32 = 0,
+    stream_data_count: u32 = 0,
+    connect_request_count: u32 = 0,
+
+    pub fn onConnectRequest(self: *TestWtHandler, session: *Session, session_id: u64, _: []const u8) void {
+        self.connect_request_count += 1;
+        session.acceptSession(session_id) catch {};
+    }
+    pub fn onSessionReady(self: *TestWtHandler, _: *Session, _: u64) void {
+        self.session_ready_count += 1;
+    }
+    pub fn onStreamData(self: *TestWtHandler, session: *Session, stream_id: u64, data: []const u8, fin: bool) void {
+        self.stream_data_count += 1;
+        // Echo back
+        if (data.len > 0) {
+            session.sendStreamData(stream_id, data) catch {};
+        }
+        if (fin) {
+            session.closeStream(stream_id);
+        }
+    }
+    pub fn onDatagram(_: *TestWtHandler, _: *Session, _: u64, _: []const u8) void {}
+    pub fn onSessionClosed(_: *TestWtHandler, _: *Session, _: u64, _: u32, _: []const u8) void {}
+};
+
+const TestH3Handler = struct {
+    pub const protocol: Protocol = .h3;
+    request_count: u32 = 0,
+
+    pub fn onRequest(self: *TestH3Handler, session: *Session, stream_id: u64, _: []const qpack.Header) void {
+        self.request_count += 1;
+        const resp = [_]qpack.Header{.{ .name = ":status", .value = "200" }};
+        session.sendResponse(stream_id, &resp, "OK") catch {};
+    }
+};
+
+// Compile-time handler validation: unrecognized callback should fail
+// (can't test compile errors in Zig tests, but we verify valid handlers compile)
+test "Server: handler validation compiles for valid handlers" {
+    // These should compile without error
+    _ = Server(TestWtHandler);
+    _ = Server(TestH3Handler);
+}
+
+test "Server: handlers may take the CONNECT headers" {
+    // The extra parameter is how a WebTransport handler sees
+    // WT-Available-Protocols; both arities have to keep compiling.
+    const WithHeaders = struct {
+        pub const protocol: Protocol = .webtransport;
+        pub fn onConnectRequest(_: *@This(), _: *Session, _: u64, _: []const u8, _: []const qpack.Header) void {}
+        pub fn onSessionReady(_: *@This(), _: *Session, _: u64, _: []const qpack.Header) void {}
+        pub fn onStreamData(_: *@This(), _: *Session, _: u64, _: []const u8, _: bool) void {}
+    };
+    _ = Server(WithHeaders);
+}
+
+test "Client: handlers may take the CONNECT response headers" {
+    const WithHeaders = struct {
+        pub const protocol: Protocol = .webtransport;
+        pub fn onSessionReady(_: *@This(), _: *ClientSession, _: u64, _: []const qpack.Header) void {}
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    };
+    _ = Client(WithHeaders);
+}
+
+test "Client: handler validation compiles for valid handlers" {
+    // WebTransport client handler
+    const TestWtClientHandler = struct {
+        pub const protocol: Protocol = .webtransport;
+        pub fn onSessionReady(_: *@This(), _: *ClientSession, _: u64) void {}
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+        pub fn onDatagram(_: *@This(), _: *ClientSession, _: u64, _: []const u8) void {}
+    };
+    _ = Client(TestWtClientHandler);
+
+    // H3 client handler
+    const TestH3ClientHandler = struct {
+        pub const protocol: Protocol = .h3;
+        pub fn onConnected(_: *@This(), _: *ClientSession) void {}
+        pub fn onHeaders(_: *@This(), _: *ClientSession, _: u64, _: []const qpack.Header) void {}
+        pub fn onData(_: *@This(), _: *ClientSession, _: u64, _: usize) void {}
+        pub fn onFinished(_: *@This(), _: *ClientSession, _: u64) void {}
+        pub fn onSettings(_: *@This(), _: *ClientSession, _: h3.H3Connection.Settings) void {}
+        pub fn onGoaway(_: *@This(), _: *ClientSession, _: u64) void {}
+    };
+    _ = Client(TestH3ClientHandler);
+
+    // Raw QUIC client handler
+    const TestQuicClientHandler = struct {
+        pub const protocol: Protocol = .quic;
+        pub fn onConnected(_: *@This(), _: *ClientSession) void {}
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    };
+    _ = Client(TestQuicClientHandler);
+}
+
+test "Server: init and deinit with in-memory TLS config" {
+    const tls_config = makeTestTlsConfig();
+    var handler = TestH3Handler{};
+    var server = try Server(TestH3Handler).init(testing.allocator, &handler, .{
+        .port = 0, // ephemeral port
+        .tls_config = tls_config,
+    });
+    defer server.deinit();
+
+    // Server should be in initial state
+    try testing.expect(!server.started);
+    try testing.expect(!server.stopping);
+}
+
+test "Client: init and deinit with in-memory TLS config" {
+    var handler = struct {
+        pub const protocol: Protocol = .webtransport;
+        pub fn onSessionReady(_: *@This(), _: *ClientSession, _: u64) void {}
+    }{};
+
+    var client = try Client(@TypeOf(handler)).init(testing.allocator, &handler, .{
+        .port = 19876,
+        .skip_cert_verify = true,
+    });
+    defer client.deinit();
+
+    try testing.expect(!client.started);
+    try testing.expect(!client.stopping);
+    try testing.expect(!client.protocol_initialized);
+    try testing.expect(client.session_id == null);
+}
+
+test "Server: start, tick, stop lifecycle" {
+    const tls_config = makeTestTlsConfig();
+    var handler = TestH3Handler{};
+    var server = try Server(TestH3Handler).init(testing.allocator, &handler, .{
+        .port = 0,
+        .tls_config = tls_config,
+    });
+    defer server.deinit();
+
+    // tick() should auto-start
+    try server.tick();
+    try testing.expect(server.started);
+
+    // stop() should set stopping flag
+    server.stop();
+    try testing.expect(server.stopping);
+
+    // tick after stop with no connections should be fine
+    try server.tick();
+}
+
+test "Client H3: init and deinit" {
+    var handler = struct {
+        pub const protocol: Protocol = .h3;
+        pub fn onHeaders(_: *@This(), _: *ClientSession, _: u64, _: []const qpack.Header) void {}
+    }{};
+
+    var client = try Client(@TypeOf(handler)).init(testing.allocator, &handler, .{
+        .port = 19877,
+        .skip_cert_verify = true,
+    });
+    defer client.deinit();
+
+    try testing.expect(!client.started);
+    try testing.expect(!client.protocol_initialized);
+    try testing.expect(client.h3_conn == null);
+}
+
+test "Client QUIC: init and deinit" {
+    var handler = struct {
+        pub const protocol: Protocol = .quic;
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    }{};
+
+    var client = try Client(@TypeOf(handler)).init(testing.allocator, &handler, .{
+        .port = 19878,
+        .skip_cert_verify = true,
+    });
+    defer client.deinit();
+
+    try testing.expect(!client.started);
+    try testing.expect(!client.protocol_initialized);
+    try testing.expect(client.h3_conn == null);
+}
+
+test "Client H3: start, tick, stop lifecycle" {
+    var handler = struct {
+        pub const protocol: Protocol = .h3;
+        pub fn onHeaders(_: *@This(), _: *ClientSession, _: u64, _: []const qpack.Header) void {}
+    }{};
+
+    var client = try Client(@TypeOf(handler)).init(testing.allocator, &handler, .{
+        .port = 19879,
+        .skip_cert_verify = true,
+    });
+    defer client.deinit();
+
+    try client.tick();
+    try testing.expect(client.started);
+
+    client.stop();
+    try testing.expect(client.stopping);
+}
+
+test "Client QUIC: start, tick, stop lifecycle" {
+    var handler = struct {
+        pub const protocol: Protocol = .quic;
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    }{};
+
+    var client = try Client(@TypeOf(handler)).init(testing.allocator, &handler, .{
+        .port = 19880,
+        .skip_cert_verify = true,
+    });
+    defer client.deinit();
+
+    try client.tick();
+    try testing.expect(client.started);
+
+    client.stop();
+    try testing.expect(client.stopping);
+}
+
+test "stop() leaves nothing queued for the peer" {
+    // The CONNECTION_CLOSE has to be on the wire when stop() returns. If it
+    // is merely queued, a caller that exits instead of running the loop
+    // leaves the peer holding the connection until its idle timeout, and
+    // the symptom shows up on some unrelated connection much later.
+    var handler = struct {
+        pub const protocol: Protocol = .quic;
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    }{};
+
+    var client = try Client(@TypeOf(handler)).init(testing.allocator, &handler, .{
+        .port = 19881,
+        .skip_cert_verify = true,
+    });
+    defer client.deinit();
+
+    try client.tick();
+    client.stop();
+
+    try testing.expect(client.conn.state == .closing or client.conn.isClosed());
+
+    // Nothing left to send means the close was drained, not just queued.
+    var buf: [2048]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), client.conn.send(&buf) catch 0);
+}
+
+test "stop() turns away a client that arrives while it finishes" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var sh = HelloServer{};
+    var server = try Server(HelloServer).init(testing.allocator, &sh, .{
+        .port = 29436,
+        .tls_config = makeTestTlsConfig(),
+        .loop = &loop,
+    });
+    server.start();
+    var ha = CheckingClient{};
+    var a = try Client(CheckingClient).init(testing.allocator, &ha, .{ .port = 29436, .skip_cert_verify = true, .loop = &loop });
+    a.start();
+    try runUntil(&loop, &ha, CheckingClient.done, 10_000);
+
+    // a's connection is still closing when b arrives. Served, b would hold
+    // stop() open for as long as it stayed.
+    server.stop();
+    var hb = CheckingClient{};
+    var b = try Client(CheckingClient).init(testing.allocator, &hb, .{ .port = 29436, .skip_cert_verify = true, .loop = &loop });
+    b.start();
+    const server_stopped = runUntil(&loop, &server, Server(HelloServer).isStopped, 5000);
+
+    a.stop();
+    b.stop();
+    const All = struct {
+        s: *Server(HelloServer),
+        a: *Client(CheckingClient),
+        b: *Client(CheckingClient),
+        fn stopped(self: *const @This()) bool {
+            return self.s.isStopped() and self.a.isStopped() and self.b.isStopped();
+        }
+    };
+    try runUntil(&loop, &All{ .s = &server, .a = &a, .b = &b }, All.stopped, 5000);
+    a.deinit();
+    b.deinit();
+    server.deinit();
+    try server_stopped;
+    try testing.expectEqual(@as(usize, 0), hb.received);
+}
+
+test "Client: closeConnection from a handler arms the run loop's exit" {
+    var handler = struct {
+        pub const protocol: Protocol = .quic;
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    }{};
+
+    var client = try Client(@TypeOf(handler)).init(testing.allocator, &handler, .{
+        .port = 19881,
+        .skip_cert_verify = true,
+    });
+    defer client.deinit();
+
+    try client.tick();
+    try testing.expect(!client.stopping);
+
+    // run() only leaves once `stopping` is set, so a handler that closes the
+    // connection without it leaves the client spinning after the exchange.
+    var session = client.makeSession();
+    session.closeConnection();
+    try testing.expect(client.stopping);
+}
+
+test "Client: a datagram from elsewhere does not redirect the handshake" {
+    // The client sent its Initials to whatever address it last heard from,
+    // so one spoofed datagram to its port pointed them at a victim.
+    const H = struct {
+        pub const protocol: Protocol = .quic;
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    };
+    var handler = H{};
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var client = try Client(H).init(testing.allocator, &handler, .{
+        .port = 29441,
+        .skip_cert_verify = true,
+        .loop = &loop,
+    });
+    defer client.deinit();
+    const server_addr = client.remote_addr;
+    client.start();
+    try loop.run(.no_wait);
+
+    var to = try boundAddress(client.sockfd);
+    to.in.sa.addr = std.mem.nativeToBig(u32, 0x7f000001);
+    const spoofer = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    defer sys.close(spoofer);
+    const junk: [64]u8 = @splat(0x40);
+    _ = try sys.sendto(spoofer, &junk, 0, &to.any, to.getOsSockLen());
+    for (0..20) |_| {
+        try loop.run(.no_wait);
+        sys.sleepNs(std.time.ns_per_ms);
+    }
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&server_addr), std.mem.asBytes(&client.remote_addr));
+
+    client.stop();
+    const Stopped = struct {
+        fn done(c: *Client(H)) bool {
+            return c.isStopped();
+        }
+    };
+    try runUntil(&loop, &client, Stopped.done, 5000);
+}
+
+test "two clients share one loop" {
+    // Driving two connections used to mean two loops and a caller spinning
+    // tick() over both. On a shared loop one run() drives them, and one
+    // stopping must not take the other down with it.
+    const H = struct {
+        pub const protocol: Protocol = .quic;
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    };
+    var handler = H{};
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var a = try Client(H).init(testing.allocator, &handler, .{
+        .port = 19882,
+        .skip_cert_verify = true,
+        .loop = &loop,
+    });
+    defer a.deinit();
+
+    var b = try Client(H).init(testing.allocator, &handler, .{
+        .port = 19883,
+        .skip_cert_verify = true,
+        .loop = &loop,
+    });
+    defer b.deinit();
+
+    try testing.expectEqual(a.eventLoop(), b.eventLoop());
+
+    a.start();
+    b.start();
+    try loop.run(.no_wait);
+
+    a.stop();
+    try testing.expect(a.conn.state == .closing or a.conn.isClosed());
+
+    // b still has work on a loop a did not stop.
+    try loop.run(.no_wait);
+    try testing.expect(!b.conn.isClosed());
+
+    // The teardown order the config documents: drain each client off the
+    // loop before the loop goes away.
+    b.stop();
+    const Both = struct {
+        a: *Client(H),
+        b: *Client(H),
+        fn done(x: *const @This()) bool {
+            return x.a.isStopped() and x.b.isStopped();
+        }
+    };
+    try runUntil(&loop, &Both{ .a = &a, .b = &b }, Both.done, 10_000);
+}
+
+// ─── End-to-end: Server and Client on one caller-owned loop ──────────
+
+/// Runs `loop` until `done(ctx)` holds, failing after `timeout_ms`. Never
+/// blocks in the loop: a stopped client leaves its socket watch behind, and
+/// that alone would keep a blocking run waiting forever.
+fn runUntil(loop: *xev.Loop, ctx: anytype, comptime done: fn (@TypeOf(ctx)) bool, timeout_ms: i64) !void {
+    const deadline = sys.nanoTimestamp() + timeout_ms * std.time.ns_per_ms;
+    while (!done(ctx)) {
+        if (sys.nanoTimestamp() > deadline) return error.Timeout;
+        try loop.run(.no_wait);
+        sys.sleepNs(50 * std.time.ns_per_us);
+    }
+}
+
+/// A server and a client joined to one loop the test owns.
+fn E2e(comptime ServerHandler: type, comptime ClientHandler: type) type {
+    return struct {
+        const Self = @This();
+
+        loop: xev.Loop,
+        server: Server(ServerHandler),
+        client: Client(ClientHandler),
+
+        /// In place: both sides keep pointers into `self` once started.
+        fn init(self: *Self, port: u16, sh: *ServerHandler, ch: *ClientHandler) !void {
+            return self.initWith(port, sh, ch, null, null);
+        }
+
+        fn initWith(
+            self: *Self,
+            port: u16,
+            sh: *ServerHandler,
+            ch: *ClientHandler,
+            server_conn: ?connection.ConnectionConfig,
+            client_conn: ?connection.ConnectionConfig,
+        ) !void {
+            return self.initServer(port, sh, ch, .{ .conn_config = server_conn }, client_conn);
+        }
+
+        /// `initWith` taking the server's whole `Config`; its port, TLS and
+        /// loop are set here.
+        fn initServer(
+            self: *Self,
+            port: u16,
+            sh: *ServerHandler,
+            ch: *ClientHandler,
+            server_config: Config,
+            client_conn: ?connection.ConnectionConfig,
+        ) !void {
+            self.loop = try xev.Loop.init(.{});
+            errdefer self.loop.deinit();
+            var sc = server_config;
+            sc.port = port;
+            sc.tls_config = makeTestTlsConfig();
+            sc.loop = &self.loop;
+            self.server = try Server(ServerHandler).init(testing.allocator, sh, sc);
+            errdefer self.server.deinit();
+            self.client = try Client(ClientHandler).init(testing.allocator, ch, .{
+                .port = port,
+                .skip_cert_verify = true,
+                .conn_config = client_conn,
+                .loop = &self.loop,
+            });
+            self.server.start();
+            self.client.start();
+        }
+
+        /// The teardown a shared loop needs: close both ends, then run the
+        /// loop until neither has anything left on it.
+        fn deinit(self: *Self) void {
+            self.client.stop();
+            self.server.stop();
+            runUntil(&self.loop, self, bothStopped, 5000) catch @panic("did not stop");
+            // Stopping them must not have stopped the caller's loop.
+            std.debug.assert(!self.loop.stopped());
+            self.client.deinit();
+            self.server.deinit();
+            self.loop.deinit();
+        }
+
+        fn bothStopped(self: *Self) bool {
+            return self.server.isStopped() and self.client.isStopped();
+        }
+    };
+}
+
+const E2E_CHUNK: usize = 16 * 1024;
+const E2E_BODY: usize = 1024 * 1024;
+
+fn e2eBodyByte(offset: usize) u8 {
+    return @truncate(offset *% 31 +% (offset >> 12));
+}
+
+const get_request = requestTo("GET", "/");
+
+/// Answers with headers at once, then streams the body from a timer on the
+/// shared loop — outside any server callback — paced by `onWritable`.
+const StreamingServer = struct {
+    pub const protocol: Protocol = .h3;
+
+    loop: *xev.Loop,
+    pump_timer: xev.Timer = .{},
+    pump_c: xev.Completion = .{},
+    pump_armed: bool = false,
+    session: ?Session = null,
+    stream_id: u64 = 0,
+    sent: usize = 0,
+    finished: bool = false,
+    writable_count: u32 = 0,
+    wrong_writable: u32 = 0,
+    closed_count: u32 = 0,
+    closed_id_matched: bool = false,
+
+    pub fn onRequest(self: *@This(), session: *Session, stream_id: u64, _: []const qpack.Header) void {
+        session.sendResponseHeaders(stream_id, &.{.{ .name = ":status", .value = "200" }}) catch unreachable;
+        self.session = session.*;
+        self.stream_id = stream_id;
+        self.armPump();
+    }
+
+    pub fn onWritable(self: *@This(), _: *Session, session_id: u64, stream_id: ?u64) void {
+        if (session_id != self.stream_id or stream_id != self.stream_id) self.wrong_writable += 1;
+        self.writable_count += 1;
+        self.armPump();
+    }
+
+    pub fn onConnectionClosed(self: *@This(), session: *Session) void {
+        self.closed_count += 1;
+        if (self.session) |s| self.closed_id_matched = s.id() == session.id();
+        self.session = null; // the entry is freed after this returns
+    }
+
+    fn hasRequest(self: *@This()) bool {
+        return self.session != null and self.sent > 0;
+    }
+
+    fn armPump(self: *@This()) void {
+        if (self.pump_armed) return;
+        self.pump_armed = true;
+        self.pump_timer.run(self.loop, &self.pump_c, 0, @This(), self, onPump);
+    }
+
+    fn onPump(self_opt: ?*@This(), _: *xev.Loop, _: *xev.Completion, r: xev.Timer.RunError!void) xev.CallbackAction {
+        const self = self_opt.?;
+        self.pump_armed = false;
+        _ = r catch return .disarm;
+        self.pump();
+        return .disarm;
+    }
+
+    fn pump(self: *@This()) void {
+        const s = &(self.session orelse return);
+        const want = E2E_CHUNK + 16; // chunk plus its DATA frame header
+        var chunk: [E2E_CHUNK]u8 = undefined;
+        while (self.sent < E2E_BODY) {
+            const cap = s.streamSendCapacity(self.stream_id) orelse return;
+            const buffered = s.streamBufferedBytes(self.stream_id) orelse return;
+            if (cap < want or buffered >= want) {
+                s.notifyWritable(0, self.stream_id, want) catch unreachable;
+                return;
+            }
+            const n = @min(E2E_CHUNK, E2E_BODY - self.sent);
+            for (chunk[0..n], self.sent..) |*b, off| b.* = e2eBodyByte(off);
+            s.sendResponseData(self.stream_id, chunk[0..n]) catch unreachable;
+            self.sent += n;
+        }
+        s.finishResponse(self.stream_id, null) catch unreachable;
+        self.finished = true;
+    }
+};
+
+/// Sends one request on connect and checks what comes back.
+const CheckingClient = struct {
+    pub const protocol: Protocol = .h3;
+
+    request: []const qpack.Header = &get_request,
+    request_body: ?[]const u8 = null,
+    /// Checked against e2eBodyByte when set, else collected into `body`.
+    patterned: bool = false,
+    /// Cancel the request as soon as the response headers arrive.
+    cancel_on_headers: bool = false,
+    /// Never read the answer's body: its stream's window stays shut.
+    unread: bool = false,
+
+    stream_id: ?u64 = null,
+    status: [3]u8 = .{ 0, 0, 0 },
+    received: usize = 0,
+    mismatches: usize = 0,
+    body: [64]u8 = undefined,
+    finished: bool = false,
+
+    pub fn onConnected(self: *@This(), session: *ClientSession) void {
+        self.stream_id = session.sendRequest(self.request, self.request_body) catch null;
+    }
+
+    pub fn onHeaders(self: *@This(), session: *ClientSession, stream_id: u64, headers: []const qpack.Header) void {
+        for (headers) |h| {
+            if (std.mem.eql(u8, h.name, ":status") and h.value.len == 3) @memcpy(&self.status, h.value);
+        }
+        if (self.cancel_on_headers) {
+            session.h3_conn.?.cancelRequest(stream_id, @backingInt(H3Error.request_cancelled));
+        }
+    }
+
+    pub fn onData(self: *@This(), session: *ClientSession, _: u64, _: usize) void {
+        if (self.unread) return;
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n = session.recvBody(&buf);
+            if (n == 0) break;
+            for (buf[0..n], self.received..) |b, off| {
+                if (self.patterned) {
+                    if (b != e2eBodyByte(off)) self.mismatches += 1;
+                } else if (off < self.body.len) {
+                    self.body[off] = b;
+                }
+            }
+            self.received += n;
+        }
+    }
+
+    pub fn onFinished(self: *@This(), _: *ClientSession, _: u64) void {
+        self.finished = true;
+    }
+
+    fn done(self: *@This()) bool {
+        return self.finished;
+    }
+};
+
+test "e2e: a server on a shared loop streams 1 MiB under backpressure" {
+    var client_handler = CheckingClient{ .patterned = true };
+    var server_handler = StreamingServer{ .loop = undefined };
+    var e2e: E2e(StreamingServer, CheckingClient) = undefined;
+    try e2e.init(29411, &server_handler, &client_handler);
+    server_handler.loop = &e2e.loop;
+
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &client_handler, CheckingClient.done, 20_000);
+
+    try testing.expectEqualStrings("200", &client_handler.status);
+    try testing.expectEqual(E2E_BODY, client_handler.received);
+    try testing.expectEqual(@as(usize, 0), client_handler.mismatches);
+    try testing.expect(server_handler.finished);
+    // It had to wait: the body is far bigger than one flight.
+    try testing.expect(server_handler.writable_count > 0);
+    try testing.expectEqual(@as(u32, 0), server_handler.wrong_writable);
+}
+
+test "e2e: onConnectionClosed fires once, before the entry goes" {
+    var client_handler = CheckingClient{};
+    var server_handler = StreamingServer{ .loop = undefined };
+    var e2e: E2e(StreamingServer, CheckingClient) = undefined;
+    try e2e.init(29416, &server_handler, &client_handler);
+    server_handler.loop = &e2e.loop;
+    {
+        errdefer e2e.deinit();
+        try runUntil(&e2e.loop, &server_handler, StreamingServer.hasRequest, 10_000);
+        try testing.expect(server_handler.session.?.id() != 0);
+    }
+    // Torn down mid-response: the close still reaches the handler, once.
+    e2e.deinit();
+    try testing.expectEqual(@as(u32, 1), server_handler.closed_count);
+    try testing.expect(server_handler.closed_id_matched);
+}
+
+/// No onPollComplete, so its passes skip connections with nothing new.
+const IdleServer = struct {
+    pub const protocol: Protocol = .quic;
+    closed: u32 = 0,
+    pub fn onStreamData(_: *@This(), _: *Session, _: u64, _: []const u8, _: bool) void {}
+    pub fn onConnectionClosed(self: *@This(), _: *Session) void {
+        self.closed += 1;
+    }
+};
+
+const SilentClient = struct {
+    pub const protocol: Protocol = .quic;
+    pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+};
+
+test "e2e: a connection that falls silent times out though no pass is asked to look at it" {
+    var client_handler = SilentClient{};
+    var server_handler = IdleServer{};
+    var e2e: E2e(IdleServer, SilentClient) = undefined;
+    try e2e.initWith(29491, &server_handler, &client_handler, .{ .max_idle_timeout = 200 }, null);
+    defer e2e.deinit();
+    try runUntil(&e2e.loop, &e2e.server, struct {
+        fn f(s: *Server(IdleServer)) bool {
+            const items = s.conn_mgr.entries.items;
+            return items.len == 1 and items[0].conn.isEstablished();
+        }
+    }.f, 5000);
+    // Nothing is sent after the handshake: only the cached deadline brings it
+    // up. A client that idles out before acknowledging the server's last
+    // packet leaves it waiting out its probes' backoff too, 3 x PTO x 32.
+    try runUntil(&e2e.loop, &server_handler, struct {
+        fn f(h: *IdleServer) bool {
+            return h.closed == 1;
+        }
+    }.f, 8000);
+    try testing.expectEqual(@as(usize, 0), e2e.server.conn_mgr.connectionCount());
+    // Gone from what a pass goes through, and from the timers.
+    try testing.expectEqual(@as(usize, 0), e2e.server.conn_mgr.to_visit.items.len);
+    try testing.expectEqual(@as(?i64, null), e2e.server.conn_mgr.nextDeadline());
+}
+
+/// Echoes how much request body arrived, once the request is complete.
+const UploadServer = struct {
+    pub const protocol: Protocol = .h3;
+
+    body_bytes: usize = 0,
+    body_ok: bool = true,
+    ended: u32 = 0,
+    reply: [32]u8 = undefined,
+
+    pub fn onRequest(_: *@This(), _: *Session, _: u64, _: []const qpack.Header) void {}
+
+    pub fn onData(self: *@This(), _: *Session, _: u64, data: []const u8) void {
+        for (data, self.body_bytes..) |b, off| {
+            if (b != e2eBodyByte(off)) self.body_ok = false;
+        }
+        self.body_bytes += data.len;
+    }
+
+    pub fn onRequestEnd(self: *@This(), session: *Session, stream_id: u64) void {
+        self.ended += 1;
+        const text = std.fmt.bufPrint(&self.reply, "{d}", .{self.body_bytes}) catch unreachable;
+        session.sendResponse(stream_id, &.{.{ .name = ":status", .value = "200" }}, text) catch unreachable;
+    }
+};
+
+test "e2e: onRequestEnd follows the whole POST body" {
+    const body = try testing.allocator.alloc(u8, 100_000);
+    defer testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = e2eBodyByte(i);
+
+    var client_handler = CheckingClient{
+        .request = &.{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "localhost" },
+            .{ .name = ":path", .value = "/upload" },
+        },
+        .request_body = body,
+    };
+    var server_handler = UploadServer{};
+    var e2e: E2e(UploadServer, CheckingClient) = undefined;
+    try e2e.init(29412, &server_handler, &client_handler);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &client_handler, CheckingClient.done, 10_000);
+    try testing.expectEqual(@as(u32, 1), server_handler.ended);
+    try testing.expect(server_handler.body_ok);
+    try testing.expectEqualStrings("100000", client_handler.body[0..client_handler.received]);
+}
+
+/// Sends headers and then nothing, leaving the client to give up.
+const StallingServer = struct {
+    pub const protocol: Protocol = .h3;
+
+    cancelled_stream: ?u64 = null,
+    cancel_code: u64 = 0,
+
+    pub fn onRequest(_: *@This(), session: *Session, stream_id: u64, _: []const qpack.Header) void {
+        session.sendResponseHeaders(stream_id, &.{.{ .name = ":status", .value = "200" }}) catch unreachable;
+    }
+
+    pub fn onRequestCancelled(self: *@This(), _: *Session, stream_id: u64, error_code: u64) void {
+        self.cancelled_stream = stream_id;
+        self.cancel_code = error_code;
+    }
+
+    fn done(self: *@This()) bool {
+        return self.cancelled_stream != null;
+    }
+};
+
+test "e2e: a client allowing no uni streams is closed, not given a new H3 layer every pass" {
+    // HTTP/3 needs three uni streams (RFC 9114 6.2); a peer granting fewer
+    // left the server rebuilding its H3 layer on every loop pass.
+    const Closed = struct {
+        fn done(c: *Client(CheckingClient)) bool {
+            return switch (c.conn.state) {
+                .closing, .draining, .terminated => true,
+                else => false,
+            };
+        }
+    };
+    const none: connection.ConnectionConfig = .{ .initial_max_streams_uni = 0 };
+    for ([_][2]?connection.ConnectionConfig{ .{ null, none }, .{ none, null } }, [_]u16{ 29438, 29439 }) |configs, port| {
+        var server_handler = TestH3Handler{};
+        var client_handler = CheckingClient{};
+        var e2e: E2e(TestH3Handler, CheckingClient) = undefined;
+        try e2e.initWith(port, &server_handler, &client_handler, configs[0], configs[1]);
+        defer e2e.deinit();
+
+        try runUntil(&e2e.loop, &e2e.client, Closed.done, 3000);
+        try testing.expectEqual(@as(u32, 0), server_handler.request_count);
+    }
+}
+
+test "e2e: a client abandoning a response reaches onRequestCancelled" {
+    var client_handler = CheckingClient{ .cancel_on_headers = true };
+    var server_handler = StallingServer{};
+    var e2e: E2e(StallingServer, CheckingClient) = undefined;
+    try e2e.init(29413, &server_handler, &client_handler);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &server_handler, StallingServer.done, 10_000);
+    try testing.expectEqual(client_handler.stream_id, server_handler.cancelled_stream);
+    try testing.expectEqual(@as(u64, @backingInt(H3Error.request_cancelled)), server_handler.cancel_code);
+}
+
+/// A WebTransport listener that also serves plain requests.
+const MixedServer = struct {
+    pub const protocol: Protocol = .webtransport;
+
+    requests: u32 = 0,
+    connects: u32 = 0,
+
+    pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        self.connects += 1;
+        session.acceptSession(session_id) catch {};
+    }
+
+    pub fn onRequest(self: *@This(), session: *Session, stream_id: u64, headers: []const qpack.Header) void {
+        self.requests += 1;
+        for (headers) |h| {
+            if (std.mem.eql(u8, h.name, ":method") and !std.mem.eql(u8, h.value, "GET")) return;
+        }
+        session.sendResponseHeaders(stream_id, &.{.{ .name = ":status", .value = "200" }}) catch unreachable;
+    }
+
+    pub fn onRequestEnd(_: *@This(), session: *Session, stream_id: u64) void {
+        session.sendResponseData(stream_id, "hello ") catch unreachable;
+        session.sendResponseData(stream_id, "world") catch unreachable;
+        session.finishResponse(stream_id, null) catch unreachable;
+    }
+};
+
+test "e2e: a WebTransport listener serves a plain GET" {
+    var client_handler = CheckingClient{};
+    var server_handler = MixedServer{};
+    var e2e: E2e(MixedServer, CheckingClient) = undefined;
+    try e2e.init(29414, &server_handler, &client_handler);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &client_handler, CheckingClient.done, 10_000);
+    try testing.expectEqual(@as(u32, 1), server_handler.requests);
+    try testing.expectEqual(@as(u32, 0), server_handler.connects);
+    try testing.expectEqualStrings("200", &client_handler.status);
+    try testing.expectEqualStrings("hello world", client_handler.body[0..client_handler.received]);
+}
+
+/// Takes requests at their head (`onHttpHead`): checks a patterned body as
+/// it streams in and answers with its length, or streams `E2E_BODY` back
+/// without one.
+fn HeadServer(comptime proto: Protocol) type {
+    return struct {
+        pub const protocol: Protocol = proto;
+
+        heads: u32 = 0,
+        received: usize = 0,
+        body_ok: bool = true,
+        gone: u32 = 0,
+        writable: u32 = 0,
+        streaming: ?*Exchange = null,
+        sent: usize = 0,
+        stream_back: bool = false,
+
+        pub fn onHttpHead(self: *@This(), ex: *Exchange) void {
+            self.heads += 1;
+            if (std.mem.eql(u8, ex.target, "/pass")) return ex.pass();
+            if (std.mem.eql(u8, ex.target, "/early")) return ex.respond(413, &.{}, "too big\n");
+            self.stream_back = std.mem.eql(u8, ex.target, "/stream");
+        }
+
+        pub fn onHttpBody(self: *@This(), _: *Exchange, data: []const u8) void {
+            for (data, self.received..) |b, off| {
+                if (b != e2eBodyByte(off)) self.body_ok = false;
+            }
+            self.received += data.len;
+        }
+
+        pub fn onHttpEnd(self: *@This(), ex: *Exchange) void {
+            if (!self.stream_back) {
+                var text: [20]u8 = undefined;
+                return ex.respond(200, &.{.{ .name = "Content-Type", .value = "text/plain" }}, std.fmt.bufPrint(&text, "{d}", .{self.received}) catch unreachable);
+            }
+            ex.sendHead(200, &.{}, null) catch return;
+            self.streaming = ex;
+            self.pump();
+        }
+
+        pub fn onHttpGone(self: *@This(), ex: *Exchange) void {
+            self.gone += 1;
+            if (self.streaming == ex) self.streaming = null;
+        }
+
+        pub fn onHttpWritable(self: *@This(), ex: *Exchange) void {
+            self.writable += 1;
+            if (self.streaming == ex) self.pump();
+        }
+
+        fn pump(self: *@This()) void {
+            const ex = self.streaming orelse return;
+            var chunk: [16 * 1024]u8 = undefined;
+            while (self.sent < E2E_BODY) {
+                if (ex.bufferedAmount() >= 128 * 1024) return;
+                const n = @min(chunk.len, E2E_BODY - self.sent);
+                for (chunk[0..n], self.sent..) |*b, off| b.* = e2eBodyByte(off);
+                ex.write(chunk[0..n]) catch return;
+                self.sent += n;
+            }
+            self.streaming = null;
+            ex.finish();
+        }
+    };
+}
+
+fn requestTo(comptime method: []const u8, comptime path: []const u8) [4]qpack.Header {
+    return .{
+        .{ .name = ":method", .value = method },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = ":path", .value = path },
+    };
+}
+
+test "e2e: onHttpHead takes an HTTP/3 POST, its body in pieces, then onHttpEnd, on .h3 and .webtransport alike" {
+    const body = try testing.allocator.alloc(u8, 100_000);
+    defer testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = e2eBodyByte(i);
+    const request = requestTo("POST", "/upload");
+    inline for (.{ Protocol.h3, Protocol.webtransport }, .{ 29554, 29558 }) |proto, port| {
+        var client_handler = CheckingClient{ .request = &request, .request_body = body };
+        var server_handler = HeadServer(proto){};
+        var e2e: E2e(HeadServer(proto), CheckingClient) = undefined;
+        try e2e.init(port, &server_handler, &client_handler);
+        defer e2e.deinit();
+
+        try runUntil(&e2e.loop, &client_handler, CheckingClient.done, 10_000);
+        try testing.expectEqualStrings("200", &client_handler.status);
+        try testing.expectEqualStrings("100000", client_handler.body[0..client_handler.received]);
+        try testing.expect(server_handler.body_ok);
+        try testing.expectEqual(@as(u32, 0), server_handler.gone);
+    }
+}
+
+test "e2e: an HTTP/3 answer without a length streams whole, paced by onHttpWritable" {
+    const request = requestTo("GET", "/stream");
+    var client_handler = CheckingClient{ .request = &request, .patterned = true };
+    var server_handler = HeadServer(.h3){};
+    var e2e: E2e(HeadServer(.h3), CheckingClient) = undefined;
+    try e2e.init(29555, &server_handler, &client_handler);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &client_handler, CheckingClient.done, 20_000);
+    try testing.expectEqual(E2E_BODY, client_handler.received);
+    try testing.expectEqual(@as(usize, 0), client_handler.mismatches);
+    try testing.expect(server_handler.writable > 0);
+}
+
+/// Sends a POST's head and none of its body, its stream left open.
+const HoldingClient = struct {
+    pub const protocol: Protocol = .h3;
+
+    const request = requestTo("POST", "/upload");
+
+    pub fn onConnected(_: *@This(), session: *ClientSession) void {
+        const h3c = session.h3_conn orelse return;
+        const stream = h3c.quic_conn.openStream() catch return;
+        h3c.writeHeadersFrame(&stream.send, &request) catch return;
+        session.wake();
+    }
+};
+
+fn headServerGone(h: *HeadServer(.h3)) bool {
+    return h.gone == 1;
+}
+
+test "e2e: over HTTP/3, a body that doesn't come is reset after its first window, its handler told" {
+    var client_handler = HoldingClient{};
+    var server_handler = HeadServer(.h3){};
+    var e2e: E2e(HeadServer(.h3), HoldingClient) = undefined;
+    try e2e.initServer(29692, &server_handler, &client_handler, .{ .stall_timeout_ms = 300 }, null);
+    defer e2e.deinit();
+
+    const start = sys.nanoTimestamp();
+    try runUntil(&e2e.loop, &server_handler, headServerGone, 5_000);
+    try testing.expect(sys.nanoTimestamp() - start >= 300 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(u32, 1), server_handler.heads);
+}
+
+test "e2e: over HTTP/3, a streamed answer its client stops reading is reset after stall_timeout_ms" {
+    const request = requestTo("GET", "/stream");
+    var client_handler = CheckingClient{ .request = &request, .unread = true };
+    var server_handler = HeadServer(.h3){};
+    var e2e: E2e(HeadServer(.h3), CheckingClient) = undefined;
+    try e2e.initServer(29693, &server_handler, &client_handler, .{ .stall_timeout_ms = 300 }, .{ .initial_max_stream_data_bidi_local = 64 * 1024 });
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &server_handler, headServerGone, 5_000);
+    try testing.expect(server_handler.sent < E2E_BODY);
+}
+
+test "e2e: over HTTP/3, an answer from onHttpHead and a pass are 413 and 404" {
+    const early = requestTo("POST", "/early");
+    const passed = requestTo("GET", "/pass");
+    const unread: [64]u8 = @splat('x');
+    for ([_][]const qpack.Header{ &early, &passed }, [_]?[]const u8{ &unread, null }, [_][]const u8{ "413", "404" }, [_]u16{ 29556, 29557 }) |request, body, status, port| {
+        var client_handler = CheckingClient{ .request = request, .request_body = body };
+        var server_handler = HeadServer(.h3){};
+        var e2e: E2e(HeadServer(.h3), CheckingClient) = undefined;
+        try e2e.init(port, &server_handler, &client_handler);
+        defer e2e.deinit();
+
+        try runUntil(&e2e.loop, &client_handler, CheckingClient.done, 10_000);
+        try testing.expectEqualStrings(status, &client_handler.status);
+        try testing.expectEqual(@as(u32, 1), server_handler.heads);
+    }
+}
+
+/// One session per connection, as netcode keeps it: any later CONNECT is
+/// refused, by `rejectSession` or by `closeSession` before it was accepted.
+const OneSessionServer = struct {
+    pub const protocol: Protocol = .webtransport;
+    refuse_with_close: bool = false,
+    first: ?u64 = null,
+    datagrams: u32 = 0,
+    closed: u32 = 0,
+
+    pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        if (self.first != null) {
+            if (self.refuse_with_close) return session.closeSession(session_id);
+            return session.rejectSession(session_id, 409) catch unreachable;
+        }
+        self.first = session_id;
+        session.acceptSession(session_id) catch unreachable;
+    }
+    pub fn onDatagram(self: *@This(), _: *Session, session_id: u64, _: []const u8) void {
+        if (session_id == self.first) self.datagrams += 1;
+    }
+    pub fn onSessionClosed(self: *@This(), _: *Session, _: u64, _: u32, _: []const u8) void {
+        self.closed += 1;
+    }
+};
+
+/// Asks for a second session as soon as the first is ready.
+const SecondSessionClient = struct {
+    pub const protocol: Protocol = .webtransport;
+    first: ?u64 = null,
+    second: ?u64 = null,
+    rejected: ?u64 = null,
+    status: [3]u8 = undefined,
+
+    pub fn onSessionReady(self: *@This(), session: *ClientSession, session_id: u64) void {
+        if (self.first != null) return;
+        self.first = session_id;
+        self.second = session.wt_conn.?.connect("localhost", "/second") catch unreachable;
+    }
+    pub fn onSessionRejected(self: *@This(), _: *ClientSession, session_id: u64, status: []const u8) void {
+        self.rejected = session_id;
+        @memcpy(&self.status, status[0..3]);
+    }
+    fn settled(self: *const @This()) bool {
+        return self.rejected != null;
+    }
+};
+
+fn expectSecondSessionRefused(port: u16, refuse_with_close: bool, status: []const u8) !void {
+    var client_handler = SecondSessionClient{};
+    var server_handler = OneSessionServer{ .refuse_with_close = refuse_with_close };
+    var e2e: E2e(OneSessionServer, SecondSessionClient) = undefined;
+    try e2e.init(port, &server_handler, &client_handler);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &client_handler, SecondSessionClient.settled, 10_000);
+    try testing.expectEqual(client_handler.second, client_handler.rejected);
+    try testing.expectEqualStrings(status, &client_handler.status);
+
+    // The first session carries on over the same connection.
+    var cs = e2e.client.clientSession();
+    try cs.sendDatagram(client_handler.first.?, "still here");
+    try runUntilCount(&e2e.loop, &server_handler.datagrams, 1, 3000);
+    try runFor(&e2e.loop, 50);
+    try testing.expect(!e2e.client.conn.isClosed());
+    try testing.expectEqual(@as(u32, 0), server_handler.closed);
+}
+
+test "e2e: a second CONNECT refused with rejectSession leaves the first session open" {
+    try expectSecondSessionRefused(29680, false, "409");
+}
+
+test "e2e: closeSession on a CONNECT never accepted refuses it, and the first session stays" {
+    try expectSecondSessionRefused(29681, true, "403");
+}
+
+const ReadyClient = struct {
+    pub const protocol: Protocol = .webtransport;
+    session_id: ?u64 = null,
+
+    pub fn onSessionReady(self: *@This(), _: *ClientSession, session_id: u64) void {
+        self.session_id = session_id;
+    }
+    fn ready(self: *const @This()) bool {
+        return self.session_id != null;
+    }
+};
+
+test "e2e: a datagram of maxDatagramPayloadSize arrives, and one byte more is refused at the send" {
+    var client_handler = ReadyClient{};
+    var server_handler = OneSessionServer{};
+    var e2e: E2e(OneSessionServer, ReadyClient) = undefined;
+    try e2e.init(29682, &server_handler, &client_handler);
+    defer e2e.deinit();
+    try runUntil(&e2e.loop, &client_handler, ReadyClient.ready, 10_000);
+
+    var cs = e2e.client.clientSession();
+    const sid = client_handler.session_id.?;
+    const max = cs.maxDatagramPayloadSize(sid).?;
+    var buf: [connection.DatagramQueue.MAX_DATAGRAM_SIZE]u8 = @splat('d');
+    try testing.expectError(error.DatagramTooLarge, cs.sendDatagram(sid, buf[0 .. max + 1]));
+    try cs.sendDatagram(sid, buf[0..max]);
+    try cs.sendDatagram(sid, "and one behind it");
+    try runUntilCount(&e2e.loop, &server_handler.datagrams, 2, 3000);
+}
+
+test "e2e: an RSA certificate, picked by SNI next to an EC one" {
+    const test_certs = @import("tls/test_certs.zig");
+    var ec_certs: test_certs.TestCerts = undefined;
+    try ec_certs.load();
+    var rsa_cert: test_certs.RsaCert = undefined;
+    try rsa_cert.load(false);
+    const entries = [_]tls13.CertEntry{
+        ec_certs.entries[0],
+        .{ .server_names = &.{"rsa.test"}, .cert = rsa_cert.cert },
+    };
+    // The pin stands in for the chain; CertificateVerify is still checked.
+    var pin: [32]u8 = undefined;
+    crypto.hash.sha2.Sha256.hash(rsa_cert.chain[0], &pin, .{});
+    const pins = [_][32]u8{pin};
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    const S = Server(MixedServer);
+    const C = Client(CheckingClient);
+    var sh = MixedServer{};
+    var server = try S.init(testing.allocator, &sh, .{
+        .port = 29437,
+        .tls_config = .{ .cert_chain_der = &.{}, .private_key_bytes = &.{}, .certs = &entries, .alpn = &.{"h3"} },
+        .loop = &loop,
+    });
+    server.start();
+    var ch = CheckingClient{};
+    var client = try C.init(testing.allocator, &ch, .{
+        .port = 29437,
+        .server_name = "rsa.test",
+        .ca = .{ .pinned_hashes = &pins },
+        .loop = &loop,
+    });
+    client.start();
+    try runUntil(&loop, &ch, finishedOne, 10_000);
+    try testing.expectEqualStrings("200", &ch.status);
+    try testing.expectEqualStrings("hello world", ch.body[0..ch.received]);
+
+    client.stop();
+    server.stop();
+    const Both = struct {
+        s: *S,
+        c: *C,
+        fn done(x: *const @This()) bool {
+            return x.s.isStopped() and x.c.isStopped();
+        }
+    };
+    try runUntil(&loop, &Both{ .s = &server, .c = &client }, Both.done, 5000);
+    client.deinit();
+    server.deinit();
+}
+
+test "Server: socket options, ALPN and connection cap come from Config" {
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest; // no SO_REUSEPORT
+    const alpn = [_][]const u8{ "h3", "hq-interop" };
+    var handler = TestH3Handler{};
+    const S = Server(TestH3Handler);
+
+    // Two sockets on one port is exactly what SO_REUSEPORT allows.
+    var a = try S.init(testing.allocator, &handler, .{
+        .port = 29415,
+        .reuse_port = true,
+        // Under Linux's default rmem_max, which clamps anything larger.
+        .recv_buffer_size = 150_000,
+        .send_buffer_size = 150_000,
+        .max_connections = 1000,
+        .alpn = &alpn,
+    });
+    defer a.deinit();
+    var b = try S.init(testing.allocator, &handler, .{ .port = 29415, .reuse_port = true });
+    defer b.deinit();
+
+    try testing.expectEqual(@as(usize, 1000), a.conn_mgr.max_connections);
+    try testing.expectEqual(@as(usize, 2), a.owned_tls.?.alpn.len);
+    try testing.expectEqualStrings("hq-interop", a.owned_tls.?.alpn[1]);
+    try testing.expectEqualStrings("h3", b.owned_tls.?.alpn[0]);
+
+    // Linux reports double what was asked; b shows the OS default.
+    const rcvbuf = try getRcvBuf(a.sockfd);
+    try testing.expect(rcvbuf >= 150_000);
+    try testing.expect(rcvbuf != try getRcvBuf(b.sockfd));
+}
+
+test "Server: serves on a socket it is given" {
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest; // no dup for sockets
+    var handler = TestH3Handler{};
+    const S = Server(TestH3Handler);
+    var a = try S.init(testing.allocator, &handler, .{ .port = 29416 });
+    // A dup of a's socket, as a replacement server after a restart would get.
+    const fd = std.c.fcntl(a.sockfd, posix.F.DUPFD_CLOEXEC, @as(c_int, 0));
+    try testing.expect(fd >= 0);
+    a.deinit();
+    var b = try S.init(testing.allocator, &handler, .{ .socket = fd, .port = 1 });
+    defer b.deinit();
+    try testing.expectEqual(fd, b.sockfd);
+    try testing.expectEqual(@as(u16, 29416), b.port());
+}
+
+test "Server: port 0 takes one the kernel picks, which port() names for siblings to join" {
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest; // no SO_REUSEPORT
+    var handler = TestH3Handler{};
+    const S = Server(TestH3Handler);
+    var a = try S.init(testing.allocator, &handler, .{ .port = 0, .reuse_port = true });
+    defer a.deinit();
+    try testing.expect(a.port() != 0);
+    var b = try S.init(testing.allocator, &handler, .{ .port = a.port(), .reuse_port = true });
+    defer b.deinit();
+    try testing.expectEqual(a.port(), b.port());
+}
+
+test "Server: port 0 puts the HTTP/1.1 listener and Alt-Svc on the port UDP got" {
+    var handler = TestH3Handler{};
+    const S = Server(TestH3Handler);
+    var s = try S.init(testing.allocator, &handler, .{ .port = 0, .http1 = .{ .tls = false } });
+    defer s.deinit();
+    const h1 = &s.http1_server.?;
+    try testing.expectEqual(s.port(), h1.port());
+    var buf: [32]u8 = undefined;
+    const want = try std.fmt.bufPrint(&buf, "h3=\":{d}\"", .{s.port()});
+    try testing.expect(std.mem.startsWith(u8, h1.altSvc().?, want));
+}
+
+test "Server and Client sockets send with DF set, IPv4 and dual-stack" {
+    if (comptime builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
+    var handler = TestH3Handler{};
+    const S = Server(TestH3Handler);
+    var v4 = try S.init(testing.allocator, &handler, .{ .port = 29417 });
+    defer v4.deinit();
+    var dual = try S.init(testing.allocator, &handler, .{ .port = 29418, .ipv6 = true });
+    defer dual.deinit();
+    var client_handler = CheckingClient{};
+    var client = try Client(CheckingClient).init(testing.allocator, &client_handler, .{ .port = 29417, .skip_cert_verify = true });
+    defer client.deinit();
+
+    try testing.expectEqual(df_on, try dfOption(v4.sockfd, .ip));
+    try testing.expectEqual(df_on, try dfOption(client.sockfd, .ip));
+    try testing.expectEqual(df_on, try dfOption(dual.sockfd, .ipv6));
+    // A dual-stack socket's IPv4 peers take the IPv4 option, where it can be set.
+    if (builtin.target.os.tag == .linux) try testing.expectEqual(df_on, try dfOption(dual.sockfd, .ip));
+}
+
+const df_on: c_int = if (builtin.target.os.tag == .linux) std.os.linux.IP.PMTUDISC_PROBE else 1;
+
+/// The option `ecn_socket.setDontFragment` sets for `family`, as `fd` has it.
+fn dfOption(fd: posix.socket_t, family: enum { ip, ipv6 }) !c_int {
+    const linux = std.os.linux;
+    const level: i32, const name: u32 = switch (builtin.target.os.tag) {
+        .linux => if (family == .ip) .{ posix.IPPROTO.IP, linux.IP.MTU_DISCOVER } else .{ posix.IPPROTO.IPV6, linux.IPV6.MTU_DISCOVER },
+        else => if (family == .ip) .{ posix.IPPROTO.IP, posix.IP.DONTFRAG } else .{ posix.IPPROTO.IPV6, posix.IPV6.DONTFRAG },
+    };
+    var v: c_int = 0;
+    var len: posix.socklen_t = @sizeOf(c_int);
+    try testing.expectEqual(@as(c_int, 0), std.c.getsockopt(fd, level, name, @ptrCast(&v), &len));
+    return v;
+}
+
+fn getRcvBuf(fd: posix.socket_t) !c_int {
+    var v: c_int = 0;
+    var len: posix.socklen_t = @sizeOf(c_int);
+    try testing.expectEqual(@as(c_int, 0), std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, @ptrCast(&v), &len));
+    return v;
+}
+
+/// Answers every GET with a short body.
+const HelloServer = struct {
+    pub const protocol: Protocol = .h3;
+
+    pub fn onRequest(_: *@This(), session: *Session, stream_id: u64, _: []const qpack.Header) void {
+        session.sendResponse(stream_id, &.{.{ .name = ":status", .value = "200" }}, "hello") catch unreachable;
+    }
+};
+
+/// Keeps the request's path past `onRequest`, which the contract forbids.
+const PathKeepingServer = struct {
+    pub const protocol: Protocol = .h3;
+    path: ?[]const u8 = null,
+
+    pub fn onRequest(self: *@This(), session: *Session, stream_id: u64, headers: []const qpack.Header) void {
+        for (headers) |h| {
+            if (std.mem.eql(u8, h.name, ":path")) self.path = h.value;
+        }
+        session.sendResponse(stream_id, &.{.{ .name = ":status", .value = "200" }}, "hello") catch unreachable;
+    }
+};
+
+test "e2e: a header slice kept past its callback reads as poison, not another client's headers" {
+    // Every connection on a loop decodes into one scratch buffer, so a slice
+    // kept from onRequest showed whichever client was decoded next.
+    if (!std.debug.runtime_safety) return error.SkipZigTest;
+    var server_handler = PathKeepingServer{};
+    // Not "/", which the static table would answer from constant memory.
+    const request = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = ":path", .value = "/kept" },
+    };
+    var client_handler = CheckingClient{ .request = &request };
+    var e2e: E2e(PathKeepingServer, CheckingClient) = undefined;
+    try e2e.initWith(29464, &server_handler, &client_handler, null, null);
+    defer e2e.deinit();
+    try runUntil(&e2e.loop, &client_handler, CheckingClient.done, 10_000);
+    try testing.expect(std.mem.allEqual(u8, server_handler.path.?, 0xaa));
+}
+
+fn allFinished(clients: []CheckingClient) bool {
+    for (clients) |*c| if (!c.finished) return false;
+    return true;
+}
+
+test "e2e: one client on a shared loop stops and goes while the others carry on" {
+    const C = Client(CheckingClient);
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var server_handler = HelloServer{};
+    var server = try Server(HelloServer).init(testing.allocator, &server_handler, .{
+        .port = 29417,
+        .tls_config = makeTestTlsConfig(),
+        .loop = &loop,
+    });
+    defer server.deinit();
+    server.start();
+
+    var handlers = [_]CheckingClient{ .{}, .{}, .{} };
+    var clients: [3]C = undefined;
+    for (&clients, &handlers, 0..) |*c, *h, i| {
+        c.* = try C.init(testing.allocator, h, .{ .port = 29417, .skip_cert_verify = true, .loop = &loop });
+        errdefer for (clients[0..i]) |*prev| prev.deinit();
+        c.start();
+    }
+    var live: []C = &clients;
+    defer for (live) |*c| c.deinit();
+
+    const all: []CheckingClient = &handlers;
+    try runUntil(&loop, all, allFinished, 10_000);
+
+    // The first client leaves; the loop keeps running for everyone else.
+    clients[0].stop();
+    try runUntil(&loop, &clients[0], C.isStopped, 5000);
+    clients[0].deinit();
+    live = clients[1..];
+    try testing.expect(!loop.stopped());
+
+    // A second request from each survivor, written outside any callback:
+    // the client's own wakeup has to get it onto the wire.
+    for (live, handlers[1..]) |*c, *h| {
+        h.finished = false;
+        h.received = 0;
+        var cs = c.clientSession();
+        h.stream_id = try cs.sendRequest(&get_request, null);
+    }
+    try runUntil(&loop, all[1..], allFinished, 10_000);
+    for (handlers[1..]) |*h| try testing.expectEqualStrings("hello", h.body[0..h.received]);
+
+    for (live) |*c| c.stop();
+    server.stop();
+    const Everything = struct {
+        server: *Server(HelloServer),
+        clients: []C,
+        fn stopped(self: *const @This()) bool {
+            if (!self.server.isStopped()) return false;
+            for (self.clients) |*c| if (!c.isStopped()) return false;
+            return true;
+        }
+    };
+    try runUntil(&loop, &Everything{ .server = &server, .clients = live }, Everything.stopped, 5000);
+}
+
+const DRIP_CHUNK: usize = 1000;
+const DRIP_CHUNKS: usize = 40;
+const DRIP_INTERVAL_MS: u64 = 20;
+
+/// Serves the first request slowly — one chunk per timer tick, from outside
+/// any server callback — so a drain begins with it still in flight.
+const DrippingServer = struct {
+    pub const protocol: Protocol = .h3;
+
+    loop: *xev.Loop,
+    timer: xev.Timer = .{},
+    timer_c: xev.Completion = .{},
+    session: ?Session = null,
+    stream_id: u64 = 0,
+    sent: usize = 0,
+    requests: u32 = 0,
+
+    pub fn onRequest(self: *@This(), session: *Session, stream_id: u64, _: []const qpack.Header) void {
+        self.requests += 1;
+        if (self.session != null) return;
+        session.sendResponseHeaders(stream_id, &.{.{ .name = ":status", .value = "200" }}) catch unreachable;
+        self.session = session.*;
+        self.stream_id = stream_id;
+        self.timer.run(self.loop, &self.timer_c, DRIP_INTERVAL_MS, @This(), self, onTick);
+    }
+
+    pub fn onConnectionClosed(self: *@This(), _: *Session) void {
+        self.session = null;
+    }
+
+    fn onTick(self_opt: ?*@This(), loop: *xev.Loop, c: *xev.Completion, r: xev.Timer.RunError!void) xev.CallbackAction {
+        const self = self_opt.?;
+        _ = r catch return .disarm;
+        const s = &(self.session orelse return .disarm);
+        var chunk: [DRIP_CHUNK]u8 = undefined;
+        for (&chunk, self.sent..) |*b, off| b.* = e2eBodyByte(off);
+        s.sendResponseData(self.stream_id, &chunk) catch return .disarm;
+        self.sent += chunk.len;
+        if (self.sent == DRIP_CHUNK * DRIP_CHUNKS) {
+            s.finishResponse(self.stream_id, null) catch {};
+            return .disarm;
+        }
+        self.timer.run(loop, c, DRIP_INTERVAL_MS, @This(), self, onTick);
+        return .disarm;
+    }
+
+    fn inFlight(self: *@This()) bool {
+        return self.sent > 0;
+    }
+};
+
+/// Reads the dripped response and, on the final GOAWAY, tries a second
+/// request twice: once as a client that honours GOAWAY, once as one that
+/// does not.
+const DrainedClient = struct {
+    pub const protocol: Protocol = .h3;
+
+    stream_id: ?u64 = null,
+    received: usize = 0,
+    mismatches: usize = 0,
+    finished: bool = false,
+    goaway_id: ?u64 = null,
+    refused_locally: bool = false,
+    late_stream: ?u64 = null,
+    late_reset_code: ?u64 = null,
+
+    pub fn onConnected(self: *@This(), session: *ClientSession) void {
+        self.stream_id = session.sendRequest(&get_request, null) catch null;
+    }
+
+    pub fn onHeaders(_: *@This(), _: *ClientSession, _: u64, _: []const qpack.Header) void {}
+
+    pub fn onData(self: *@This(), session: *ClientSession, _: u64, _: usize) void {
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n = session.recvBody(&buf);
+            if (n == 0) break;
+            for (buf[0..n], self.received..) |b, off| {
+                if (b != e2eBodyByte(off)) self.mismatches += 1;
+            }
+            self.received += n;
+        }
+    }
+
+    pub fn onFinished(self: *@This(), _: *ClientSession, stream_id: u64) void {
+        if (stream_id == self.stream_id) self.finished = true;
+    }
+
+    pub fn onGoaway(self: *@This(), session: *ClientSession, id: u64) void {
+        if (id > 1 << 40) return; // the first GOAWAY names no limit
+        self.goaway_id = id;
+        if (session.sendRequest(&get_request, null)) |_| {} else |_| self.refused_locally = true;
+        session.h3_conn.?.peer_goaway_id = null;
+        self.late_stream = session.sendRequest(&get_request, null) catch null;
+    }
+
+    pub fn onRequestCancelled(self: *@This(), _: *ClientSession, stream_id: u64, error_code: u64) void {
+        if (stream_id == self.late_stream) self.late_reset_code = error_code;
+    }
+};
+
+const DrainE2e = E2e(DrippingServer, DrainedClient);
+
+fn drainSettled(e2e: *DrainE2e) bool {
+    return e2e.client.handler.finished and e2e.client.handler.late_reset_code != null and e2e.server.isDrained();
+}
+
+test "e2e: drain() lets an in-flight response finish and turns new requests away" {
+    var client_handler = DrainedClient{};
+    var server_handler = DrippingServer{ .loop = undefined };
+    var e2e: DrainE2e = undefined;
+    try e2e.init(29420, &server_handler, &client_handler);
+    server_handler.loop = &e2e.loop;
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &server_handler, DrippingServer.inFlight, 10_000);
+    e2e.server.drain(.{});
+    try testing.expect(!e2e.server.isDrained());
+
+    try runUntil(&e2e.loop, &e2e, drainSettled, 10_000);
+    // The response survived the drain, whole.
+    try testing.expectEqual(DRIP_CHUNK * DRIP_CHUNKS, client_handler.received);
+    try testing.expectEqual(@as(usize, 0), client_handler.mismatches);
+    // The final GOAWAY names the first request not served: the next one.
+    try testing.expectEqual(@as(?u64, 4), client_handler.goaway_id);
+    try testing.expect(client_handler.refused_locally);
+    try testing.expectEqual(@as(?u64, @backingInt(H3Error.request_rejected)), client_handler.late_reset_code);
+    try testing.expectEqual(@as(u32, 1), server_handler.requests);
+}
+
+const PAUSE_WINDOW: u64 = 256 * 1024;
+const PAUSE_BODY: usize = 4 * 1024 * 1024;
+
+/// Pauses every request body on arrival; the test resumes it.
+const PausingServer = struct {
+    pub const protocol: Protocol = .h3;
+
+    session: ?Session = null,
+    stream_id: u64 = 0,
+    body_bytes: usize = 0,
+    body_ok: bool = true,
+    ended: u32 = 0,
+    bytes_at_end: usize = 0,
+    reply: [32]u8 = undefined,
+
+    pub fn onRequest(self: *@This(), session: *Session, stream_id: u64, _: []const qpack.Header) void {
+        session.pauseRequestBody(stream_id) catch unreachable;
+        self.session = session.*;
+        self.stream_id = stream_id;
+    }
+
+    pub fn onData(self: *@This(), _: *Session, _: u64, data: []const u8) void {
+        for (data, self.body_bytes..) |b, off| {
+            if (b != e2eBodyByte(off)) self.body_ok = false;
+        }
+        self.body_bytes += data.len;
+    }
+
+    pub fn onRequestEnd(self: *@This(), session: *Session, stream_id: u64) void {
+        self.ended += 1;
+        self.bytes_at_end = self.body_bytes;
+        const text = std.fmt.bufPrint(&self.reply, "{d}", .{self.body_bytes}) catch unreachable;
+        session.sendResponse(stream_id, &.{.{ .name = ":status", .value = "200" }}, text) catch unreachable;
+    }
+
+    pub fn onConnectionClosed(self: *@This(), _: *Session) void {
+        self.session = null;
+    }
+
+    fn hasRequest(self: *@This()) bool {
+        return self.session != null;
+    }
+
+    /// Request bytes held server-side: unread in QUIC plus buffered in H3.
+    fn buffered(self: *@This()) usize {
+        const s = self.session orelse return 0;
+        var total: usize = 0;
+        if (s.entry.conn.streams.getStream(self.stream_id)) |st| {
+            for (st.recv.sorter.chunks.items) |c| total += c.data.len;
+        }
+        if (s.entry.h3_conn) |h| {
+            if (h.stream_bufs.get(self.stream_id)) |b| total += b.items.len;
+        }
+        return total;
+    }
+};
+
+const PauseWatch = struct {
+    server: *PausingServer,
+    until: i64,
+    max_buffered: usize = 0,
+
+    fn sample(self: *@This()) bool {
+        self.max_buffered = @max(self.max_buffered, self.server.buffered());
+        return sys.nanoTimestamp() > self.until;
+    }
+};
+
+test "e2e: a paused request body is held back by flow control, then delivered whole" {
+    const body = try testing.allocator.alloc(u8, PAUSE_BODY);
+    defer testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = e2eBodyByte(i);
+
+    var client_handler = CheckingClient{
+        .request = &.{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = "localhost" },
+            .{ .name = ":path", .value = "/upload" },
+        },
+        .request_body = body,
+    };
+    var server_handler = PausingServer{};
+    var e2e: E2e(PausingServer, CheckingClient) = undefined;
+    try e2e.initWith(29421, &server_handler, &client_handler, .{
+        .initial_max_stream_data_bidi_remote = PAUSE_WINDOW,
+    }, null);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &server_handler, PausingServer.hasRequest, 10_000);
+    // Long enough for an unpaused upload of this size to finish many times.
+    var watch = PauseWatch{ .server = &server_handler, .until = sys.nanoTimestamp() + 500 * std.time.ns_per_ms };
+    try runUntil(&e2e.loop, &watch, PauseWatch.sample, 5_000);
+
+    try testing.expectEqual(@as(usize, 0), server_handler.body_bytes);
+    try testing.expect(watch.max_buffered > 0);
+    try testing.expect(watch.max_buffered <= PAUSE_WINDOW + 4096);
+    const st = server_handler.session.?.entry.conn.streams.getStream(server_handler.stream_id).?;
+    try testing.expect(st.recv.sorter.highestReceived() <= PAUSE_WINDOW);
+
+    // Resumed from outside any server callback, as a proxy would once its
+    // upstream drains.
+    server_handler.session.?.resumeRequestBody(server_handler.stream_id);
+    try runUntil(&e2e.loop, &client_handler, CheckingClient.done, 20_000);
+
+    try testing.expectEqual(@as(u32, 1), server_handler.ended);
+    try testing.expectEqual(PAUSE_BODY, server_handler.bytes_at_end);
+    try testing.expect(server_handler.body_ok);
+    try testing.expectEqualStrings("4194304", client_handler.body[0..client_handler.received]);
+}
+
+const UNI_BODY: usize = 3 * 1024 * 1024;
+
+/// Counts what arrives on the peer's uni streams.
+const UniSink = struct {
+    pub const protocol: Protocol = .quic;
+
+    bytes: usize = 0,
+    ok: bool = true,
+    fin: bool = false,
+
+    pub fn onStreamData(self: *@This(), _: *Session, stream_id: u64, data: []const u8, fin: bool) void {
+        if (stream_mod.isBidi(stream_id)) return;
+        for (data, self.bytes..) |b, off| {
+            if (b != e2eBodyByte(off)) self.ok = false;
+        }
+        self.bytes += data.len;
+        if (fin) self.fin = true;
+    }
+
+    fn done(self: *@This()) bool {
+        return self.fin;
+    }
+};
+
+/// Sends `UNI_BODY` bytes on one uni stream as soon as it connects.
+const UniSender = struct {
+    pub const protocol: Protocol = .quic;
+
+    body: []const u8,
+
+    pub fn onConnected(self: *@This(), session: *ClientSession) void {
+        const id = session.openQuicUniStream() catch unreachable;
+        session.writeStream(id, self.body) catch unreachable;
+        session.closeQuicStream(id);
+    }
+
+    pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+};
+
+test "e2e: a peer uni stream carries well past its 1 MiB initial window" {
+    const body = try testing.allocator.alloc(u8, UNI_BODY);
+    defer testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = e2eBodyByte(i);
+
+    var client_handler = UniSender{ .body = body };
+    var server_handler = UniSink{};
+    var e2e: E2e(UniSink, UniSender) = undefined;
+    try e2e.init(29422, &server_handler, &client_handler);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &server_handler, UniSink.done, 20_000);
+    try testing.expectEqual(UNI_BODY, server_handler.bytes);
+    try testing.expect(server_handler.ok);
+}
+
+/// Holds the first request's response open, then finishes it from another
+/// connection's onConnectionClosed.
+const CrossWriter = struct {
+    pub const protocol: Protocol = .h3;
+
+    held: ?Session = null,
+    held_stream: u64 = 0,
+
+    pub fn onRequest(self: *@This(), session: *Session, stream_id: u64, _: []const qpack.Header) void {
+        if (self.held == null) {
+            session.sendResponseHeaders(stream_id, &.{.{ .name = ":status", .value = "200" }}) catch unreachable;
+            self.held = session.*;
+            self.held_stream = stream_id;
+        } else {
+            session.sendResponse(stream_id, &.{.{ .name = ":status", .value = "200" }}, "hello") catch unreachable;
+        }
+    }
+
+    pub fn onConnectionClosed(self: *@This(), session: *Session) void {
+        const h = &(self.held orelse return);
+        if (h.entry == session.entry) {
+            self.held = null;
+            return;
+        }
+        h.sendResponseData(self.held_stream, "bye") catch unreachable;
+        h.finishResponse(self.held_stream, null) catch unreachable;
+    }
+};
+
+fn statusSeen(c: *CheckingClient) bool {
+    return c.status[0] != 0;
+}
+
+fn finishedOne(c: *CheckingClient) bool {
+    return c.finished;
+}
+
+test "e2e: a write from one connection's onConnectionClosed to another goes out at once" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    const S = Server(CrossWriter);
+    const C = Client(CheckingClient);
+    var sh = CrossWriter{};
+    var server = try S.init(testing.allocator, &sh, .{ .port = 29423, .tls_config = makeTestTlsConfig(), .loop = &loop });
+    server.start();
+
+    var ha = CheckingClient{};
+    var a = try C.init(testing.allocator, &ha, .{ .port = 29423, .skip_cert_verify = true, .loop = &loop });
+    a.start();
+    try runUntil(&loop, &ha, statusSeen, 5000);
+
+    var hb = CheckingClient{};
+    var b = try C.init(testing.allocator, &hb, .{ .port = 29423, .skip_cert_verify = true, .loop = &loop });
+    b.start();
+    try runUntil(&loop, &hb, finishedOne, 5000);
+    b.stop();
+    try runUntil(&loop, &b, C.isStopped, 5000);
+    b.deinit();
+
+    const OneLeft = struct {
+        fn done(x: *S) bool {
+            return x.conn_mgr.entries.items.len == 1;
+        }
+    };
+    try runUntil(&loop, &server, OneLeft.done, 5000);
+    // Without a wakeup this waits for A's next packet: the idle timeout.
+    try runUntil(&loop, &ha, finishedOne, 150);
+    try testing.expectEqualStrings("bye", ha.body[0..ha.received]);
+
+    a.stop();
+    server.stop();
+    const Both = struct {
+        s: *S,
+        c: *C,
+        fn done(x: *const @This()) bool {
+            return x.s.isStopped() and x.c.isStopped();
+        }
+    };
+    try runUntil(&loop, &Both{ .s = &server, .c = &a }, Both.done, 5000);
+    a.deinit();
+    server.deinit();
+}
+
+const FANOUT_STREAMS: u32 = 12;
+
+/// Opens streams of its own from onStreamData, growing the stream map the
+/// raw-QUIC poll is walking.
+const FanoutServer = struct {
+    pub const protocol: Protocol = .quic;
+
+    fins: u32 = 0,
+    opened: u32 = 0,
+
+    pub fn onStreamData(self: *@This(), session: *Session, _: u64, _: []const u8, fin: bool) void {
+        for (0..4) |_| {
+            const id = session.openStream() catch break;
+            session.closeQuicStream(id);
+            self.opened += 1;
+        }
+        if (fin) self.fins += 1;
+    }
+
+    fn done(self: *@This()) bool {
+        return self.fins == FANOUT_STREAMS;
+    }
+};
+
+/// Sends a byte and a FIN on each of `FANOUT_STREAMS` bidi streams.
+const FanoutClient = struct {
+    pub const protocol: Protocol = .quic;
+
+    pub fn onConnected(_: *@This(), session: *ClientSession) void {
+        for (0..FANOUT_STREAMS) |_| {
+            const id = session.openStream() catch unreachable;
+            session.writeStream(id, "x") catch unreachable;
+            session.closeQuicStream(id);
+        }
+    }
+
+    pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+};
+
+test "e2e: a raw-QUIC handler may open streams from onStreamData" {
+    var client_handler = FanoutClient{};
+    var server_handler = FanoutServer{};
+    var e2e: E2e(FanoutServer, FanoutClient) = undefined;
+    try e2e.init(29424, &server_handler, &client_handler);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &server_handler, FanoutServer.done, 10_000);
+    try testing.expect(server_handler.opened > 0);
+}
+
+/// Writes `PAUSE_BODY` patterned bytes and a FIN on one WebTransport
+/// stream, as fast as the peer's credit allows. Works for either side.
+const WtPump = struct {
+    session_id: u64 = 0,
+    stream_id: ?u64 = null,
+    sent: usize = 0,
+    closed: bool = false,
+
+    /// False until the peer's stream credit allows it; retry later.
+    fn open(self: *WtPump, s: anytype, session_id: u64) bool {
+        self.session_id = session_id;
+        self.stream_id = s.openBidiStream(session_id, null) catch return false;
+        self.pump(s);
+        return true;
+    }
+
+    fn pump(self: *WtPump, s: anytype) void {
+        const sid = self.stream_id orelse return;
+        var chunk: [E2E_CHUNK]u8 = undefined;
+        while (self.sent < PAUSE_BODY) {
+            const n = @min(E2E_CHUNK, PAUSE_BODY - self.sent);
+            const cap = s.streamSendCapacity(sid) orelse return;
+            if (cap < n) {
+                s.notifyWritable(self.session_id, sid, n) catch unreachable;
+                return;
+            }
+            for (chunk[0..n], self.sent..) |*b, off| b.* = e2eBodyByte(off);
+            s.sendStreamData(sid, chunk[0..n]) catch unreachable;
+            self.sent += n;
+        }
+        if (!self.closed) {
+            self.closed = true;
+            s.closeStream(sid);
+        }
+    }
+};
+
+/// Receiving end of a `WtPump` stream: pauses it on arrival and checks
+/// what comes through once resumed.
+const WtSink = struct {
+    stream_id: ?u64 = null,
+    bytes: usize = 0,
+    ok: bool = true,
+    fin: bool = false,
+
+    fn opened(self: *WtSink, s: anytype, stream_id: u64) void {
+        s.pauseStream(stream_id) catch unreachable;
+        self.stream_id = stream_id;
+    }
+
+    fn data(self: *WtSink, stream_id: u64, bytes: []const u8, fin: bool) void {
+        if (self.stream_id != stream_id) return;
+        for (bytes, self.bytes..) |b, off| {
+            if (b != e2eBodyByte(off)) self.ok = false;
+        }
+        self.bytes += bytes.len;
+        if (fin) self.fin = true;
+    }
+
+    fn done(self: *WtSink) bool {
+        return self.fin;
+    }
+};
+
+const WtUploadClient = struct {
+    pub const protocol: Protocol = .webtransport;
+    up: WtPump = .{},
+
+    pub fn onSessionReady(self: *@This(), session: *ClientSession, session_id: u64) void {
+        if (!self.up.open(session, session_id)) unreachable;
+    }
+    pub fn onWritable(self: *@This(), session: *ClientSession, _: u64, _: ?u64) void {
+        self.up.pump(session);
+    }
+    pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+};
+
+const WtPausingServer = struct {
+    pub const protocol: Protocol = .webtransport;
+    sink: WtSink = .{},
+    session: ?Session = null,
+
+    pub fn onConnectRequest(_: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch unreachable;
+    }
+    pub fn onBidiStream(self: *@This(), session: *Session, _: u64, stream_id: u64) void {
+        self.sink.opened(session, stream_id);
+        self.session = session.*;
+    }
+    pub fn onStreamData(self: *@This(), _: *Session, stream_id: u64, data: []const u8, fin: bool) void {
+        self.sink.data(stream_id, data, fin);
+    }
+    pub fn onConnectionClosed(self: *@This(), _: *Session) void {
+        self.session = null;
+    }
+};
+
+const WtDownloadServer = struct {
+    pub const protocol: Protocol = .webtransport;
+    up: WtPump = .{},
+    accepted: ?u64 = null,
+
+    pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch unreachable;
+        self.accepted = session_id;
+    }
+    pub fn onPollComplete(self: *@This(), session: *Session) void {
+        const id = self.accepted orelse return;
+        if (self.up.open(session, id)) self.accepted = null;
+    }
+    pub fn onWritable(self: *@This(), session: *Session, _: u64, _: ?u64) void {
+        self.up.pump(session);
+    }
+    pub fn onStreamData(_: *@This(), _: *Session, _: u64, _: []const u8, _: bool) void {}
+};
+
+const WtPausingClient = struct {
+    pub const protocol: Protocol = .webtransport;
+    sink: WtSink = .{},
+
+    pub fn onSessionReady(_: *@This(), _: *ClientSession, _: u64) void {}
+    pub fn onBidiStream(self: *@This(), session: *ClientSession, _: u64, stream_id: u64) void {
+        self.sink.opened(session, stream_id);
+    }
+    pub fn onStreamData(self: *@This(), _: *ClientSession, stream_id: u64, data: []const u8, fin: bool) void {
+        self.sink.data(stream_id, data, fin);
+    }
+};
+
+/// Runs the loop for `ms` while nothing may arrive on a paused stream.
+fn holdPaused(loop: *xev.Loop, sink: *WtSink, conn: *connection.Connection, ms: i64) !void {
+    const Watch = struct {
+        sink: *WtSink,
+        until: i64,
+        fn over(self: *@This()) bool {
+            return self.sink.bytes > 0 or sys.nanoTimestamp() > self.until;
+        }
+    };
+    var w = Watch{ .sink = sink, .until = sys.nanoTimestamp() + ms * std.time.ns_per_ms };
+    try runUntil(loop, &w, Watch.over, ms + 5_000);
+    try testing.expectEqual(@as(usize, 0), sink.bytes);
+    // One window, plus the first read that identified the stream as
+    // WebTransport — taken before the handler could pause it.
+    const st = conn.streams.getStream(sink.stream_id.?).?;
+    try testing.expect(st.recv.sorter.highestReceived() > 0);
+    try testing.expect(st.recv.sorter.highestReceived() <= 2 * PAUSE_WINDOW);
+}
+
+test "e2e: a paused WebTransport stream holds its sender back, then delivers whole" {
+    var client_handler = WtUploadClient{};
+    var server_handler = WtPausingServer{};
+    var e2e: E2e(WtPausingServer, WtUploadClient) = undefined;
+    try e2e.initWith(29433, &server_handler, &client_handler, .{
+        .initial_max_stream_data_bidi_remote = PAUSE_WINDOW,
+    }, null);
+    defer e2e.deinit();
+
+    const Opened = struct {
+        fn f(h: *WtPausingServer) bool {
+            return h.sink.stream_id != null;
+        }
+    };
+    try runUntil(&e2e.loop, &server_handler, Opened.f, 10_000);
+    try holdPaused(&e2e.loop, &server_handler.sink, server_handler.session.?.entry.conn, 500);
+    try testing.expect(client_handler.up.sent < PAUSE_BODY);
+
+    // From outside any callback, as a relay would once its other side drains.
+    server_handler.session.?.resumeStream(server_handler.sink.stream_id.?);
+    try runUntil(&e2e.loop, &server_handler.sink, WtSink.done, 20_000);
+    try testing.expectEqual(PAUSE_BODY, server_handler.sink.bytes);
+    try testing.expect(server_handler.sink.ok);
+}
+
+test "e2e: a WebTransport client pauses a server stream the same way" {
+    var client_handler = WtPausingClient{};
+    var server_handler = WtDownloadServer{};
+    var e2e: E2e(WtDownloadServer, WtPausingClient) = undefined;
+    try e2e.initWith(29434, &server_handler, &client_handler, null, .{
+        .initial_max_stream_data_bidi_remote = PAUSE_WINDOW,
+        .max_datagram_frame_size = 65536, // WebTransport needs DATAGRAM
+    });
+    defer e2e.deinit();
+
+    const Opened = struct {
+        fn f(h: *WtPausingClient) bool {
+            return h.sink.stream_id != null;
+        }
+    };
+    try runUntil(&e2e.loop, &client_handler, Opened.f, 10_000);
+    try holdPaused(&e2e.loop, &client_handler.sink, e2e.client.conn, 500);
+    try testing.expect(server_handler.up.sent < PAUSE_BODY);
+
+    var cs = e2e.client.clientSession();
+    cs.resumeStream(client_handler.sink.stream_id.?);
+    try runUntil(&e2e.loop, &client_handler.sink, WtSink.done, 20_000);
+    try testing.expectEqual(PAUSE_BODY, client_handler.sink.bytes);
+    try testing.expect(client_handler.sink.ok);
+}
+
+/// Runs `loop` for `ms`, so that what is in flight lands.
+fn runFor(loop: *xev.Loop, ms: i64) !void {
+    const until = sys.nanoTimestamp() + ms * std.time.ns_per_ms;
+    while (sys.nanoTimestamp() < until) {
+        try loop.run(.no_wait);
+        sys.sleepNs(50 * std.time.ns_per_us);
+    }
+}
+
+/// Runs `loop` until the counter at `p` reaches `want`.
+fn runUntilCount(loop: *xev.Loop, p: anytype, want: @TypeOf(p.*), timeout_ms: i64) !void {
+    const Reached = struct {
+        p: @TypeOf(p),
+        want: @TypeOf(p.*),
+        fn done(self: *const @This()) bool {
+            return self.p.* >= self.want;
+        }
+    };
+    try runUntil(loop, &Reached{ .p = p, .want = want }, Reached.done, timeout_ms);
+}
+
+/// Keeps its one session and the stream its client opens, for a test to
+/// write to from outside any callback, as a game server's tick does.
+const WtTicker = struct {
+    pub const protocol: Protocol = .webtransport;
+    session: ?Session = null,
+    session_id: u64 = 0,
+    stream_id: ?u64 = null,
+
+    pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch unreachable;
+        self.session = session.*;
+        self.session_id = session_id;
+    }
+    pub fn onBidiStream(self: *@This(), _: *Session, _: u64, stream_id: u64) void {
+        self.stream_id = stream_id;
+    }
+    pub fn onStreamData(_: *@This(), _: *Session, _: u64, _: []const u8, _: bool) void {}
+    pub fn onDatagram(_: *@This(), _: *Session, _: u64, _: []const u8) void {}
+    pub fn onConnectionClosed(self: *@This(), _: *Session) void {
+        self.session = null;
+    }
+
+    fn hasStream(self: *@This()) bool {
+        return self.stream_id != null;
+    }
+};
+
+/// Opens one stream for the server to answer on, and counts what comes back.
+const WtTickClient = struct {
+    pub const protocol: Protocol = .webtransport;
+    datagrams: u32 = 0,
+    stream_bytes: usize = 0,
+
+    pub fn onSessionReady(_: *@This(), session: *ClientSession, session_id: u64) void {
+        const id = session.openBidiStream(session_id, null) catch unreachable;
+        session.sendStreamData(id, "hi") catch unreachable;
+    }
+    pub fn onDatagram(self: *@This(), _: *ClientSession, _: u64, _: []const u8) void {
+        self.datagrams += 1;
+    }
+    pub fn onStreamData(self: *@This(), _: *ClientSession, _: u64, data: []const u8, _: bool) void {
+        self.stream_bytes += data.len;
+    }
+};
+
+test "e2e: writes alone do not poll a WebTransport connection for events" {
+    var client_handler = WtTickClient{};
+    var server_handler = WtTicker{};
+    var e2e: E2e(WtTicker, WtTickClient) = undefined;
+    try e2e.init(29500, &server_handler, &client_handler);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &server_handler, WtTicker.hasStream, 10_000);
+    try runFor(&e2e.loop, 200); // the handshake's tail settles
+    const polls = e2e.server.polls;
+
+    // Each tick's writes go out on a pass of their own; only ACKs come back.
+    const ticks = 20;
+    const state = "state";
+    var s = server_handler.session.?;
+    for (0..ticks) |_| {
+        try s.sendDatagram(server_handler.session_id, "tick");
+        try s.sendStreamData(server_handler.stream_id.?, state);
+        try e2e.loop.run(.no_wait);
+    }
+    try runUntilCount(&e2e.loop, &client_handler.stream_bytes, ticks * state.len, 5000);
+    try runFor(&e2e.loop, 100); // and their ACKs land
+    try testing.expect(client_handler.datagrams > 0);
+    try testing.expectEqual(polls, e2e.server.polls);
+}
+
+/// Ticks every 10 ms from `onPass` once `due_ns` is set, writing a datagram
+/// to its one session each time, and keeps how late each tick ran.
+const WtPassTicker = struct {
+    pub const protocol: Protocol = .webtransport;
+    const period_ns = 10 * std.time.ns_per_ms;
+    session: ?Session = null,
+    session_id: u64 = 0,
+    due_ns: ?i64 = null,
+    late_ns: [32]i64 = undefined,
+    ticks: u32 = 0,
+
+    pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch unreachable;
+        self.session = session.*;
+        self.session_id = session_id;
+    }
+    pub fn onStreamData(_: *@This(), _: *Session, _: u64, _: []const u8, _: bool) void {}
+    pub fn onDatagram(_: *@This(), _: *Session, _: u64, _: []const u8) void {}
+    pub fn onConnectionClosed(self: *@This(), _: *Session) void {
+        self.session = null;
+    }
+    pub fn onPass(self: *@This(), now_ns: i64) ?i64 {
+        const due = self.due_ns orelse return null;
+        if (now_ns < due or self.ticks == self.late_ns.len) return due;
+        self.late_ns[self.ticks] = now_ns - due;
+        self.ticks += 1;
+        self.due_ns = due + period_ns;
+        if (self.session) |*s| s.sendDatagram(self.session_id, "tick") catch {};
+        return self.due_ns;
+    }
+
+    fn ready(self: *@This()) bool {
+        return self.session != null;
+    }
+};
+
+test "e2e: onPass runs on its deadline, and what it writes leaves in that pass" {
+    var client_handler = WtTickClient{};
+    var server_handler = WtPassTicker{};
+    var e2e: E2e(WtPassTicker, WtTickClient) = undefined;
+    try e2e.init(29503, &server_handler, &client_handler);
+    defer e2e.deinit();
+    try runUntil(&e2e.loop, &server_handler, WtPassTicker.ready, 10_000);
+    try runFor(&e2e.loop, 200);
+
+    // Started from outside any callback, so the loop learns of it by wakeAt.
+    const start = sys.nanoTimestamp() + WtPassTicker.period_ns;
+    server_handler.due_ns = start;
+    e2e.server.wakeAt(start);
+    const ticks = 20;
+    const entry = server_handler.session.?.entry;
+    while (server_handler.ticks < ticks) {
+        if (sys.nanoTimestamp() > start + 5 * std.time.ns_per_s) return error.Timeout;
+        const before = server_handler.ticks;
+        try e2e.loop.run(.no_wait);
+        // Sent by the tick's own pass, not left for a wake pass.
+        if (server_handler.ticks != before) try testing.expect(!entry.needs_visit);
+        sys.sleepNs(50 * std.time.ns_per_us);
+    }
+    // Only the deadline brings these passes: the client sends nothing but ACKs.
+    try testing.expect(sys.nanoTimestamp() - start < (ticks - 1) * WtPassTicker.period_ns + 100 * std.time.ns_per_ms);
+    const late = server_handler.late_ns[0..ticks];
+    std.mem.sort(i64, late, {}, std.sort.asc(i64));
+    try testing.expect(late[ticks / 2] < 3 * std.time.ns_per_ms);
+    try runUntilCount(&e2e.loop, &client_handler.datagrams, ticks, 5000);
+}
+
+/// Once `armed`, asks for a pass `delay_ns` after the first one that sees it,
+/// and counts the passes before that.
+const PassAfter = struct {
+    pub const protocol: Protocol = .h3;
+    const delay_ns = 5 * std.time.ns_per_ms;
+    armed: bool = false,
+    calls: u32 = 0,
+    target_ns: ?i64 = null,
+    early: u32 = 0,
+    reached_ns: ?i64 = null,
+
+    pub fn onPass(self: *@This(), now_ns: i64) ?i64 {
+        self.calls += 1;
+        if (!self.armed or self.reached_ns != null) return null;
+        const target = self.target_ns orelse blk: {
+            self.target_ns = now_ns + delay_ns;
+            break :blk self.target_ns.?;
+        };
+        if (now_ns >= target) {
+            self.reached_ns = now_ns;
+            return null;
+        }
+        self.early += 1;
+        return target;
+    }
+
+    fn called(self: *@This()) bool {
+        return self.calls > 0;
+    }
+    fn reached(self: *@This()) bool {
+        return self.reached_ns != null;
+    }
+};
+
+test "e2e: an onPass deadline set after a long wait is not woken for early" {
+    // libxev's epoll loop counted the timer from the time it read before
+    // waiting (until mitchellh/libxev#255), so a deadline set in a socket
+    // callback after a 30 ms wait fired at once.
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var handler = PassAfter{};
+    var server = try Server(PassAfter).init(testing.allocator, &handler, .{
+        .port = 29504,
+        .tls_config = makeTestTlsConfig(),
+        .loop = &loop,
+    });
+    defer server.deinit();
+    server.start();
+    try runUntil(&loop, &handler, PassAfter.called, 5_000);
+
+    const Poke = struct {
+        fn run() void {
+            sys.sleepNs(30 * std.time.ns_per_ms);
+            const fd = sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return;
+            defer sys.close(fd);
+            const to = net.Address.parseIp4("127.0.0.1", 29504) catch unreachable;
+            _ = std.c.sendto(fd, "x", 1, 0, &to.any, to.getOsSockLen());
+        }
+    };
+    handler.armed = true;
+    const poker = try std.Thread.spawn(.{}, Poke.run, .{});
+    try loop.run(.once); // waits for the datagram; its pass sets the deadline
+    poker.join();
+    try testing.expect(handler.target_ns != null);
+    const early = handler.early; // the datagram's own pass
+    try runUntil(&loop, &handler, PassAfter.reached, 5_000);
+    try testing.expectEqual(early, handler.early);
+    try testing.expect(handler.reached_ns.? - handler.target_ns.? < 50 * std.time.ns_per_ms);
+
+    server.stop();
+    try runUntil(&loop, &server, Server(PassAfter).isStopped, 5_000);
+}
+
+test "e2e: wakeAt brings a pass, and a server with nothing due sleeps" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var handler = PassAfter{};
+    var server = try Server(PassAfter).init(testing.allocator, &handler, .{
+        .port = 29505,
+        .tls_config = makeTestTlsConfig(),
+        .loop = &loop,
+    });
+    defer server.deinit();
+    server.start();
+    try runUntil(&loop, &handler, PassAfter.called, 5_000);
+    // Nothing connected and nothing asked for.
+    try testing.expect(!server.timer_armed and !server.wake_armed);
+
+    server.wakeAt(sys.nanoTimestamp() + 2 * std.time.ns_per_ms);
+    try testing.expect(server.timer_armed);
+    try runUntilCount(&loop, &handler.calls, 2, 5_000);
+    // That pass reached it, so nothing is armed again.
+    try testing.expect(!server.timer_armed and !server.wake_armed);
+    try runFor(&loop, 20);
+    try testing.expectEqual(@as(u32, 2), handler.calls);
+
+    server.stop();
+    try runUntil(&loop, &server, Server(PassAfter).isStopped, 5_000);
+}
+
+/// Counts the events that reach it, and answers each datagram with one: what
+/// came with a datagram arrives on a pass that also wrote to its connection.
+const WtEventCounter = struct {
+    pub const protocol: Protocol = .webtransport;
+    datagrams: u32 = 0,
+    data: usize = 0,
+    fins: u32 = 0,
+    resets: u32 = 0,
+    reset_code: u32 = 0,
+    stops: u32 = 0,
+    stop_code: u32 = 0,
+    closed: u32 = 0,
+    close_code: u32 = 0,
+
+    pub fn onConnectRequest(_: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch unreachable;
+    }
+    pub fn onStreamData(self: *@This(), _: *Session, _: u64, data: []const u8, fin: bool) void {
+        self.data += data.len;
+        if (fin) self.fins += 1;
+    }
+    pub fn onStreamReset(self: *@This(), _: *Session, _: u64, _: u64, code: u32) void {
+        self.resets += 1;
+        self.reset_code = code;
+    }
+    pub fn onStopSending(self: *@This(), _: *Session, _: u64, _: u64, code: u32) void {
+        self.stops += 1;
+        self.stop_code = code;
+    }
+    pub fn onSessionClosed(self: *@This(), _: *Session, _: u64, code: u32, _: []const u8) void {
+        self.closed += 1;
+        self.close_code = code;
+    }
+    pub fn onDatagram(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        self.datagrams += 1;
+        session.sendDatagram(session_id, "echo") catch {};
+    }
+};
+
+/// Does nothing of its own: the test drives it through `clientSession()`.
+const WtIdleClient = struct {
+    pub const protocol: Protocol = .webtransport;
+    session_id: ?u64 = null,
+
+    pub fn onSessionReady(self: *@This(), _: *ClientSession, session_id: u64) void {
+        self.session_id = session_id;
+    }
+    pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    pub fn onDatagram(_: *@This(), _: *ClientSession, _: u64, _: []const u8) void {}
+
+    fn ready(self: *@This()) bool {
+        return self.session_id != null;
+    }
+};
+
+test "e2e: WebTransport events arrive alone or on a pass that also wrote to the connection" {
+    for ([_]bool{ false, true }, [_]u16{ 29501, 29502 }) |with_write, port| {
+        var client_handler = WtIdleClient{};
+        var h = WtEventCounter{};
+        var e2e: E2e(WtEventCounter, WtIdleClient) = undefined;
+        try e2e.init(port, &h, &client_handler);
+        defer e2e.deinit();
+
+        try runUntil(&e2e.loop, &client_handler, WtIdleClient.ready, 10_000);
+        try runFor(&e2e.loop, 100);
+        const sid = client_handler.session_id.?;
+        var cs = e2e.client.clientSession();
+        // Each frame goes alone or shares a packet with a datagram.
+        const Next = struct {
+            fn write(c: *ClientSession, session_id: u64, on: bool) !void {
+                if (on) try c.sendDatagram(session_id, "w");
+            }
+        };
+
+        try Next.write(&cs, sid, with_write);
+        const bidi = try cs.openBidiStream(sid, null);
+        try cs.sendStreamData(bidi, "abc");
+        try runUntilCount(&e2e.loop, &h.data, 3, 3000);
+
+        try Next.write(&cs, sid, with_write);
+        cs.closeStream(bidi); // a bare FIN
+        try runUntilCount(&e2e.loop, &h.fins, 1, 3000);
+
+        const uni = try cs.openUniStream(sid, null);
+        try cs.sendStreamData(uni, "u");
+        try runUntilCount(&e2e.loop, &h.data, 4, 3000);
+        try Next.write(&cs, sid, with_write);
+        cs.resetStream(uni, 7); // RESET_STREAM alone: a uni stream has no receive side to stop
+        try runUntilCount(&e2e.loop, &h.resets, 1, 3000);
+        try testing.expectEqual(@as(u32, 7), h.reset_code);
+
+        try Next.write(&cs, sid, with_write);
+        cs.stopSending(bidi, 9);
+        try runUntilCount(&e2e.loop, &h.stops, 1, 3000);
+        try testing.expectEqual(@as(u32, 9), h.stop_code);
+
+        try Next.write(&cs, sid, with_write);
+        try cs.closeSessionWithError(sid, 42, "bye");
+        try runUntilCount(&e2e.loop, &h.closed, 1, 3000);
+        try testing.expectEqual(@as(u32, 42), h.close_code);
+
+        try testing.expectEqual(@as(u32, if (with_write) 5 else 0), h.datagrams);
+    }
+}
+
+/// How a session's close reached one side, through the 6-arity callback.
+const CloseSeen = struct {
+    count: u32 = 0,
+    code: u32 = 0,
+    reason_buf: [32]u8 = undefined,
+    reason_len: usize = 0,
+    abrupt: bool = false,
+
+    fn record(self: *CloseSeen, code: u32, why: []const u8, abrupt: bool) void {
+        self.count += 1;
+        self.code = code;
+        self.reason_len = @min(why.len, self.reason_buf.len);
+        @memcpy(self.reason_buf[0..self.reason_len], why[0..self.reason_len]);
+        self.abrupt = abrupt;
+    }
+
+    fn reason(self: *const CloseSeen) []const u8 {
+        return self.reason_buf[0..self.reason_len];
+    }
+};
+
+/// Keeps its one session, for a test to end it from outside a callback.
+const WtCloseServer = struct {
+    pub const protocol: Protocol = .webtransport;
+    session: ?Session = null,
+    session_id: u64 = 0,
+    seen: CloseSeen = .{},
+    conns_closed: u32 = 0,
+    /// Sessions reported when their connection's own end came.
+    seen_at_conn_close: u32 = 0,
+    /// How that connection ended: its CONNECTION_CLOSE code, either way.
+    conn_close_code: ?u64 = null,
+    goaway_sent: bool = false,
+
+    pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch unreachable;
+        self.session = session.*;
+        self.session_id = session_id;
+    }
+    pub fn onStreamData(_: *@This(), _: *Session, _: u64, _: []const u8, _: bool) void {}
+    pub fn onSessionClosed(self: *@This(), _: *Session, session_id: u64, code: u32, reason: []const u8, abrupt: bool) void {
+        std.debug.assert(session_id == self.session_id);
+        self.seen.record(code, reason, abrupt);
+    }
+    pub fn onConnectionClosed(self: *@This(), session: *Session) void {
+        self.conns_closed += 1;
+        self.seen_at_conn_close = self.seen.count;
+        if (session.entry.conn.local_err) |e| self.conn_close_code = e.code;
+        if (session.entry.h3_conn) |h| self.goaway_sent = h.local_goaway_id != null;
+    }
+};
+
+const WtCloseClient = struct {
+    pub const protocol: Protocol = .webtransport;
+    session_id: ?u64 = null,
+    seen: CloseSeen = .{},
+
+    pub fn onSessionReady(self: *@This(), _: *ClientSession, session_id: u64) void {
+        self.session_id = session_id;
+    }
+    pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    pub fn onSessionClosed(self: *@This(), _: *ClientSession, _: u64, code: u32, reason: []const u8, abrupt: bool) void {
+        self.seen.record(code, reason, abrupt);
+    }
+
+    fn ready(self: *@This()) bool {
+        return self.session_id != null;
+    }
+};
+
+/// How a test ends the session: from which side, and with what.
+const SessionEnd = enum { fin, reset, capsule };
+
+/// Ends an established session the way `how` says, from the client or the
+/// server, and runs until both sides have heard. Each side's view is returned.
+fn endSessionE2e(port: u16, from_client: bool, how: SessionEnd) !struct { server: CloseSeen, client: CloseSeen } {
+    var ch = WtCloseClient{};
+    var sh = WtCloseServer{};
+    var e2e: E2e(WtCloseServer, WtCloseClient) = undefined;
+    try e2e.init(port, &sh, &ch);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &ch, WtCloseClient.ready, 10_000);
+    try runFor(&e2e.loop, 50);
+    const sid = ch.session_id.?;
+    var cs = e2e.client.clientSession();
+    var ss = sh.session.?;
+    const cancelled = @backingInt(H3Error.request_cancelled);
+    switch (how) {
+        .fin => if (from_client) cs.closeQuicStream(sid) else ss.closeQuicStream(sid),
+        .reset => if (from_client) {
+            cs.conn.streams.getStream(sid).?.send.reset(cancelled);
+            cs.sendKeepAlive();
+        } else {
+            ss.entry.conn.streams.getStream(sid).?.send.reset(cancelled);
+            ss.sendKeepAlive();
+        },
+        .capsule => if (from_client)
+            try cs.closeSessionWithError(sid, 42, "bye")
+        else
+            try ss.closeSessionWithError(sid, 3999, "later"),
+    }
+    try runUntilCount(&e2e.loop, &sh.seen.count, 1, 3000);
+    try runUntilCount(&e2e.loop, &ch.seen.count, 1, 3000);
+    return .{ .server = sh.seen, .client = ch.seen };
+}
+
+test "e2e: a bare FIN on the CONNECT stream closes the session as code 0, from either side" {
+    for ([_]bool{ true, false }, [_]u16{ 29520, 29521 }) |from_client, port| {
+        const seen = try endSessionE2e(port, from_client, .fin);
+        // The other side answers with its own FIN, so both see a clean close.
+        for ([_]CloseSeen{ seen.server, seen.client }) |side| {
+            try testing.expectEqual(@as(u32, 0), side.code);
+            try testing.expectEqualStrings("", side.reason());
+            try testing.expect(!side.abrupt);
+        }
+    }
+}
+
+test "e2e: a RESET_STREAM of the CONNECT stream ends the session abruptly, from either side" {
+    for ([_]bool{ true, false }, [_]u16{ 29522, 29523 }) |from_client, port| {
+        const seen = try endSessionE2e(port, from_client, .reset);
+        for ([_]CloseSeen{ seen.server, seen.client }) |side| {
+            try testing.expectEqual(@as(u32, 0), side.code);
+            try testing.expect(side.abrupt);
+        }
+    }
+}
+
+test "e2e: a close capsule still carries its code and reason, from either side" {
+    for ([_]bool{ true, false }, [_]u16{ 29524, 29525 }) |from_client, port| {
+        const seen = try endSessionE2e(port, from_client, .capsule);
+        const want_code: u32 = if (from_client) 42 else 3999;
+        const want_reason = if (from_client) "bye" else "later";
+        // The closer's own view, once the peer's FIN is in, is its own close.
+        for ([_]CloseSeen{ seen.server, seen.client }) |side| {
+            try testing.expectEqual(want_code, side.code);
+            try testing.expectEqualStrings(want_reason, side.reason());
+            try testing.expect(!side.abrupt);
+        }
+    }
+}
+
+fn clientConnClosed(c: *Client(WtCloseClient)) bool {
+    return c.conn.isClosed();
+}
+
+test "e2e: a connection's end reports its session once, by its id, on both sides" {
+    // Under a live session, and after one already closed.
+    for ([_]bool{ false, true }, [_]u16{ 29526, 29527 }) |closed_first, port| {
+        var ch = WtCloseClient{};
+        var sh = WtCloseServer{};
+        var e2e: E2e(WtCloseServer, WtCloseClient) = undefined;
+        try e2e.init(port, &sh, &ch);
+        defer e2e.deinit();
+        try runUntil(&e2e.loop, &ch, WtCloseClient.ready, 10_000);
+        try runFor(&e2e.loop, 50);
+        var ss = sh.session.?;
+        if (closed_first) {
+            try ss.closeSessionWithError(sh.session_id, 7, "bye");
+            try runUntilCount(&e2e.loop, &sh.seen.count, 1, 3000);
+            try runUntilCount(&e2e.loop, &ch.seen.count, 1, 3000);
+        }
+        ss.closeConnection();
+        try runUntilCount(&e2e.loop, &sh.conns_closed, 1, 3000);
+        try runUntil(&e2e.loop, &e2e.client, clientConnClosed, 3000);
+        for ([_]CloseSeen{ sh.seen, ch.seen }) |side| {
+            try testing.expectEqual(@as(u32, 1), side.count);
+            try testing.expectEqual(!closed_first, side.abrupt);
+        }
+        // Before the connection's own callback, never after it.
+        try testing.expectEqual(@as(u32, 1), sh.seen_at_conn_close);
+    }
+}
+
+test "e2e: a connection that times out reports its session, and one with none reports nothing" {
+    var idle = QuicIdleClient{}; // no session at all
+    var sh = WtCloseServer{};
+    var e2e: E2e(WtCloseServer, QuicIdleClient) = undefined;
+    try e2e.initWith(29528, &sh, &idle, .{ .max_idle_timeout = 300 }, null);
+    defer e2e.deinit();
+    // A session's client on a loop of its own, so it can fall silent.
+    var ch = WtCloseClient{};
+    var c = try Client(WtCloseClient).init(testing.allocator, &ch, .{ .port = 29528, .skip_cert_verify = true });
+    defer c.deinit();
+    c.start();
+    try runUntil2(&e2e.loop, c.eventLoop(), &ch, WtCloseClient.ready, 10_000);
+
+    // An idle timeout ends it inside the pass's timers, with no poll after.
+    try runUntilCount(&e2e.loop, &sh.conns_closed, 2, 8000);
+    try testing.expectEqual(@as(u32, 1), sh.seen.count);
+    try testing.expect(sh.seen.abrupt);
+    try testing.expectEqual(@as(u32, 0), sh.seen.code);
+}
+
+const h3_no_error: u64 = @backingInt(H3Error.no_error);
+
+test "e2e: once its only session is over, a connection closes with H3_NO_ERROR, from either side" {
+    for ([_]bool{ true, false }, [_]u16{ 29529, 29530 }) |from_client, port| {
+        var ch = WtCloseClient{};
+        var sh = WtCloseServer{};
+        var e2e: E2e(WtCloseServer, WtCloseClient) = undefined;
+        try e2e.init(port, &sh, &ch);
+        defer e2e.deinit();
+        try runUntil(&e2e.loop, &ch, WtCloseClient.ready, 10_000);
+        var cs = e2e.client.clientSession();
+        var ss = sh.session.?;
+        if (from_client) try cs.closeSessionWithError(sh.session_id, 42, "bye") else try ss.closeSessionWithError(sh.session_id, 3999, "later");
+
+        try runUntilCount(&e2e.loop, &sh.conns_closed, 1, 3000);
+        try runUntil(&e2e.loop, &e2e.client, clientConnClosed, 3000);
+        // The session's own report came first, with the code it was given.
+        try testing.expectEqual(@as(u32, 1), sh.seen_at_conn_close);
+        try testing.expect(!sh.seen.abrupt and !ch.seen.abrupt);
+        try testing.expectEqual(h3_no_error, sh.conn_close_code.?);
+        try testing.expectEqual(h3_no_error, e2e.client.conn.local_err.?.code);
+    }
+}
+
+/// Leaves when its session is over, without a CONNECTION_CLOSE, as Chrome does.
+fn silentlyGone(port: u16, sh: *WtCloseServer, loop: *xev.Loop) !void {
+    var ch = WtCloseClient{};
+    var c = try Client(WtCloseClient).init(testing.allocator, &ch, .{
+        .port = port,
+        .skip_cert_verify = true,
+        .wt_close_after_sessions = false,
+    });
+    defer c.deinit();
+    c.start();
+    try runUntil2(loop, c.eventLoop(), &ch, WtCloseClient.ready, 10_000);
+    var cs = c.clientSession();
+    try cs.closeSessionWithError(ch.session_id.?, 7, "bye");
+    // Both sides have heard it, so our FIN reached the client; its loop then stops.
+    const Heard = struct {
+        s: *WtCloseServer,
+        c: *WtCloseClient,
+        fn done(self: *const @This()) bool {
+            return self.s.seen.count == 1 and self.c.seen.count == 1;
+        }
+    };
+    try runUntil2(loop, c.eventLoop(), &Heard{ .s = sh, .c = &ch }, Heard.done, 3000);
+}
+
+test "e2e: a peer that leaves silently once its session is over is closed in a few PTO, not on its idle timeout" {
+    var idle = QuicIdleClient{};
+    var sh = WtCloseServer{};
+    var e2e: E2e(WtCloseServer, QuicIdleClient) = undefined;
+    try e2e.init(29531, &sh, &idle);
+    defer e2e.deinit();
+    try silentlyGone(29531, &sh, &e2e.loop);
+
+    // The idle timeout is 30 s; waiting out the ack of our FIN and GOAWAY
+    // is bounded by 3 PTO, and the closing period by 3 more.
+    const began = sys.nanoTimestamp();
+    try runUntilCount(&e2e.loop, &sh.conns_closed, 1, 5000);
+    try testing.expect(sys.nanoTimestamp() - began < 3 * std.time.ns_per_s);
+    try testing.expect(sh.goaway_sent);
+    try testing.expectEqual(h3_no_error, sh.conn_close_code.?);
+    try testing.expectEqual(@as(usize, 1), e2e.server.conn_mgr.connectionCount()); // the idle client's
+}
+
+test "e2e: with wt_close_after_sessions off, a connection outlives its session" {
+    var idle = QuicIdleClient{};
+    var sh = WtCloseServer{};
+    var e2e: E2e(WtCloseServer, QuicIdleClient) = undefined;
+    try e2e.initServer(29532, &sh, &idle, .{ .wt_close_after_sessions = false }, null);
+    defer e2e.deinit();
+    try silentlyGone(29532, &sh, &e2e.loop);
+    try runFor(&e2e.loop, 1000);
+    try testing.expectEqual(@as(u32, 0), sh.conns_closed);
+    try testing.expectEqual(@as(usize, 2), e2e.server.conn_mgr.connectionCount());
+}
+
+/// Accepts and echoes datagrams, keeping its one session for the test.
+const WtShutdownServer = struct {
+    pub const protocol: Protocol = .webtransport;
+    session: ?Session = null,
+    session_id: u64 = 0,
+    closed: u32 = 0,
+    conns_closed: u32 = 0,
+
+    pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch unreachable;
+        self.session = session.*;
+        self.session_id = session_id;
+    }
+    pub fn onStreamData(_: *@This(), _: *Session, _: u64, _: []const u8, _: bool) void {}
+    pub fn onDatagram(_: *@This(), session: *Session, session_id: u64, data: []const u8) void {
+        session.sendDatagram(session_id, data) catch {};
+    }
+    pub fn onSessionClosed(self: *@This(), _: *Session, _: u64, _: u32, _: []const u8) void {
+        self.closed += 1;
+    }
+    pub fn onConnectionClosed(self: *@This(), _: *Session) void {
+        self.conns_closed += 1;
+    }
+};
+
+const WtDrainClient = struct {
+    pub const protocol: Protocol = .webtransport;
+    session_id: ?u64 = null,
+    drainings: u32 = 0,
+    echoes: u32 = 0,
+    closed: u32 = 0,
+
+    pub fn onSessionReady(self: *@This(), _: *ClientSession, session_id: u64) void {
+        self.session_id = session_id;
+    }
+    pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    pub fn onSessionDraining(self: *@This(), _: *ClientSession, _: u64) void {
+        self.drainings += 1;
+    }
+    pub fn onDatagram(self: *@This(), _: *ClientSession, _: u64, _: []const u8) void {
+        self.echoes += 1;
+    }
+    pub fn onSessionClosed(self: *@This(), _: *ClientSession, _: u64, _: u32, _: []const u8) void {
+        self.closed += 1;
+    }
+
+    fn ready(self: *@This()) bool {
+        return self.session_id != null;
+    }
+
+    fn toldToDrain(self: *@This()) bool {
+        return self.drainings > 0;
+    }
+};
+
+fn refusedOrUp(c: *Client(WtDrainClient)) bool {
+    return c.conn.state != .first_flight and c.conn.state != .handshake;
+}
+
+fn serverDrained(s: *Server(WtShutdownServer)) bool {
+    return s.isDrained();
+}
+
+test "e2e: drain() refuses newcomers, sends GOAWAY and WT_DRAIN_SESSION, and closes nothing" {
+    var ch = WtDrainClient{};
+    var sh = WtShutdownServer{};
+    var e2e: E2e(WtShutdownServer, WtDrainClient) = undefined;
+    try e2e.init(29533, &sh, &ch);
+    defer e2e.deinit();
+    try runUntil(&e2e.loop, &ch, WtDrainClient.ready, 10_000);
+    const sid = ch.session_id.?;
+
+    e2e.server.drain(.{});
+    try runUntilCount(&e2e.loop, &ch.drainings, 1, 3000);
+    // Both signals reach the client, which reports the drain once. The
+    // GOAWAY waits for the capsule's ack.
+    const wsess = e2e.client.wt_conn.?.getSession(sid).?;
+    try runUntil(&e2e.loop, wsess, struct {
+        fn f(w: *const wt.Session) bool {
+            return w.drain_by_goaway;
+        }
+    }.f, 3000);
+    try testing.expect(wsess.drain_by_capsule);
+    try testing.expectEqual(@as(u32, 1), ch.drainings);
+
+    // RFC 9000 §5.2.2: a newcomer's Initial is answered with CONNECTION_REFUSED.
+    var lh = WtDrainClient{};
+    var late = try Client(WtDrainClient).init(testing.allocator, &lh, .{ .port = 29533, .skip_cert_verify = true, .loop = &e2e.loop });
+    late.start();
+    try runUntil(&e2e.loop, &late, refusedOrUp, 5000);
+    try testing.expectEqual(@as(u64, @backingInt(@import("quic/frame.zig").TransportError.connection_refused)), late.conn.local_err.?.code);
+    try testing.expect(!late.conn.local_err.?.is_app);
+    late.stop();
+    try runUntil(&e2e.loop, &late, struct {
+        fn f(c: *Client(WtDrainClient)) bool {
+            return c.isStopped();
+        }
+    }.f, 5000);
+    late.deinit();
+
+    // The session goes on until the application ends it.
+    var cs = e2e.client.clientSession();
+    try cs.sendDatagram(sid, "ping");
+    _ = try cs.openBidiStream(sid, null);
+    try runUntilCount(&e2e.loop, &ch.echoes, 1, 3000);
+    try testing.expect(!e2e.server.isDrained());
+    try testing.expectEqual(@as(u32, 0), sh.closed);
+
+    var ss = sh.session.?;
+    try ss.closeSessionWithError(sh.session_id, 0, "shutting down");
+    try runUntil(&e2e.loop, &e2e.server, serverDrained, 3000);
+    try testing.expectEqual(@as(u32, 1), sh.closed);
+    try testing.expectEqual(@as(u32, 1), ch.closed);
+}
+
+test "e2e: drain() that signals no peer still refuses newcomers, and is drained once the sessions are over" {
+    var ch = WtDrainClient{};
+    var sh = WtShutdownServer{};
+    var e2e: E2e(WtShutdownServer, WtDrainClient) = undefined;
+    try e2e.init(29541, &sh, &ch);
+    defer e2e.deinit();
+    try runUntil(&e2e.loop, &ch, WtDrainClient.ready, 10_000);
+    const sid = ch.session_id.?;
+
+    e2e.server.drain(.{ .signal_peers = false });
+    try runFor(&e2e.loop, 200);
+    try testing.expectEqual(@as(u32, 0), ch.drainings);
+    try testing.expectEqual(@as(?u64, null), e2e.client.h3_conn.?.peer_goaway_id);
+    const wsess = e2e.client.wt_conn.?.getSession(sid).?;
+    try testing.expect(!wsess.drain_by_capsule and !wsess.drain_by_goaway);
+
+    var lh = WtDrainClient{};
+    var late = try Client(WtDrainClient).init(testing.allocator, &lh, .{ .port = 29541, .skip_cert_verify = true, .loop = &e2e.loop });
+    late.start();
+    try runUntil(&e2e.loop, &late, refusedOrUp, 5000);
+    try testing.expectEqual(@as(u64, @backingInt(@import("quic/frame.zig").TransportError.connection_refused)), late.conn.local_err.?.code);
+    late.stop();
+    try runUntil(&e2e.loop, &late, struct {
+        fn f(c: *Client(WtDrainClient)) bool {
+            return c.isStopped();
+        }
+    }.f, 5000);
+    late.deinit();
+
+    // The application tells its client itself, then ends the session; the
+    // connection goes with it, by wt_close_after_sessions.
+    var cs = e2e.client.clientSession();
+    try cs.sendDatagram(sid, "ping");
+    try runUntilCount(&e2e.loop, &ch.echoes, 1, 3000);
+    try testing.expect(!e2e.server.isDrained());
+    var ss = sh.session.?;
+    try ss.closeSessionWithError(sh.session_id, 4002, "server shutdown");
+    const began = sys.nanoTimestamp();
+    try runUntil(&e2e.loop, &e2e.server, serverDrained, 3000);
+    try testing.expect(sys.nanoTimestamp() - began < std.time.ns_per_s);
+    try testing.expectEqual(@as(u32, 1), ch.closed);
+}
+
+test "e2e: drainConnection drains one connection, and the server still takes new ones" {
+    var ch = WtDrainClient{};
+    var sh = WtShutdownServer{};
+    var e2e: E2e(WtShutdownServer, WtDrainClient) = undefined;
+    try e2e.init(29534, &sh, &ch);
+    defer e2e.deinit();
+    try runUntil(&e2e.loop, &ch, WtDrainClient.ready, 10_000);
+    var ss = sh.session.?;
+    ss.drainConnection();
+    try runUntilCount(&e2e.loop, &ch.drainings, 1, 3000);
+    // The GOAWAY waits for the capsule's ack: one drain report for both.
+    const wsess = e2e.client.wt_conn.?.getSession(ch.session_id.?).?;
+    try runUntil(&e2e.loop, wsess, struct {
+        fn f(w: *const wt.Session) bool {
+            return w.drain_by_goaway;
+        }
+    }.f, 3000);
+    try testing.expect(wsess.drain_by_capsule);
+    try testing.expectEqual(@as(u32, 1), ch.drainings);
+
+    var lh = WtDrainClient{};
+    var late = try Client(WtDrainClient).init(testing.allocator, &lh, .{ .port = 29534, .skip_cert_verify = true, .loop = &e2e.loop });
+    late.start();
+    try runUntil(&e2e.loop, &lh, WtDrainClient.ready, 5000);
+    try testing.expectEqual(@as(u32, 0), lh.drainings);
+    late.stop();
+    try runUntil(&e2e.loop, &late, struct {
+        fn f(c: *Client(WtDrainClient)) bool {
+            return c.isStopped();
+        }
+    }.f, 5000);
+    late.deinit();
+}
+
+/// Runs the graceful shutdown from its own `onPass`, as netcode does: drain,
+/// then stop once drained or at once, whichever the test asks for.
+const ShutdownOnPass = struct {
+    pub const protocol: Protocol = .webtransport;
+    /// The `Server(ShutdownOnPass)`: its type can't be named in a field here.
+    server: ?*anyopaque = null,
+    plan: enum { none, stop, drain_then_stop, stop_once_drained } = .none,
+    drained: bool = false,
+    stopped_in_pass: bool = false,
+    /// `.stop_once_drained`: how long after the drain began to stop anyway,
+    /// when it began, and whether it ended drained or at that deadline.
+    drain_grace_ns: i64 = 300 * std.time.ns_per_ms,
+    drain_began: ?i64 = null,
+    stopped_drained: bool = false,
+    /// Off, it asks for no passes of its own: only a packet brings one.
+    ticking: bool = true,
+    session: ?Session = null,
+    session_id: u64 = 0,
+
+    pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch unreachable;
+        self.session = session.*;
+        self.session_id = session_id;
+    }
+    pub fn onStreamData(_: *@This(), _: *Session, _: u64, _: []const u8, _: bool) void {}
+    pub fn onPass(self: *@This(), now_ns: i64) ?i64 {
+        const server: *Server(ShutdownOnPass) = @ptrCast(@alignCast(self.server orelse return null));
+        switch (self.plan) {
+            .none => {},
+            .stop => {
+                self.plan = .none;
+                server.stop();
+                self.stopped_in_pass = true;
+            },
+            .drain_then_stop => if (!self.drained) {
+                server.drain(.{});
+                self.drained = true;
+            } else if (server.isDrained()) {
+                self.plan = .none;
+                server.stop();
+                self.stopped_in_pass = true;
+            },
+            // The README's recipe, for a drain begun elsewhere: `requestDrain()`.
+            .stop_once_drained => if (server.draining) {
+                const began = self.drain_began orelse now_ns;
+                self.drain_began = began;
+                if (server.isDrained() or now_ns - began > self.drain_grace_ns) {
+                    self.plan = .none;
+                    self.stopped_drained = server.isDrained();
+                    server.stop();
+                    self.stopped_in_pass = true;
+                }
+            },
+        }
+        return if (self.ticking) now_ns + 5 * std.time.ns_per_ms else null; // a game's tick
+    }
+
+    fn hasSession(self: *@This()) bool {
+        return self.session != null;
+    }
+};
+
+fn shutdownServerStopped(s: *Server(ShutdownOnPass)) bool {
+    return s.isStopped();
+}
+
+fn shutdownServerStopping(s: *Server(ShutdownOnPass)) bool {
+    return s.isStopping();
+}
+
+fn shutdownServerDraining(s: *Server(ShutdownOnPass)) bool {
+    return s.draining;
+}
+
+fn shutdownServerEmpty(s: *Server(ShutdownOnPass)) bool {
+    return s.conn_mgr.connectionCount() == 0;
+}
+
+test "e2e: stop() from onPass takes a server off a shared loop, with a connection open or none" {
+    for ([_]bool{ false, true }, [_]u16{ 29535, 29536 }) |with_conn, port| {
+        var sh = ShutdownOnPass{};
+        var ch = WtDrainClient{};
+        var e2e: E2e(ShutdownOnPass, WtDrainClient) = undefined;
+        try e2e.init(port, &sh, &ch);
+        defer e2e.deinit();
+        sh.server = &e2e.server;
+        if (with_conn) {
+            try runUntil(&e2e.loop, &ch, WtDrainClient.ready, 10_000);
+        } else {
+            e2e.client.stop(); // nothing connected when the server stops
+            try runUntil(&e2e.loop, &e2e.client, struct {
+                fn f(c: *Client(WtDrainClient)) bool {
+                    return c.isStopped();
+                }
+            }.f, 5000);
+            try runUntil(&e2e.loop, &e2e.server, struct {
+                fn f(s: *Server(ShutdownOnPass)) bool {
+                    return s.conn_mgr.connectionCount() == 0;
+                }
+            }.f, 5000);
+        }
+        sh.plan = .stop;
+        try runUntil(&e2e.loop, &e2e.server, shutdownServerStopped, 5000);
+        try testing.expect(sh.stopped_in_pass);
+        try testing.expect(!e2e.loop.stopped());
+        if (with_conn) try testing.expect(e2e.client.conn.state != .connected);
+    }
+}
+
+test "e2e: stop() from an onPass a datagram brought takes the server off a shared loop" {
+    // The pass runs inside the socket watch's own callback, which a cancel
+    // can't take off the loop: on epoll, cancelling it there panicked.
+    var sh = ShutdownOnPass{ .ticking = false };
+    var idle = QuicIdleClient{};
+    var e2e: E2e(ShutdownOnPass, QuicIdleClient) = undefined;
+    try e2e.init(29540, &sh, &idle);
+    defer e2e.deinit();
+    sh.server = &e2e.server;
+    e2e.client.stop();
+    try runUntil(&e2e.loop, &e2e.client, struct {
+        fn f(c: *Client(QuicIdleClient)) bool {
+            return c.isStopped();
+        }
+    }.f, 5000);
+    try runFor(&e2e.loop, 50);
+
+    sh.plan = .stop;
+    const fd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    defer sys.close(fd);
+    const to = try net.Address.parseIp4("127.0.0.1", 29540);
+    _ = std.c.sendto(fd, "x", 1, 0, &to.any, to.getOsSockLen());
+    try runUntil(&e2e.loop, &e2e.server, shutdownServerStopped, 5000);
+    try testing.expect(sh.stopped_in_pass);
+}
+
+test "e2e: stop() from onPass exits a server's own loop, with a connection open or none" {
+    for ([_]bool{ false, true }, [_]u16{ 29537, 29538 }) |with_conn, port| {
+        var sh = ShutdownOnPass{};
+        var server = try Server(ShutdownOnPass).init(testing.allocator, &sh, .{ .port = port, .tls_config = makeTestTlsConfig() });
+        defer server.deinit();
+        sh.server = &server;
+        server.start();
+        var ch = WtDrainClient{};
+        var client = try Client(WtDrainClient).init(testing.allocator, &ch, .{ .port = port, .skip_cert_verify = true });
+        defer client.deinit();
+        if (with_conn) {
+            client.start();
+            try runUntil2(server.eventLoop(), client.eventLoop(), &ch, WtDrainClient.ready, 10_000);
+        }
+        sh.plan = .stop;
+        const deadline = sys.nanoTimestamp() + 5 * std.time.ns_per_s;
+        while (!server.eventLoop().stopped()) {
+            if (sys.nanoTimestamp() > deadline) return error.Timeout;
+            try server.tick();
+            if (with_conn) try client.tick();
+            sys.sleepNs(50 * std.time.ns_per_us);
+        }
+        try testing.expect(sh.stopped_in_pass);
+        try testing.expectEqual(@as(usize, 0), server.conn_mgr.connectionCount());
+    }
+}
+
+test "e2e: drain() then stop() from onPass, once the client has ended its session" {
+    var sh = ShutdownOnPass{};
+    var ch = WtDrainClient{};
+    var e2e: E2e(ShutdownOnPass, WtDrainClient) = undefined;
+    try e2e.init(29539, &sh, &ch);
+    defer e2e.deinit();
+    sh.server = &e2e.server;
+    try runUntil(&e2e.loop, &ch, WtDrainClient.ready, 10_000);
+
+    sh.plan = .drain_then_stop;
+    try runUntilCount(&e2e.loop, &ch.drainings, 1, 3000);
+    try runFor(&e2e.loop, 50);
+    try testing.expect(!sh.stopped_in_pass); // a live session holds it
+    var cs = e2e.client.clientSession();
+    try cs.closeSessionWithError(ch.session_id.?, 0, "leaving");
+    try runUntil(&e2e.loop, &e2e.server, shutdownServerStopped, 5000);
+    try testing.expect(sh.stopped_in_pass);
+    try testing.expectEqual(@as(u32, 1), ch.closed);
+}
+
+/// `run()` on a thread of its own, as `main` runs it.
+fn RunThread(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        target: *T,
+        thread: std.Thread = undefined,
+        returned: std.atomic.Value(bool) = .init(false),
+
+        fn spawn(self: *Self) !void {
+            self.thread = try std.Thread.spawn(.{}, run, .{self});
+        }
+
+        fn run(self: *Self) void {
+            self.target.run() catch |err| std.debug.panic("run: {any}", .{err});
+            self.returned.store(true, .release);
+        }
+
+        fn hasReturned(self: *Self) bool {
+            return self.returned.load(.acquire);
+        }
+
+        /// Waits for `run()` to return, or panics: a thread whose loop never
+        /// stopped can't be joined.
+        fn join(self: *Self, timeout_ms: i64) void {
+            const deadline = sys.nanoTimestamp() + timeout_ms * std.time.ns_per_ms;
+            while (!self.hasReturned()) {
+                if (sys.nanoTimestamp() > deadline) @panic("run() did not return");
+                sys.sleepNs(std.time.ns_per_ms);
+            }
+            self.thread.join();
+        }
+    };
+}
+
+const ServerThread = RunThread(Server(ShutdownOnPass));
+
+test "e2e: requestStop() from a signal handler ends run() on an idle server" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // no POSIX signals
+    var sh = ShutdownOnPass{ .ticking = false }; // no timer: idle, it waits in the kernel for good
+    var server = try Server(ShutdownOnPass).init(testing.allocator, &sh, .{ .port = 29542, .tls_config = makeTestTlsConfig() });
+    defer server.deinit();
+
+    const OnSignal = struct {
+        var target: ?*Server(ShutdownOnPass) = null;
+        fn handle(_: posix.SIG) callconv(.c) void {
+            if (target) |s| s.requestStop();
+        }
+    };
+    OnSignal.target = &server;
+    defer OnSignal.target = null;
+    const act = posix.Sigaction{
+        .handler = .{ .handler = OnSignal.handle },
+        .mask = std.mem.zeroes(posix.sigset_t),
+        .flags = 0,
+    };
+    var old: posix.Sigaction = undefined;
+    posix.sigaction(posix.SIG.USR1, &act, &old);
+    defer posix.sigaction(posix.SIG.USR1, &old, null);
+
+    var rt = ServerThread{ .target = &server };
+    try rt.spawn();
+    sys.sleepNs(50 * std.time.ns_per_ms); // parked in kevent/epoll_wait
+    // On the loop's own thread, interrupting that wait, as in issue #48.
+    _ = std.c.pthread_kill(rt.thread.getHandle(), posix.SIG.USR1);
+    rt.join(2000);
+}
+
+test "e2e: requestStop() from another thread ends run(), made before it or during it" {
+    for ([_]bool{ false, true }, [_]u16{ 29543, 29544 }) |during, port| {
+        var sh = ShutdownOnPass{ .ticking = false };
+        var server = try Server(ShutdownOnPass).init(testing.allocator, &sh, .{ .port = port, .tls_config = makeTestTlsConfig() });
+        defer server.deinit();
+        var rt = ServerThread{ .target = &server };
+        if (during) {
+            try rt.spawn();
+            sys.sleepNs(50 * std.time.ns_per_ms);
+            server.requestStop();
+        } else {
+            server.requestStop();
+            try rt.spawn();
+        }
+        rt.join(2000);
+    }
+}
+
+/// A wait that spans a closing period: 3 PTO, which follows the measured RTT
+/// and so stretches on a loaded machine.
+const closing_ms = 10_000;
+
+/// A server and a client with a session between them, each on a loop of its
+/// own and both run from the test's thread.
+const OwnLoops = struct {
+    sh: ShutdownOnPass = .{ .ticking = false },
+    ch: WtDrainClient = .{},
+    server: Server(ShutdownOnPass) = undefined,
+    client: Client(WtDrainClient) = undefined,
+
+    /// In place: both keep pointers into `self`.
+    fn init(self: *OwnLoops, port: u16) !void {
+        self.* = .{};
+        self.server = try Server(ShutdownOnPass).init(testing.allocator, &self.sh, .{ .port = port, .tls_config = makeTestTlsConfig() });
+        errdefer self.server.deinit();
+        self.client = try Client(WtDrainClient).init(testing.allocator, &self.ch, .{ .port = port, .skip_cert_verify = true });
+        errdefer self.client.deinit();
+        self.server.start();
+        self.client.start();
+        try self.runUntil(&self.ch, WtDrainClient.ready, 10_000);
+    }
+
+    fn deinit(self: *OwnLoops) void {
+        self.client.deinit();
+        self.server.deinit();
+    }
+
+    fn runUntil(self: *OwnLoops, ctx: anytype, comptime done: fn (@TypeOf(ctx)) bool, timeout_ms: i64) !void {
+        return runUntil2(self.server.eventLoop(), self.client.eventLoop(), ctx, done, timeout_ms);
+    }
+
+    fn runFor(self: *OwnLoops, ms: i64) !void {
+        const until = sys.nanoTimestamp() + ms * std.time.ns_per_ms;
+        while (sys.nanoTimestamp() < until) {
+            try self.server.eventLoop().run(.no_wait);
+            try self.client.eventLoop().run(.no_wait);
+            sys.sleepNs(50 * std.time.ns_per_us);
+        }
+    }
+};
+
+test "e2e: requestDrain() and requestStop() reach a server and a client that own their loops" {
+    var o: OwnLoops = undefined;
+    try o.init(29545);
+    defer o.deinit();
+
+    o.server.requestDrain(.{});
+    try o.runUntil(&o.ch, WtDrainClient.toldToDrain, 3000);
+
+    o.client.requestStop();
+    try o.runUntil(o.client.eventLoop(), xev.Loop.stopped, closing_ms);
+    o.server.requestStop();
+    try runUntil(o.server.eventLoop(), o.server.eventLoop(), xev.Loop.stopped, closing_ms);
+}
+
+test "e2e: requestDrain() with signal_peers off drains without telling the peer" {
+    var o: OwnLoops = undefined;
+    try o.init(29546);
+    defer o.deinit();
+
+    o.server.requestDrain(.{ .signal_peers = false });
+    try o.runUntil(&o.server, shutdownServerDraining, 3000);
+    try o.runFor(200);
+    try testing.expectEqual(@as(u32, 0), o.ch.drainings);
+    try testing.expectEqual(@as(?u64, null), o.client.h3_conn.?.peer_goaway_id);
+}
+
+test "e2e: a second requestStop(), or a requestDrain(), while the stop finishes changes nothing" {
+    var o: OwnLoops = undefined;
+    try o.init(29547);
+    defer o.deinit();
+
+    o.server.requestStop();
+    try o.runUntil(&o.server, shutdownServerStopping, 3000);
+    try testing.expect(!o.server.eventLoop().stopped()); // in its closing period
+    // A second Ctrl+C, or a SIGTERM after a SIGINT.
+    o.server.requestStop();
+    o.server.requestDrain(.{});
+    try o.runUntil(o.server.eventLoop(), xev.Loop.stopped, closing_ms);
+    try testing.expect(!o.server.draining);
+    try testing.expectEqual(@as(u32, 0), o.ch.drainings);
+    try testing.expectEqual(@as(u32, 1), o.ch.closed);
+    try testing.expectEqual(@as(usize, 0), o.server.conn_mgr.connectionCount());
+}
+
+test "e2e: requestDrain() from another thread, then stop() in onPass once drained or at a deadline, ends run()" {
+    // The README's shutdown, on a server that blocks in run().
+    for ([_]bool{ true, false }, [_]u16{ 29548, 29549 }) |client_leaves, port| {
+        var sh = ShutdownOnPass{ .plan = .stop_once_drained };
+        var server = try Server(ShutdownOnPass).init(testing.allocator, &sh, .{ .port = port, .tls_config = makeTestTlsConfig() });
+        defer server.deinit();
+        sh.server = &server;
+        var ch = WtDrainClient{};
+        var client = try Client(WtDrainClient).init(testing.allocator, &ch, .{ .port = port, .skip_cert_verify = true });
+        defer client.deinit();
+        client.start();
+
+        var rt = ServerThread{ .target = &server };
+        {
+            try rt.spawn();
+            errdefer {
+                server.requestStop();
+                rt.join(5000);
+            }
+            try runUntil(client.eventLoop(), &ch, WtDrainClient.ready, 10_000);
+            server.requestDrain(.{});
+            try runUntil(client.eventLoop(), &ch, WtDrainClient.toldToDrain, 3000);
+            if (client_leaves) {
+                var cs = client.clientSession();
+                try cs.closeSessionWithError(ch.session_id.?, 0, "leaving");
+            }
+            try runUntil(client.eventLoop(), &rt, ServerThread.hasReturned, closing_ms);
+        }
+        rt.join(1000);
+        try testing.expect(sh.stopped_in_pass);
+        try testing.expectEqual(client_leaves, sh.stopped_drained);
+        try testing.expectEqual(@as(u32, 1), ch.closed);
+    }
+}
+
+test "e2e: Client.requestStop() from another thread ends Client.run(), and the server hears it go" {
+    var sh = ShutdownOnPass{ .ticking = false };
+    var server = try Server(ShutdownOnPass).init(testing.allocator, &sh, .{ .port = 29550, .tls_config = makeTestTlsConfig() });
+    defer server.deinit();
+    server.start();
+    var ch = WtDrainClient{};
+    var client = try Client(WtDrainClient).init(testing.allocator, &ch, .{ .port = 29550, .skip_cert_verify = true });
+    defer client.deinit();
+
+    const ClientThread = RunThread(Client(WtDrainClient));
+    var rt = ClientThread{ .target = &client };
+    {
+        try rt.spawn();
+        errdefer {
+            client.requestStop();
+            rt.join(5000);
+        }
+        try runUntil(server.eventLoop(), &sh, ShutdownOnPass.hasSession, 10_000);
+        client.requestStop();
+        try runUntil(server.eventLoop(), &rt, ClientThread.hasReturned, closing_ms);
+    }
+    rt.join(1000);
+    try testing.expect(client.conn.isClosed());
+    // Its CONNECTION_CLOSE, not an idle timeout, ends the server's side.
+    try runUntil(server.eventLoop(), &server, shutdownServerEmpty, closing_ms);
+}
+
+test "e2e: a WT_STREAMS_BLOCKED is answered with nothing more from the peer" {
+    var client_handler = WtIdleClient{};
+    var h = WtEventCounter{};
+    var e2e: E2e(WtEventCounter, WtIdleClient) = undefined;
+    try e2e.init(29506, &h, &client_handler);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &client_handler, WtIdleClient.ready, 10_000);
+    const sid = client_handler.session_id.?;
+    const limit = &e2e.client.wt_conn.?.getSession(sid).?.fc.bidi;
+    const Limit = struct {
+        fn granted(l: *wt_fc.StreamLimit) bool {
+            return l.max_send != null;
+        }
+        fn regranted(l: *wt_fc.StreamLimit) bool {
+            return (l.max_send orelse 0) > 0;
+        }
+    };
+    try runUntil(&e2e.loop, limit, Limit.granted, 3000);
+    try runFor(&e2e.loop, 100);
+
+    // As if the grant had been lost: the client is refused, and says so.
+    limit.max_send = 0;
+    var cs = e2e.client.clientSession();
+    try testing.expectError(error.WtStreamLimitReached, cs.openBidiStream(sid, null));
+    cs.sendKeepAlive(); // a pass for the client to send its WT_STREAMS_BLOCKED on
+    try runUntil(&e2e.loop, limit, Limit.regranted, 3000);
+}
+
+const cross_body: [1000]u8 = @splat('x');
+
+/// Sends `cross_body` and a FIN on one stream once its session is up.
+const WtOneShot = struct {
+    pub const protocol: Protocol = .webtransport;
+
+    pub fn onSessionReady(_: *@This(), session: *ClientSession, session_id: u64) void {
+        const id = session.openBidiStream(session_id, null) catch unreachable;
+        session.sendStreamData(id, &cross_body) catch unreachable;
+        session.closeStream(id);
+    }
+    pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+};
+
+/// Pauses the first client's stream, and resumes it from the callback that
+/// delivers the next client's data, after the first one's turn in the pass.
+const WtCrossResume = struct {
+    pub const protocol: Protocol = .webtransport;
+    held: ?Session = null,
+    held_stream: u64 = 0,
+    held_bytes: usize = 0,
+    held_fins: u32 = 0,
+
+    pub fn onConnectRequest(_: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch unreachable;
+    }
+    pub fn onBidiStream(self: *@This(), session: *Session, _: u64, stream_id: u64) void {
+        if (self.held != null) return;
+        session.pauseStream(stream_id) catch unreachable;
+        self.held = session.*;
+        self.held_stream = stream_id;
+    }
+    pub fn onStreamData(self: *@This(), session: *Session, _: u64, data: []const u8, fin: bool) void {
+        const h = &(self.held orelse return);
+        if (h.entry == session.entry) {
+            self.held_bytes += data.len;
+            if (fin) self.held_fins += 1;
+            return;
+        }
+        h.resumeStream(self.held_stream);
+    }
+    pub fn onConnectionClosed(self: *@This(), session: *Session) void {
+        const h = self.held orelse return;
+        if (h.entry == session.entry) self.held = null;
+    }
+
+    fn holding(self: *@This()) bool {
+        return self.held != null;
+    }
+};
+
+test "e2e: a stream resumed from a later connection's callback is delivered without a packet" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    const S = Server(WtCrossResume);
+    const C = Client(WtOneShot);
+    var sh = WtCrossResume{};
+    var server = try S.init(testing.allocator, &sh, .{ .port = 29503, .tls_config = makeTestTlsConfig(), .loop = &loop });
+    server.start();
+
+    var ha = WtOneShot{};
+    var a = try C.init(testing.allocator, &ha, .{ .port = 29503, .skip_cert_verify = true, .loop = &loop });
+    a.start();
+    try runUntil(&loop, &sh, WtCrossResume.holding, 5000);
+    try runFor(&loop, 100); // the whole body is in, held back
+    try testing.expectEqual(@as(usize, 0), sh.held_bytes);
+
+    var hb = WtOneShot{};
+    var b = try C.init(testing.allocator, &hb, .{ .port = 29503, .skip_cert_verify = true, .loop = &loop });
+    b.start();
+    // A, done sending, has nothing more to say: no packet of its own brings the poll.
+    try runUntilCount(&loop, &sh.held_fins, 1, 3000);
+    try testing.expectEqual(cross_body.len, sh.held_bytes);
+
+    a.stop();
+    b.stop();
+    server.stop();
+    const All = struct {
+        s: *S,
+        a: *C,
+        b: *C,
+        fn done(x: *const @This()) bool {
+            return x.s.isStopped() and x.a.isStopped() and x.b.isStopped();
+        }
+    };
+    try runUntil(&loop, &All{ .s = &server, .a = &a, .b = &b }, All.done, 5000);
+    a.deinit();
+    b.deinit();
+    server.deinit();
+}
+
+/// Opens its stream to the client straight from onConnectRequest, as netcode
+/// does, and has no onPollComplete: only onWritable brings it back to write.
+const WtSparseDownloadServer = struct {
+    pub const protocol: Protocol = .webtransport;
+    up: WtPump = .{},
+    writable: u32 = 0,
+
+    pub fn onConnectRequest(self: *@This(), session: *Session, session_id: u64, _: []const u8) void {
+        session.acceptSession(session_id) catch unreachable;
+        if (!self.up.open(session, session_id)) unreachable;
+    }
+    pub fn onWritable(self: *@This(), session: *Session, _: u64, _: ?u64) void {
+        self.writable += 1;
+        self.up.pump(session);
+    }
+    pub fn onStreamData(_: *@This(), _: *Session, _: u64, _: []const u8, _: bool) void {}
+};
+
+const WtCollector = struct {
+    pub const protocol: Protocol = .webtransport;
+    sink: WtSink = .{},
+
+    pub fn onSessionReady(_: *@This(), _: *ClientSession, _: u64) void {}
+    pub fn onBidiStream(self: *@This(), _: *ClientSession, _: u64, stream_id: u64) void {
+        self.sink.stream_id = stream_id;
+    }
+    pub fn onStreamData(self: *@This(), _: *ClientSession, stream_id: u64, data: []const u8, fin: bool) void {
+        self.sink.data(stream_id, data, fin);
+    }
+};
+
+test "e2e: a WebTransport server held to its client's window is woken to write the rest" {
+    var client_handler = WtCollector{};
+    var server_handler = WtSparseDownloadServer{};
+    var e2e: E2e(WtSparseDownloadServer, WtCollector) = undefined;
+    try e2e.initWith(29504, &server_handler, &client_handler, null, .{
+        .initial_max_stream_data_bidi_remote = PAUSE_WINDOW,
+        .max_datagram_frame_size = 65536, // WebTransport needs DATAGRAM
+    });
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &client_handler.sink, WtSink.done, 20_000);
+    try testing.expectEqual(PAUSE_BODY, client_handler.sink.bytes);
+    try testing.expect(client_handler.sink.ok);
+    try testing.expect(server_handler.writable > 0);
+}
+
+const QuicCounter = struct {
+    pub const protocol: Protocol = .quic;
+    datagrams: u32 = 0,
+    data: usize = 0,
+    fins: u32 = 0,
+
+    pub fn onDatagram(self: *@This(), _: *Session, _: u64, _: []const u8) void {
+        self.datagrams += 1;
+    }
+    pub fn onStreamData(self: *@This(), _: *Session, _: u64, data: []const u8, fin: bool) void {
+        self.data += data.len;
+        if (fin) self.fins += 1;
+    }
+};
+
+const QuicIdleClient = struct {
+    pub const protocol: Protocol = .quic;
+    connected: bool = false,
+
+    pub fn onConnected(self: *@This(), _: *ClientSession) void {
+        self.connected = true;
+    }
+    pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+
+    fn ready(self: *@This()) bool {
+        return self.connected;
+    }
+};
+
+test "e2e: raw-QUIC datagrams and stream data reach a handler with nothing else in the packet" {
+    var client_handler = QuicIdleClient{};
+    var h = QuicCounter{};
+    var e2e: E2e(QuicCounter, QuicIdleClient) = undefined;
+    try e2e.init(29505, &h, &client_handler);
+    defer e2e.deinit();
+
+    try runUntil(&e2e.loop, &client_handler, QuicIdleClient.ready, 10_000);
+    try runFor(&e2e.loop, 100);
+    var cs = e2e.client.clientSession();
+
+    // No zero-copy callback here: the datagram waits in the queue for a poll.
+    try cs.sendDatagram(0, "d");
+    try runUntilCount(&e2e.loop, &h.datagrams, 1, 3000);
+
+    const id = try cs.openStream();
+    try cs.writeStream(id, "abc");
+    try runUntilCount(&e2e.loop, &h.data, 3, 3000);
+    cs.closeQuicStream(id);
+    try runUntilCount(&e2e.loop, &h.fins, 1, 3000);
+}
+
+/// `runUntil` over two loops at once.
+fn runUntil2(a: *xev.Loop, b: *xev.Loop, ctx: anytype, comptime done: fn (@TypeOf(ctx)) bool, timeout_ms: i64) !void {
+    const deadline = sys.nanoTimestamp() + timeout_ms * std.time.ns_per_ms;
+    while (!done(ctx)) {
+        if (sys.nanoTimestamp() > deadline) return error.Timeout;
+        try a.run(.no_wait);
+        try b.run(.no_wait);
+        sys.sleepNs(50 * std.time.ns_per_us);
+    }
+}
+
+/// Keeps the connection that says "b", and writes to it whenever another
+/// says "go": a write from one connection's callback to another.
+const CrossTimer = struct {
+    pub const protocol: Protocol = .quic;
+    b: ?Session = null,
+
+    pub fn onDatagram(self: *@This(), s: *Session, _: u64, data: []const u8) void {
+        if (std.mem.eql(u8, data, "b")) self.b = s.*;
+        if (std.mem.eql(u8, data, "go")) if (self.b) |*b| b.sendQuicDatagram("x") catch {};
+    }
+
+    fn hasB(self: *@This()) bool {
+        return self.b != null;
+    }
+};
+
+/// No timer before a second from now: nothing in flight, no ACK owed.
+fn quietEntry(e: *ConnEntry) bool {
+    const next = e.conn.nextTimeoutNs() orelse return true;
+    return next > sys.nanoTimestamp() + std.time.ns_per_s;
+}
+
+fn ptoFired(e: *ConnEntry) bool {
+    return e.conn.pkt_handler.pto_count > 0;
+}
+
+test "e2e: flush() sends for the connections written to, not every connection" {
+    var h = QuicCounter{};
+    var a_handler = QuicIdleClient{};
+    var e2e: E2e(QuicCounter, QuicIdleClient) = undefined;
+    try e2e.init(29516, &h, &a_handler);
+    defer e2e.deinit();
+
+    const C = Client(QuicIdleClient);
+    const idle_count = 16;
+    var idle_handlers: [idle_count]QuicIdleClient = @splat(.{});
+    var idle: [idle_count]C = undefined;
+    for (&idle, &idle_handlers, 0..) |*c, *ih, i| {
+        c.* = try C.init(testing.allocator, ih, .{ .port = 29516, .skip_cert_verify = true, .loop = &e2e.loop });
+        errdefer for (idle[0..i]) |*prev| prev.deinit();
+        c.start();
+    }
+    defer {
+        for (&idle) |*c| c.stop();
+        const Stopped = struct {
+            fn f(cs: []C) bool {
+                for (cs) |*c| if (!c.isStopped()) return false;
+                return true;
+            }
+        };
+        runUntil(&e2e.loop, @as([]C, &idle), Stopped.f, 5_000) catch @panic("did not stop");
+        for (&idle) |*c| c.deinit();
+    }
+
+    const Quiet = struct {
+        fn f(s: *Server(QuicCounter)) bool {
+            const m = &s.conn_mgr;
+            if (m.connectionCount() != idle_count + 1 or m.to_visit.items.len > 0) return false;
+            for (m.entries.items) |e| if (!e.conn.isEstablished() or !quietEntry(e)) return false;
+            return true;
+        }
+    };
+    try runUntil(&e2e.loop, &e2e.server, Quiet.f, 10_000);
+
+    // A host's command, outside the loop's callbacks, then the flush that
+    // sends it at once.
+    const entry = e2e.server.conn_mgr.entries.items[0];
+    var session = Session{ .entry = entry };
+    const sent = entry.conn.total_packets_sent;
+    const before = e2e.server.examined;
+    try session.sendDatagram(0, "d");
+    e2e.server.flush();
+    try testing.expect(entry.conn.total_packets_sent > sent);
+    // Through all 17, a host flushing after each batch of commands pays for
+    // every connection on every batch.
+    try testing.expect(e2e.server.examined - before <= 1);
+}
+
+test "e2e: a write from another connection's callback arms the timer it starts" {
+    var h = CrossTimer{};
+    var a_handler = QuicIdleClient{};
+    var e2e: E2e(CrossTimer, QuicIdleClient) = undefined;
+    try e2e.init(29510, &h, &a_handler);
+    defer e2e.deinit();
+    // B runs a loop of its own, so it can fall silent while A and the server go on.
+    var b_handler = QuicIdleClient{};
+    var b = try Client(QuicIdleClient).init(testing.allocator, &b_handler, .{ .port = 29510, .skip_cert_verify = true });
+    defer b.deinit();
+    b.start();
+
+    try runUntil2(&e2e.loop, b.eventLoop(), &b_handler, QuicIdleClient.ready, 10_000);
+    var bs = b.clientSession();
+    try bs.sendDatagram(0, "b");
+    try runUntil2(&e2e.loop, b.eventLoop(), &h, CrossTimer.hasB, 5_000);
+    const entry = h.b.?.entry;
+    try runUntil2(&e2e.loop, b.eventLoop(), entry, quietEntry, 5_000);
+
+    // B stops answering. A's datagram makes the server write to B from A's
+    // callback, and that write's probe timer has to reach the loop's.
+    var as = e2e.client.clientSession();
+    try as.sendDatagram(0, "go");
+    try runUntil(&e2e.loop, entry, ptoFired, 5_000);
+}
+
+test "e2e: a server's passes go through what is active, not every connection" {
+    var h = QuicCounter{};
+    var a_handler = QuicIdleClient{};
+    var e2e: E2e(QuicCounter, QuicIdleClient) = undefined;
+    try e2e.init(29511, &h, &a_handler);
+    defer e2e.deinit();
+
+    const C = Client(QuicIdleClient);
+    const idle_count = 16;
+    var idle_handlers: [idle_count]QuicIdleClient = @splat(.{});
+    var idle: [idle_count]C = undefined;
+    for (&idle, &idle_handlers, 0..) |*c, *ih, i| {
+        c.* = try C.init(testing.allocator, ih, .{ .port = 29511, .skip_cert_verify = true, .loop = &e2e.loop });
+        errdefer for (idle[0..i]) |*prev| prev.deinit();
+        c.start();
+    }
+    defer {
+        for (&idle) |*c| c.stop();
+        const Stopped = struct {
+            fn f(cs: []C) bool {
+                for (cs) |*c| if (!c.isStopped()) return false;
+                return true;
+            }
+        };
+        runUntil(&e2e.loop, @as([]C, &idle), Stopped.f, 5_000) catch @panic("did not stop");
+        for (&idle) |*c| c.deinit();
+    }
+
+    const Quiet = struct {
+        fn f(s: *Server(QuicCounter)) bool {
+            const m = &s.conn_mgr;
+            if (m.connectionCount() != idle_count + 1 or m.to_visit.items.len > 0) return false;
+            for (m.entries.items) |e| if (!e.conn.isEstablished() or !quietEntry(e)) return false;
+            return true;
+        }
+    };
+    try runUntil(&e2e.loop, &e2e.server, Quiet.f, 10_000);
+
+    const before = e2e.server.examined;
+    var cs = e2e.client.clientSession();
+    const datagrams = 20;
+    for (1..datagrams + 1) |n| {
+        try cs.sendDatagram(0, "d");
+        try runUntilCount(&e2e.loop, &h.datagrams, @intCast(n), 3_000);
+    }
+    try runFor(&e2e.loop, 100); // and the ACKs that follow
+    // Going through all 17 would be at least two passes of 17 a datagram.
+    try testing.expect(e2e.server.examined - before < datagrams * (idle_count + 1));
+    try testing.expectEqual(idle_count + 1, e2e.server.conn_mgr.timers.items.len);
+    // No read's time is left for a datagram routed later to take.
+    try testing.expect(e2e.server.conn_mgr.recv_time == null);
+}
+
+/// Answers a datagram saying "echo" with one of its own; others get nothing.
+const EchoOnAsk = struct {
+    pub const protocol: Protocol = .quic;
+    datagrams: u32 = 0,
+
+    pub fn onDatagram(self: *@This(), s: *Session, _: u64, data: []const u8) void {
+        self.datagrams += 1;
+        if (std.mem.eql(u8, data, "echo")) s.sendQuicDatagram("back") catch {};
+    }
+};
+
+/// When `conn` has acknowledged all it received, as the test loop sees it:
+/// no earlier than its ACK went.
+const AckWatch = struct {
+    conn: *connection.Connection,
+    at: i64 = 0,
+
+    fn sent(self: *@This()) bool {
+        if (self.conn.pkt_handler.recv[2].hasUnackedAckEliciting()) return false;
+        self.at = sys.nanoTimestamp();
+        return true;
+    }
+
+    fn delay(self: *const @This()) i64 {
+        return self.at - self.conn.pkt_handler.recv[2].largest_received_time;
+    }
+};
+
+fn nothingInFlight(c: *connection.Connection) bool {
+    return c.pkt_handler.sent[2].ack_eliciting_in_flight == 0;
+}
+
+test "e2e: a lone packet with nothing to answer is acknowledged on its receiver's timer" {
+    var h = EchoOnAsk{};
+    var client_handler = QuicIdleClient{};
+    var e2e: E2e(EchoOnAsk, QuicIdleClient) = undefined;
+    try e2e.init(29512, &h, &client_handler);
+    defer e2e.deinit();
+    try testing.expect(!e2e.server.visitsAll());
+
+    const Quiet = struct {
+        fn f(s: *Server(EchoOnAsk)) bool {
+            const m = &s.conn_mgr;
+            if (m.connectionCount() != 1 or m.to_visit.items.len > 0) return false;
+            return m.entries.items[0].conn.isEstablished() and quietEntry(m.entries.items[0]);
+        }
+    };
+    try runUntil(&e2e.loop, &e2e.server, Quiet.f, 10_000);
+    const sconn = e2e.server.conn_mgr.entries.items[0].conn;
+    const cconn = e2e.client.conn;
+    const max_ack_delay: i64 = @intCast(sconn.local_params.max_ack_delay * std.time.ns_per_ms);
+    // The alarm's own timing is pinned on lossy_link_test's virtual clock.
+    // Here a loaded machine may run the timer late.
+    const late = 10 * max_ack_delay;
+    // A skipped packet number leaves a gap, which is acknowledged at once.
+    sconn.pkt_handler.skip_pn = std.math.maxInt(u64);
+    cconn.pkt_handler.skip_pn = std.math.maxInt(u64);
+    // Kept through ACKs, unlike pto_count.
+    const server_pto = sconn.pkt_handler.sent[2].pto_fired_at;
+    const client_pto = cconn.pkt_handler.sent[2].pto_fired_at;
+    var cs = e2e.client.clientSession();
+
+    // Server side: the visit that reads it has nothing to send, so only the
+    // deadline it leaves in the heap brings the ACK, alone.
+    const received = sconn.total_packets_received;
+    const server_sent = sconn.total_packets_sent;
+    try cs.sendDatagram(0, "quiet");
+    try runUntilCount(&e2e.loop, &h.datagrams, 1, 3_000);
+    const server_alarm = sconn.pkt_handler.recv[2].ack_alarm orelse return error.NoAckAlarm;
+    var server_ack = AckWatch{ .conn = sconn };
+    try runUntil(&e2e.loop, &server_ack, AckWatch.sent, 1_000);
+    try testing.expectEqual(received + 1, sconn.total_packets_received);
+    try testing.expectEqual(server_sent + 1, sconn.total_packets_sent);
+    try testing.expect(server_ack.at >= server_alarm);
+    try testing.expect(server_ack.delay() <= late);
+
+    // Client side: the echo carries the server's ACK, and the client owes
+    // one for the echo that only its own timer sends.
+    try runUntil(&e2e.loop, cconn, nothingInFlight, 1_000);
+    const client_received = cconn.total_packets_received;
+    try cs.sendDatagram(0, "echo");
+    const Echoed = struct {
+        fn f(c: *connection.Connection) bool {
+            return c.pkt_handler.recv[2].hasUnackedAckEliciting();
+        }
+    };
+    try runUntil(&e2e.loop, cconn, Echoed.f, 3_000);
+    const client_sent = cconn.total_packets_sent;
+    const client_alarm = cconn.pkt_handler.recv[2].ack_alarm orelse return error.NoAckAlarm;
+    var client_ack = AckWatch{ .conn = cconn };
+    try runUntil(&e2e.loop, &client_ack, AckWatch.sent, 1_000);
+    try testing.expectEqual(client_received + 1, cconn.total_packets_received);
+    try testing.expectEqual(client_sent + 1, cconn.total_packets_sent);
+    try testing.expect(client_ack.at >= client_alarm);
+    try testing.expect(client_ack.delay() <= late);
+
+    // An ACK on time leaves its peer nothing to probe for. A loaded machine
+    // can run the timer past the peer's PTO, so only those are checked.
+    try runUntil(&e2e.loop, sconn, nothingInFlight, 1_000);
+    if (server_ack.delay() <= max_ack_delay) try testing.expectEqual(client_pto, cconn.pkt_handler.sent[2].pto_fired_at);
+    if (client_ack.delay() <= max_ack_delay) try testing.expectEqual(server_pto, sconn.pkt_handler.sent[2].pto_fired_at);
+}
+
+test "e2e: a server's longer max_ack_delay reaches its client, and small packets wait for it" {
+    var h = EchoOnAsk{};
+    var client_handler = QuicIdleClient{};
+    var e2e: E2e(EchoOnAsk, QuicIdleClient) = undefined;
+    try e2e.initServer(29513, &h, &client_handler, .{ .max_ack_delay = 60, .ack_bytes_threshold = 2000 }, null);
+    defer e2e.deinit();
+
+    const Quiet = struct {
+        fn f(s: *Server(EchoOnAsk)) bool {
+            const m = &s.conn_mgr;
+            if (m.connectionCount() != 1 or m.to_visit.items.len > 0) return false;
+            return m.entries.items[0].conn.isEstablished() and quietEntry(m.entries.items[0]);
+        }
+    };
+    try runUntil(&e2e.loop, &e2e.server, Quiet.f, 10_000);
+    const sconn = e2e.server.conn_mgr.entries.items[0].conn;
+    const cconn = e2e.client.conn;
+    const ms: i64 = std.time.ns_per_ms;
+    // The client's PTO allows for it.
+    try testing.expectEqual(@as(u64, 60), cconn.peer_params.?.max_ack_delay);
+    try testing.expectEqual(60 * ms, cconn.pkt_handler.rtt_stats.max_ack_delay);
+    sconn.pkt_handler.skip_pn = std.math.maxInt(u64);
+    cconn.pkt_handler.skip_pn = std.math.maxInt(u64);
+    var cs = e2e.client.clientSession();
+
+    // Two packets would draw an ACK at once; these are too small to.
+    const first = sys.nanoTimestamp();
+    try cs.sendDatagram(0, "one");
+    try runUntilCount(&e2e.loop, &h.datagrams, 1, 3_000);
+    try cs.sendDatagram(0, "two");
+    try runUntilCount(&e2e.loop, &h.datagrams, 2, 3_000);
+    // The alarm's own timing is pinned on lossy_link_test's virtual clock.
+    var server_ack = AckWatch{ .conn = sconn };
+    try runUntil(&e2e.loop, &server_ack, AckWatch.sent, 1_000);
+    try testing.expect(server_ack.at - first > 25 * ms);
+}
+
+test "e2e: a server asks its client for fewer ACKs, unless told not to" {
+    for ([_]bool{ true, false }, [_]u16{ 29514, 29515 }) |request, port| {
+        var h = EchoOnAsk{};
+        var client_handler = QuicIdleClient{};
+        var e2e: E2e(EchoOnAsk, QuicIdleClient) = undefined;
+        try e2e.initServer(port, &h, &client_handler, .{ .request_ack_frequency = request }, null);
+        defer e2e.deinit();
+        const Asked = struct {
+            fn f(c: *Client(QuicIdleClient)) bool {
+                return c.conn.isEstablished() and c.conn.handshake_confirmed;
+            }
+        };
+        try runUntil(&e2e.loop, &e2e.client, Asked.f, 10_000);
+        // The ACK_FREQUENCY rides with HANDSHAKE_DONE.
+        try testing.expectEqual(@as(u32, if (request) 11 else 2), e2e.client.conn.pkt_handler.recv[2].ack_eliciting_threshold);
+    }
+}
+
+test "e2e: a client and server that both offer QUIC v2 finish the handshake in it" {
+    var server_handler = HelloServer{};
+    var client_handler = CheckingClient{};
+    var e2e: E2e(HelloServer, CheckingClient) = undefined;
+    try e2e.initWith(29465, &server_handler, &client_handler, .{ .enable_v2 = true }, .{ .enable_v2 = true });
+    defer e2e.deinit();
+    try runUntil(&e2e.loop, &client_handler, CheckingClient.done, 10_000);
+    try testing.expectEqualStrings("hello", client_handler.body[0..client_handler.received]);
+    try testing.expectEqual(@as(u32, 0x6b3343cf), e2e.client.conn.version);
+}
+
+test "Server: workers sharing a reset key, given or derived, send no resets unless they steer" {
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest; // no SO_REUSEPORT
+    // A packet for one worker's connection can reach another, whose reset
+    // handed the sender that connection's token (RFC 9000 §21.11).
+    var handler = HelloServer{};
+    var shared = try Server(HelloServer).init(testing.allocator, &handler, .{
+        .port = 29462,
+        .reuse_port = true,
+        .static_reset_key = @splat(0x5e),
+        .tls_config = makeTestTlsConfig(),
+    });
+    defer shared.deinit();
+    var own = try Server(HelloServer).init(testing.allocator, &handler, .{
+        .port = 29463,
+        .reuse_port = true,
+        .tls_config = makeTestTlsConfig(),
+    });
+    defer own.deinit();
+    var derived = try Server(HelloServer).init(testing.allocator, &handler, .{
+        .port = 29457,
+        .reuse_port = true,
+        .derive_reset_key = true,
+        .tls_config = makeTestTlsConfig(),
+    });
+    defer derived.deinit();
+    const pk = derived.conn_mgr.tls_config.private_key_bytes;
+    try testing.expectEqual(stateless_reset.deriveKey(pk, 29457), derived.conn_mgr.static_reset_key);
+
+    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    var out: [1500]u8 = undefined;
+    var pkt = [_]u8{0x41} ++ @as([99]u8, @splat(0x22));
+    try testing.expect(shared.conn_mgr.recvDatagram(&pkt, addr, addr, 0, &out) == .dropped);
+    pkt = [_]u8{0x41} ++ @as([99]u8, @splat(0x22));
+    try testing.expect(derived.conn_mgr.recvDatagram(&pkt, addr, addr, 0, &out) == .dropped);
+    pkt = [_]u8{0x41} ++ @as([99]u8, @splat(0x22));
+    try testing.expect(own.conn_mgr.recvDatagram(&pkt, addr, addr, 0, &out) == .send_response);
+}
+
+test "e2e: a flood of datagrams can't keep a server reading" {
+    // The receive loop ran until the socket was empty, so datagrams arriving
+    // as fast as they were read held off every timer and send.
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var handler = HelloServer{};
+    var server = try Server(HelloServer).init(testing.allocator, &handler, .{
+        .port = 29461,
+        .tls_config = makeTestTlsConfig(),
+        .loop = &loop,
+    });
+    defer server.deinit();
+    server.start();
+
+    const fd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    defer sys.close(fd);
+    const to = try net.Address.parseIp4("127.0.0.1", 29461);
+    for (0..max_recv_per_pass + 16) |_| _ = std.c.sendto(fd, "x", 1, 0, &to.any, to.getOsSockLen());
+    sys.sleepNs(20 * std.time.ns_per_ms);
+
+    const Waiting = struct {
+        fn f(srv: *Server(HelloServer)) bool {
+            var peek: [1]u8 = undefined;
+            const dontwait = if (builtin.target.os.tag == .windows) 0 else std.posix.MSG.DONTWAIT;
+            return std.c.recv(srv.sockfd, &peek, 1, std.posix.MSG.PEEK | dontwait) > 0;
+        }
+        fn not(srv: *Server(HelloServer)) bool {
+            return !f(srv);
+        }
+    };
+    try testing.expect(server.recvAllPackets());
+    try testing.expect(Waiting.f(&server));
+    // The rest is read on a pass of its own, with nothing new arriving.
+    try testing.expect(server.wake_armed);
+    try runUntil(&loop, &server, Waiting.not, 5_000);
+
+    server.stop();
+    try runUntil(&loop, &server, Server(HelloServer).isStopped, 5_000);
+}
+
+test "e2e: a client trusts only the system's roots by default, so a self-signed server is refused" {
+    // Nothing anchored the default client's chain, so any certificate with
+    // the right name passed, whoever made it.
+    const test_certs = @import("tls/test_certs.zig");
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var certs: test_certs.TestCerts = undefined;
+    try certs.load();
+    var server_handler = HelloServer{};
+    var server = try Server(HelloServer).init(testing.allocator, &server_handler, .{
+        .port = 29467,
+        .tls_config = .{ .cert_chain_der = &.{}, .private_key_bytes = &.{}, .certs = certs.entries[0..1], .alpn = &.{"h3"} },
+        .loop = &loop,
+    });
+    defer server.deinit();
+    server.start();
+
+    const Over = struct {
+        c: *Client(CheckingClient),
+        h: *CheckingClient,
+        fn f(self: *const @This()) bool {
+            return self.h.finished or self.c.conn.isClosed();
+        }
+    };
+    var refused_handler = CheckingClient{};
+    var refused = try Client(CheckingClient).init(testing.allocator, &refused_handler, .{ .port = 29467, .loop = &loop });
+    defer refused.deinit();
+    refused.start();
+    try runUntil(&loop, &Over{ .c = &refused, .h = &refused_handler }, Over.f, 10_000);
+    try testing.expect(!refused_handler.finished);
+
+    // Pinned, the same certificate is accepted.
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(certs.chains[0][0], &digest, .{});
+    const pins = [_][32]u8{digest};
+    var pinned_handler = CheckingClient{};
+    var pinned = try Client(CheckingClient).init(testing.allocator, &pinned_handler, .{ .port = 29467, .ca = .{ .pinned_hashes = &pins }, .loop = &loop });
+    defer pinned.deinit();
+    pinned.start();
+    try runUntil(&loop, &pinned_handler, CheckingClient.done, 10_000);
+
+    refused.stop();
+    pinned.stop();
+    server.stop();
+    const All = struct {
+        s: *Server(HelloServer),
+        a: *Client(CheckingClient),
+        b: *Client(CheckingClient),
+        fn stopped(self: *const @This()) bool {
+            return self.s.isStopped() and self.a.isStopped() and self.b.isStopped();
+        }
+    };
+    try runUntil(&loop, &All{ .s = &server, .a = &refused, .b = &pinned }, All.stopped, 5000);
+}
+
+/// Serves two clients from 127.0.0.1 in turn under `config`, the first still
+/// connected while the second handshakes, so only the first's finished
+/// handshake, not its removal, can make room. Returns whether the second
+/// answered a Retry.
+fn serveSecondBesideFirst(config: Config) !bool {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var server_handler = HelloServer{};
+    var server_config = config;
+    server_config.tls_config = makeTestTlsConfig();
+    server_config.loop = &loop;
+    var server = try Server(HelloServer).init(testing.allocator, &server_handler, server_config);
+    defer server.deinit();
+    server.start();
+
+    var first_handler = CheckingClient{};
+    var first = try Client(CheckingClient).init(testing.allocator, &first_handler, .{ .port = config.port, .skip_cert_verify = true, .loop = &loop });
+    defer first.deinit();
+    first.start();
+    try runUntil(&loop, &first_handler, CheckingClient.done, 10_000);
+
+    var second_handler = CheckingClient{};
+    var second = try Client(CheckingClient).init(testing.allocator, &second_handler, .{ .port = config.port, .skip_cert_verify = true, .loop = &loop });
+    defer second.deinit();
+    second.start();
+    try runUntil(&loop, &second_handler, CheckingClient.done, 10_000);
+    const retried = second.conn.retry_received;
+
+    first.stop();
+    second.stop();
+    server.stop();
+    const All = struct {
+        s: *Server(HelloServer),
+        a: *Client(CheckingClient),
+        b: *Client(CheckingClient),
+        fn stopped(self: *const @This()) bool {
+            return self.s.isStopped() and self.a.isStopped() and self.b.isStopped();
+        }
+    };
+    try runUntil(&loop, &All{ .s = &server, .a = &first, .b = &second }, All.stopped, 5000);
+    return retried;
+}
+
+test "e2e: a finished handshake gives its place under max_handshakes back" {
+    try testing.expect(!try serveSecondBesideFirst(.{ .port = 29466, .max_handshakes = 1 }));
+}
+
+test "e2e: a finished handshake gives its source its place under max_handshakes_per_source back" {
+    try testing.expect(try serveSecondBesideFirst(.{ .port = 29468, .require_retry = true, .max_handshakes_per_source = 1 }));
+}
+
+test "e2e: a server past retry_threshold makes a client retry, then serves it" {
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var server_handler = HelloServer{};
+    var server = try Server(HelloServer).init(testing.allocator, &server_handler, .{
+        .port = 29435,
+        .tls_config = makeTestTlsConfig(),
+        .retry_threshold = 0,
+        .loop = &loop,
+    });
+    defer server.deinit();
+    server.start();
+
+    var client_handler = CheckingClient{};
+    var client = try Client(CheckingClient).init(testing.allocator, &client_handler, .{
+        .port = 29435,
+        .skip_cert_verify = true,
+        .loop = &loop,
+    });
+    defer client.deinit();
+    client.start();
+
+    try runUntil(&loop, &client_handler, CheckingClient.done, 10_000);
+    try testing.expect(client.conn.retry_received);
+    try testing.expectEqualStrings("hello", client_handler.body[0..client_handler.received]);
+
+    client.stop();
+    server.stop();
+    const Both = struct {
+        s: *Server(HelloServer),
+        c: *Client(CheckingClient),
+        fn stopped(self: *const @This()) bool {
+            return self.s.isStopped() and self.c.isStopped();
+        }
+    };
+    try runUntil(&loop, &Both{ .s = &server, .c = &client }, Both.stopped, 5000);
+}
+
+/// Server ids 1 and 2 under one QUIC-LB config, as a proxy's workers would
+/// share it.
+fn steerLbConfig(server_id: u8) quic_lb.Config {
+    var cfg: quic_lb.Config = .{ .config_id = 1, .server_id_len = 1, .nonce_len = 7, .key = @splat(0x5a) };
+    cfg.server_id[0] = server_id;
+    return cfg;
+}
+
+/// A tiny spin lock: std 0.16 keeps its mutex behind `Io`.
+const SpinLock = struct {
+    held: std.atomic.Value(bool) = .init(false),
+
+    fn lock(self: *SpinLock) void {
+        while (self.held.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *SpinLock) void {
+        self.held.store(false, .release);
+    }
+};
+
+/// One worker of a proxy: a server on its own thread and loop, plus the inbox
+/// its siblings hand datagrams to, drained on its own thread by an Async.
+const SteerWorker = struct {
+    const Handed = struct {
+        buf: [1500]u8,
+        len: usize,
+        peer: posix.sockaddr.storage,
+        local: posix.sockaddr.storage,
+        ecn: u2,
+    };
+
+    server: Server(HelloServer),
+    wakeup: xev.Async,
+    wakeup_c: xev.Completion = .{},
+    thread: std.Thread = undefined,
+
+    lock: SpinLock = .{},
+    inbox: [32]Handed = undefined,
+    head: usize = 0,
+    count: usize = 0,
+    quit: std.atomic.Value(bool) = .init(false),
+
+    /// Owner thread only; read after join.
+    injected: usize = 0,
+    /// Drain at once, on the worker's own thread.
+    drain_first: bool = false,
+
+    fn run(self: *SteerWorker) void {
+        self.server.start();
+        if (self.drain_first) self.server.drain(.{});
+        self.wakeup.wait(self.server.eventLoop(), &self.wakeup_c, SteerWorker, self, onWakeup);
+        self.server.eventLoop().run(.until_done) catch {};
+    }
+
+    fn onWakeup(self_opt: ?*SteerWorker, _: *xev.Loop, _: *xev.Completion, r: xev.Async.WaitError!void) xev.CallbackAction {
+        const self = self_opt.?;
+        _ = r catch return .rearm;
+        var item: Handed = undefined;
+        while (true) {
+            self.lock.lock();
+            if (self.count == 0) {
+                self.lock.unlock();
+                break;
+            }
+            item = self.inbox[self.head];
+            self.head = (self.head + 1) % self.inbox.len;
+            self.count -= 1;
+            self.lock.unlock();
+            self.server.injectDatagram(item.buf[0..item.len], item.peer, item.local, item.ecn);
+            self.injected += 1;
+        }
+        if (self.quit.load(.acquire)) {
+            self.server.stop();
+            return .disarm;
+        }
+        return .rearm;
+    }
+
+    /// Any thread.
+    fn hand(self: *SteerWorker, dg: *const ForeignDatagram) void {
+        if (dg.bytes.len > 1500) return;
+        self.lock.lock();
+        if (self.count < self.inbox.len) {
+            const slot = &self.inbox[(self.head + self.count) % self.inbox.len];
+            @memcpy(slot.buf[0..dg.bytes.len], dg.bytes);
+            slot.len = dg.bytes.len;
+            slot.peer = dg.peer;
+            slot.local = dg.local;
+            slot.ecn = dg.ecn;
+            self.count += 1;
+        }
+        self.lock.unlock();
+        self.wakeup.notify() catch {};
+    }
+};
+
+const SteerRouter = struct {
+    workers: [2]*SteerWorker,
+    forwarded: std.atomic.Value(usize) = .init(0),
+    handed_new: std.atomic.Value(usize) = .init(0),
+
+    /// New connections go to the second worker, the one taking them.
+    fn onNew(ctx: ?*anyopaque, dg: *const ForeignDatagram) bool {
+        const self: *SteerRouter = @ptrCast(@alignCast(ctx.?));
+        _ = self.handed_new.fetchAdd(1, .monotonic);
+        self.workers[1].hand(dg);
+        return true;
+    }
+
+    fn onForeign(ctx: ?*anyopaque, dg: *const ForeignDatagram) void {
+        const self: *SteerRouter = @ptrCast(@alignCast(ctx.?));
+        const id = dg.server_id[0];
+        if (id < 1 or id > self.workers.len) return;
+        _ = self.forwarded.fetchAdd(1, .monotonic);
+        self.workers[id - 1].hand(dg);
+    }
+};
+
+/// Stands in for a NAT between client and servers: relays through one
+/// upstream socket to `first`, then — once `rebound` is set — through a
+/// fresh one to `second`, so the client's packets change both source
+/// address and receiving server.
+const RebindingRelay = struct {
+    front: posix.socket_t,
+    up: [2]posix.socket_t,
+    targets: [2]net.Address,
+    rebound: std.atomic.Value(bool) = .init(false),
+    quit: std.atomic.Value(bool) = .init(false),
+    client: posix.sockaddr.storage = undefined,
+    client_len: posix.socklen_t = 0,
+
+    fn udp(port: u16) !posix.socket_t {
+        const fd = try sys.udpSocket(posix.AF.INET, .{});
+        errdefer sys.close(fd);
+        const addr = try net.Address.parseIp4("127.0.0.1", port);
+        try sys.bind(fd, &addr.any, addr.getOsSockLen());
+        return fd;
+    }
+
+    fn run(self: *RebindingRelay) void {
+        var buf: [2048]u8 = undefined;
+        while (!self.quit.load(.acquire)) {
+            var idle = true;
+            var from: posix.sockaddr.storage = undefined;
+            var from_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+            if (sys.recvfrom(self.front, &buf, 0, @ptrCast(&from), &from_len)) |n| {
+                idle = false;
+                self.client = from;
+                self.client_len = from_len;
+                const i: usize = @intFromBool(self.rebound.load(.acquire));
+                const to = self.targets[i];
+                _ = sys.sendto(self.up[i], buf[0..n], 0, &to.any, to.getOsSockLen()) catch {};
+            } else |_| {}
+            for (self.up) |fd| {
+                if (sys.recvfrom(fd, &buf, 0, null, null)) |n| {
+                    idle = false;
+                    if (self.client_len != 0) {
+                        _ = sys.sendto(self.front, buf[0..n], 0, @ptrCast(&self.client), self.client_len) catch {};
+                    }
+                } else |_| {}
+            }
+            if (idle) sys.sleepNs(50 * std.time.ns_per_us);
+        }
+    }
+};
+
+test "e2e: a migrated peer landing on the wrong worker is steered to its owner" {
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest; // no SO_REUSEPORT
+    const relay_port: u16 = 29430;
+    const ports = [2]u16{ 29431, 29432 };
+
+    var handler = HelloServer{};
+    var router: SteerRouter = .{ .workers = undefined };
+    for (&router.workers, ports, 1..) |*w, port, id| {
+        w.* = try testing.allocator.create(SteerWorker);
+        w.*.* = .{
+            .server = try Server(HelloServer).init(testing.allocator, &handler, .{
+                .port = port,
+                .reuse_port = true,
+                .tls_config = makeTestTlsConfig(),
+                .quic_lb = steerLbConfig(@intCast(id)),
+                .foreign_datagram = .{ .ctx = &router, .func = SteerRouter.onForeign },
+            }),
+            .wakeup = try xev.Async.init(),
+        };
+    }
+    defer for (router.workers) |w| {
+        w.wakeup.deinit();
+        w.server.deinit();
+        testing.allocator.destroy(w);
+    };
+
+    var relay: RebindingRelay = .{
+        .front = try RebindingRelay.udp(relay_port),
+        .up = .{ try RebindingRelay.udp(0), try RebindingRelay.udp(0) },
+        .targets = .{ try net.Address.parseIp4("127.0.0.1", ports[0]), try net.Address.parseIp4("127.0.0.1", ports[1]) },
+    };
+    defer for ([_]posix.socket_t{ relay.front, relay.up[0], relay.up[1] }) |fd| sys.close(fd);
+
+    for (router.workers) |w| w.thread = try std.Thread.spawn(.{}, SteerWorker.run, .{w});
+    const relay_thread = try std.Thread.spawn(.{}, RebindingRelay.run, .{&relay});
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var client_handler = CheckingClient{};
+    var client = try Client(CheckingClient).init(testing.allocator, &client_handler, .{
+        .port = relay_port,
+        .skip_cert_verify = true,
+        .loop = &loop,
+    });
+    client.start();
+
+    const first = runUntil(&loop, &client_handler, CheckingClient.done, 10_000);
+
+    // Rebind: from here on only worker 2 hears the client.
+    relay.rebound.store(true, .release);
+    const second: anyerror!void = if (first) |_| blk: {
+        client_handler.finished = false;
+        client_handler.received = 0;
+        var cs = client.clientSession();
+        client_handler.stream_id = try cs.sendRequest(&get_request, null);
+        break :blk runUntil(&loop, &client_handler, CheckingClient.done, 10_000);
+    } else |err| err;
+
+    client.stop();
+    runUntil(&loop, &client, Client(CheckingClient).isStopped, 5000) catch {};
+    client.deinit();
+    for (router.workers) |w| {
+        w.quit.store(true, .release);
+        w.wakeup.notify() catch {};
+    }
+    for (router.workers) |w| w.thread.join();
+    relay.quit.store(true, .release);
+    relay_thread.join();
+
+    try first;
+    try second;
+    try testing.expectEqualStrings("hello", client_handler.body[0..client_handler.received]);
+    // Worker 1 accepted the connection; worker 2 only ever passed packets on.
+    try testing.expect(router.forwarded.load(.monotonic) > 0);
+    try testing.expectEqual(router.forwarded.load(.monotonic), router.workers[0].injected);
+    try testing.expectEqual(@as(usize, 0), router.workers[1].injected);
+    try testing.expectEqual(@as(usize, 0), router.workers[1].server.conn_mgr.connectionCount());
+}
+
+test "e2e: a draining worker hands a new connection to one taking them" {
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest; // no SO_REUSEPORT
+    const relay_port: u16 = 29440;
+    const ports = [2]u16{ 29442, 29443 };
+
+    var handler = HelloServer{};
+    var router: SteerRouter = .{ .workers = undefined };
+    for (&router.workers, ports, 1..) |*w, port, id| {
+        w.* = try testing.allocator.create(SteerWorker);
+        w.*.* = .{
+            .server = try Server(HelloServer).init(testing.allocator, &handler, .{
+                .port = port,
+                .reuse_port = true,
+                .tls_config = makeTestTlsConfig(),
+                .quic_lb = steerLbConfig(@intCast(id)),
+                .foreign_datagram = .{ .ctx = &router, .func = SteerRouter.onForeign },
+                .new_while_draining = .{ .ctx = &router, .func = SteerRouter.onNew },
+            }),
+            .wakeup = try xev.Async.init(),
+            .drain_first = id == 1,
+        };
+    }
+    defer for (router.workers) |w| {
+        w.wakeup.deinit();
+        w.server.deinit();
+        testing.allocator.destroy(w);
+    };
+
+    // Every client packet reaches the draining worker, as the kernel would
+    // go on sending it a peer's under SO_REUSEPORT; replies from either
+    // worker reach the client from the relay's one address.
+    var relay: RebindingRelay = .{
+        .front = try RebindingRelay.udp(relay_port),
+        .up = .{ try RebindingRelay.udp(0), try RebindingRelay.udp(0) },
+        .targets = .{ try net.Address.parseIp4("127.0.0.1", ports[0]), try net.Address.parseIp4("127.0.0.1", ports[1]) },
+    };
+    defer for ([_]posix.socket_t{ relay.front, relay.up[0], relay.up[1] }) |fd| sys.close(fd);
+
+    for (router.workers) |w| w.thread = try std.Thread.spawn(.{}, SteerWorker.run, .{w});
+    const relay_thread = try std.Thread.spawn(.{}, RebindingRelay.run, .{&relay});
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var client_handler = CheckingClient{};
+    var client = try Client(CheckingClient).init(testing.allocator, &client_handler, .{
+        .port = relay_port,
+        .skip_cert_verify = true,
+        .loop = &loop,
+    });
+    client.start();
+    const got = runUntil(&loop, &client_handler, CheckingClient.done, 10_000);
+
+    client.stop();
+    runUntil(&loop, &client, Client(CheckingClient).isStopped, 5000) catch {};
+    client.deinit();
+    for (router.workers) |w| {
+        w.quit.store(true, .release);
+        w.wakeup.notify() catch {};
+    }
+    for (router.workers) |w| w.thread.join();
+    relay.quit.store(true, .release);
+    relay_thread.join();
+
+    try got;
+    try testing.expectEqualStrings("hello", client_handler.body[0..client_handler.received]);
+    try testing.expect(router.handed_new.load(.monotonic) > 0);
+    // The rest came to the draining worker too, and went on by its ids.
+    try testing.expect(router.forwarded.load(.monotonic) > 0);
+    try testing.expectEqual(router.handed_new.load(.monotonic) + router.forwarded.load(.monotonic), router.workers[1].injected);
+    try testing.expectEqual(@as(usize, 0), router.workers[0].injected);
+    try testing.expectEqual(@as(usize, 0), router.workers[0].server.conn_mgr.connectionCount());
+}
+
+test "client: run() returns once its connection closes on its own" {
+    // Documented to run until the connection closes, it ran until stop(): a
+    // client whose server never answered probed on in run() long after its
+    // connection had timed out.
+    var handler = struct {
+        pub const protocol: Protocol = .quic;
+        pub fn onStreamData(_: *@This(), _: *ClientSession, _: u64, _: []const u8, _: bool) void {}
+    }{};
+    // A peer that reads and never answers.
+    const silent = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    defer sys.close(silent);
+    const at = try net.Address.parseIp4("127.0.0.1", 29477);
+    try sys.bind(silent, &at.any, at.getOsSockLen());
+
+    var client = try Client(@TypeOf(handler)).init(testing.allocator, &handler, .{
+        .port = 29477,
+        .skip_cert_verify = true,
+        .conn_config = .{ .max_idle_timeout = 200 },
+    });
+    defer client.deinit();
+
+    const start = sys.nanoTimestamp();
+    while (!client.own_loop.stopped() and sys.nanoTimestamp() - start < 10 * std.time.ns_per_s) {
+        try client.tick();
+        sys.sleepNs(5 * std.time.ns_per_ms);
+    }
+    try testing.expect(client.conn.isClosed());
+    try testing.expect(client.own_loop.stopped());
+}

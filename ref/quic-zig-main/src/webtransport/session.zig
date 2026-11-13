@@ -1,0 +1,4697 @@
+const std = @import("std");
+const io = @import("../io_compat.zig");
+const sys = @import("../sys.zig");
+
+const quic_connection = @import("../quic/connection.zig");
+const stream_mod = @import("../quic/stream.zig");
+const packet = @import("../quic/packet.zig");
+const h3_conn = @import("../h3/connection.zig");
+const h3_frame = @import("../h3/frame.zig");
+const qpack = @import("../h3/qpack.zig");
+const fc_mod = @import("flow_control.zig");
+
+/// WebTransport stream type prefixes (draft-ietf-webtrans-http3).
+const WT_UNI_STREAM_TYPE: u64 = 0x54;
+const WT_BIDI_STREAM_TYPE: u64 = 0x41;
+
+/// Maximum number of concurrent WebTransport sessions.
+pub const MAX_SESSIONS: usize = 4;
+/// Longest close reason a CLOSE_WEBTRANSPORT_SESSION capsule may carry.
+const max_close_reason = 1024;
+
+/// The longest prefix of `reason` that fits a close capsule. §6 has a sender
+/// that truncates cut at a UTF-8 character boundary: Firefox fails a session
+/// whose reason is not valid UTF-8 rather than report it.
+fn truncateReason(reason: []const u8) []const u8 {
+    if (reason.len <= max_close_reason) return reason;
+    var n: usize = max_close_reason;
+    while (n > 0 and reason[n] & 0xC0 == 0x80) n -= 1; // back off continuation bytes
+    return reason[0..n];
+}
+
+/// WebTransport error codes (draft-ietf-webtrans-http3).
+pub const WEBTRANSPORT_SESSION_GONE: u64 = 0x170d7b68;
+pub const WEBTRANSPORT_BUFFERED_STREAM_REJECTED: u64 = 0x3994bd84;
+/// Streams held for a session not yet established (draft-13 §4.5); past
+/// this many, a stream is reset with WEBTRANSPORT_BUFFERED_STREAM_REJECTED.
+pub const MAX_HELD_STREAMS: usize = 16;
+
+/// WebTransport application error code range for H3 stream resets.
+/// Maps 32-bit app error codes to range starting at 0x52e4a40fa8db,
+/// skipping reserved codepoints of form 0x1f * N + 0x21 (RFC 9114 §8.1).
+pub fn appErrorCodeToH3(error_code: u32) u64 {
+    const base: u64 = 0x52e4a40fa8db;
+    const code: u64 = @intCast(error_code);
+    // For every 0x1e consecutive codes, we skip one reserved codepoint.
+    return base + code + (code / 0x1e);
+}
+
+/// Inverse: extract the 32-bit app error code from an H3 error code.
+pub fn h3ToAppErrorCode(h3_code: u64) ?u32 {
+    const base: u64 = 0x52e4a40fa8db;
+    if (h3_code < base) return null;
+    const diff = h3_code - base;
+    // Check if this falls on a reserved codepoint (0x1f * N + 0x21)
+    if ((h3_code -% 0x21) % 0x1f == 0) return null;
+    // Inverse: code + code/0x1e = diff → code = diff - diff/0x1f
+    const code = diff - (diff / 0x1f);
+    if (code > 0xffffffff) return null;
+    // Verify round-trip
+    if (appErrorCodeToH3(@intCast(code)) != h3_code) return null;
+    return @intCast(code);
+}
+
+/// A capsule with a longer payload than this is skipped rather than buffered:
+/// the peer chooses Length, and holding on to whatever it names would let it
+/// name 2^62. The largest we parse is WT_CLOSE_SESSION, whose reason §6 caps at
+/// 1024 bytes.
+const MAX_CAPSULE_PAYLOAD: u64 = 4096;
+
+/// The type and payload length at the front of a capsule, without needing the
+/// payload itself to have arrived.
+fn peekCapsuleHeader(data: []const u8) ?struct { frame_type: u64, length: u64, header_len: usize } {
+    var fbs = io.fixedBufferStream(data);
+    const frame_type = packet.readVarInt(&fbs) catch return null;
+    const length = packet.readVarInt(&fbs) catch return null;
+    return .{ .frame_type = frame_type, .length = length, .header_len = fbs.seek };
+}
+
+/// WebTransport session state.
+pub const SessionState = enum {
+    connecting,
+    active,
+    /// We closed it: our WT_CLOSE_SESSION and FIN are out. It is reported
+    /// once the peer ends its side of the CONNECT stream.
+    draining,
+    /// The peer closed it with WT_CLOSE_SESSION, and it has been reported.
+    /// The CONNECT stream is still read up to the peer's FIN, so bytes after
+    /// the capsule can be refused with H3_MESSAGE_ERROR (§6).
+    awaiting_fin,
+    closed,
+};
+
+/// A WebTransport session (maps to a single CONNECT stream).
+pub const Session = struct {
+    session_id: u64 = 0, // = CONNECT stream ID
+    state: SessionState = .closed,
+    occupied: bool = false,
+    close_error_code: u32 = 0,
+    /// Our close's reason or the peer's, at most `max_close_reason` bytes.
+    /// Kept until the slot is next taken: the session_closed event that
+    /// reports it points here.
+    close_reason: []u8 = &.{},
+    /// Bytes still to discard from an over-long capsule; see MAX_CAPSULE_PAYLOAD.
+    capsule_skip: u64 = 0,
+    /// The peer asked for a drain (§4.7): by WT_DRAIN_SESSION, by GOAWAY,
+    /// and whether `session_draining` has said so, once whichever came.
+    drain_by_capsule: bool = false,
+    drain_by_goaway: bool = false,
+    drain_reported: bool = false,
+    /// We sent WT_DRAIN_SESSION: once is all §4.7 asks.
+    drain_sent: bool = false,
+    /// draft-13 §5.3-§5.6 session flow control, sized by `allocateSession`
+    /// from the connection's grant. An unallocated slot grants nothing.
+    fc: fc_mod.SessionFlowControl = fc_mod.SessionFlowControl.init(.{}),
+};
+
+/// Events returned by WebTransportConnection.poll().
+pub const WtEvent = union(enum) {
+    session_ready: struct { session_id: u64, headers: []const qpack.Header = &.{} },
+    /// Client: the server refused the session. `status` is its final status,
+    /// or empty when it reset the CONNECT stream, or ended it, unanswered,
+    /// or the connection ended first.
+    session_rejected: struct { session_id: u64, status: []const u8 },
+    connect_request: struct { session_id: u64, protocol: []const u8, authority: []const u8, path: []const u8, headers: []const qpack.Header = &.{} },
+    bidi_stream: struct { session_id: u64, stream_id: u64 },
+    uni_stream: struct { session_id: u64, stream_id: u64 },
+    stream_data: struct { stream_id: u64, data: []const u8, fin: bool = false },
+    datagram: struct { session_id: u64, data: []const u8 },
+    /// The session is over (draft-ietf-webtrans-http3 §6), and its streams
+    /// have been reset with WEBTRANSPORT_SESSION_GONE.
+    ///
+    /// A close we started reports our own code and reason. One the peer
+    /// started reports its WT_CLOSE_SESSION, or code 0 and an empty reason
+    /// for a bare FIN on the CONNECT stream, which §6 makes the same thing.
+    ///
+    /// `abrupt` is set when the peer reset or stopped the CONNECT stream, or
+    /// sent a malformed capsule, instead of closing it, or the connection
+    /// ended under a session neither side had closed: code and reason are
+    /// then 0 and empty. A browser tells the two apart the same way, resolving
+    /// `closed` on a clean close and rejecting it on an abrupt one. A session
+    /// we had closed reports our close however its end comes.
+    ///
+    /// Each session is reported once, by its own id. On a server that is one
+    /// it offered as `connect_request`, accepted or not yet answered.
+    session_closed: struct { session_id: u64, error_code: u32, reason: []const u8, abrupt: bool = false },
+    session_draining: struct { session_id: u64 },
+    /// The peer reset its send side: no more data is coming on this stream.
+    /// Mirrors the browser rejecting the ReadableStream with a
+    /// WebTransportError carrying `streamErrorCode`.
+    stream_reset: struct { session_id: u64, stream_id: u64, error_code: u32 },
+    /// The peer asked us to stop sending. Mirrors the browser rejecting the
+    /// WritableStream with a WebTransportError.
+    stream_stop_sending: struct { session_id: u64, stream_id: u64, error_code: u32 },
+    /// A `notifyWritable` wait was met: the peer's credit now admits the bytes
+    /// asked for, on the stream or, with `stream_id` null, anywhere in the
+    /// session. Mirrors a browser's `writer.ready` resolving.
+    ///
+    /// For an ordinary HTTP/3 request stream (see `request`) waited on through
+    /// `H3Connection.notifyWritable`, both fields carry the stream's id.
+    writable: struct { session_id: u64, stream_id: ?u64 },
+    /// Server: an ordinary HTTP/3 request on this connection — anything but an
+    /// Extended CONNECT for `webtransport`. Answer it through the H3
+    /// connection's response methods, as on a plain HTTP/3 server.
+    request: struct { stream_id: u64, headers: []const qpack.Header },
+    /// Server: request body bytes, valid until the next poll.
+    request_data: struct { stream_id: u64, data: []const u8 },
+    /// Server: the request body is complete.
+    request_end: u64,
+    /// Server: the peer abandoned the request; see `H3Event.request_cancelled`.
+    request_cancelled: struct { stream_id: u64, error_code: u64 },
+};
+
+/// Which halves of a stream have already reported a peer-side abort, so each
+/// one surfaces exactly once.
+const ResetDelivery = struct {
+    reset: bool = false,
+    stop_sending: bool = false,
+};
+
+/// A `notifyWritable` request waiting on the peer's credit.
+const WritableWait = struct {
+    session_id: u64,
+    stream_id: ?u64,
+    min_bytes: u64,
+};
+
+/// Per-stream send statistics (matches browser WebTransportSendStream.getStats()).
+pub const SendStreamStats = struct {
+    bytes_written: u64,
+    bytes_sent: u64,
+    bytes_acknowledged: u64,
+};
+
+/// Per-stream receive statistics (matches browser WebTransportReceiveStream.getStats()).
+pub const RecvStreamStats = struct {
+    bytes_received: u64,
+    bytes_read: u64,
+};
+
+/// WebTransport connection wrapping H3Connection + QUIC Connection.
+pub const WebTransportConnection = struct {
+    h3: *h3_conn.H3Connection,
+    quic: *quic_connection.Connection,
+    is_server: bool,
+    sessions: [MAX_SESSIONS]Session = @splat(Session{}),
+    active_session_count: u32 = 0,
+    /// A session was asked for on this connection, accepted or not: see
+    /// `closeIfUnused`.
+    carried_session: bool = false,
+    /// Streams registered for a session not yet established: kept from the
+    /// application, their data left unread, until it is (draft-13 §4.5).
+    held_streams: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    // Track which bidi/uni streams belong to WT sessions
+    // Key: stream_id -> session_id
+    wt_bidi_streams: std.AutoHashMap(u64, u64),
+    wt_uni_streams: std.AutoHashMap(u64, u64),
+
+    // Next peer-initiated bidi stream ID to examine for WT type prefix.
+    // Peer-initiated bidi IDs are sequential: server sees 0, 4, 8, 12...
+    // This counter advances as streams are identified, giving O(1) discovery
+    // per new stream — same pattern as quic-go's nextStreamToAccept.
+    next_peer_bidi_to_examine: u64 = 0,
+
+    // Buffered data for WT streams (data after type prefix, or data read before poll)
+    stream_bufs: std.AutoHashMap(u64, std.ArrayList(u8)),
+
+    // Streams that have already delivered their FIN event (prevents repeated fin events)
+    fin_delivered: std.AutoHashMap(u64, void),
+
+    // Streams that have already reported a peer RESET_STREAM / STOP_SENDING.
+    reset_delivered: std.AutoHashMap(u64, ResetDelivery),
+
+    /// Streams of ended sessions that QUIC still holds, so a write to one
+    /// says why it fails. Dropped as QUIC reclaims them.
+    gone_streams: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    /// Streams the application paused; see `pauseStream`.
+    paused_streams: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    /// Outstanding `notifyWritable` requests; few, and re-checked every poll.
+    writable_waits: std.ArrayList(WritableWait) = .empty,
+
+    /// Backs `request_data` slices; reused, so they last until the next poll.
+    request_body: std.ArrayList(u8) = .empty,
+
+    /// The draft-13 §5.6 window each session grants its peer. Separate from
+    /// `h3.local_settings`, which only decides whether the same numbers are
+    /// *also* announced in SETTINGS — one shipping browser refuses a session
+    /// that sees those identifiers, and the capsule reaches everyone anyway.
+    grants: fc_mod.Credits = .{},
+
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, h3: *h3_conn.H3Connection, quic: *quic_connection.Connection, is_server: bool) WebTransportConnection {
+        h3.defer_peer_bidi = true; // see identifyWtBidiStreams
+        return .{
+            .h3 = h3,
+            .quic = quic,
+            .is_server = is_server,
+            .wt_bidi_streams = std.AutoHashMap(u64, u64).init(allocator),
+            .wt_uni_streams = std.AutoHashMap(u64, u64).init(allocator),
+            .stream_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(allocator),
+            .fin_delivered = std.AutoHashMap(u64, void).init(allocator),
+            .reset_delivered = std.AutoHashMap(u64, ResetDelivery).init(allocator),
+            // Peer-initiated bidi stream IDs: server examines 0, 4, 8...
+            // client examines 1, 5, 9... (RFC 9000 §2.1)
+            .next_peer_bidi_to_examine = if (is_server) 0 else 1,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *WebTransportConnection) void {
+        for (&self.sessions) |*s| self.allocator.free(s.close_reason);
+        // Free all buffered stream data
+        var buf_it = self.stream_bufs.iterator();
+        while (buf_it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.stream_bufs.deinit();
+        self.held_streams.deinit(self.allocator);
+        self.fin_delivered.deinit();
+        self.reset_delivered.deinit();
+        self.writable_waits.deinit(self.allocator);
+        self.request_body.deinit(self.allocator);
+        self.paused_streams.deinit(self.allocator);
+        self.gone_streams.deinit(self.allocator);
+        self.wt_bidi_streams.deinit();
+        self.wt_uni_streams.deinit();
+    }
+
+    /// Find a session by ID.
+    pub fn getSession(self: *WebTransportConnection, session_id: u64) ?*Session {
+        for (&self.sessions) |*s| {
+            if (s.occupied and s.session_id == session_id) return s;
+        }
+        return null;
+    }
+
+    /// Whether datagrams and streams for `session_id` may reach the application.
+    pub fn sessionActive(self: *WebTransportConnection, session_id: u64) bool {
+        const s = self.getSession(session_id) orelse return false;
+        return s.state == .active;
+    }
+
+    /// The session `session_id` names while it may still carry new streams
+    /// and datagrams: from its CONNECT, which draft-16 §4 lets both sides use
+    /// before the 200, until it is terminated. §6 forbids both after a close
+    /// sent or received, or once the CONNECT stream has ended.
+    fn liveSession(self: *WebTransportConnection, session_id: u64) error{SessionGone}!*Session {
+        const s = self.getSession(session_id) orelse return error.SessionGone;
+        return switch (s.state) {
+            .connecting, .active => s,
+            .draining, .awaiting_fin, .closed => error.SessionGone,
+        };
+    }
+
+    /// Allocate a session slot.
+    fn allocateSession(self: *WebTransportConnection, session_id: u64, state: SessionState) ?*Session {
+        for (&self.sessions) |*s| {
+            if (!s.occupied) {
+                self.carried_session = true;
+                self.allocator.free(s.close_reason);
+                s.* = .{
+                    .session_id = session_id,
+                    .state = state,
+                    .occupied = true,
+                    .fc = fc_mod.SessionFlowControl.init(self.grants),
+                };
+                // The peer's own credit, if its SETTINGS have landed. A client
+                // can send CONNECT before they do, which §5.1 allows for: what
+                // is unknown stays unlimited.
+                self.applyPeerCredit(&s.fc);
+                return s;
+            }
+        }
+        return null; // All slots full
+    }
+
+    /// draft-13 §5.1: session flow control binds only when both endpoints
+    /// advertise WT_MAX_SESSIONS above one. Until then a peer may not have seen
+    /// our SETTINGS, so its capsules mean nothing and MUST be ignored — and,
+    /// more to the point, a peer that never sent the setting (Chrome, quic-go,
+    /// our own client) must not be read as granting us a limit of zero.
+    fn flowControlEnabled(self: *const WebTransportConnection) bool {
+        const local = self.h3.local_settings.wt_max_sessions_v13 orelse 0;
+        const peer = self.h3.peer_settings.wt_max_sessions_v13 orelse 0;
+        return local > 1 and peer > 1;
+    }
+
+    /// Whether to spend capsules granting this peer credit. Deliberately wider
+    /// than `flowControlEnabled`: §5.1 gates flow control on *both* sides
+    /// advertising more than one session, and a peer reading that gate as "the
+    /// server said more than one" waits for a credit we would otherwise never
+    /// send. A capsule the peer must ignore costs a dozen bytes on the CONNECT
+    /// stream; the deadlock costs every client-initiated stream.
+    fn grantsCredit(self: *const WebTransportConnection) bool {
+        return self.h3.peer_settings.wt_max_sessions_v13 != null;
+    }
+
+    /// §5.5 initial limits from the peer's SETTINGS. Idempotent: a
+    /// capsule-raised limit outranks a setting, so this can be re-applied when
+    /// SETTINGS arrive after the session did.
+    fn applyPeerCredit(self: *const WebTransportConnection, fc: *fc_mod.SessionFlowControl) void {
+        if (!self.h3.peer_settings_received or !self.flowControlEnabled()) return;
+        fc.applyPeerSettings(
+            self.h3.peer_settings.wt_initial_max_streams_bidi,
+            self.h3.peer_settings.wt_initial_max_streams_uni,
+            self.h3.peer_settings.wt_initial_max_data,
+        );
+    }
+
+    /// Take one stream of §5.6.2 credit, or refuse and ask the peer for more.
+    fn spendStreamCredit(limit: *fc_mod.StreamLimit) !void {
+        if (limit.canOpen()) return;
+        limit.recordBlocked();
+        return error.WtStreamLimitReached;
+    }
+
+    /// The session whose §5.6 limits bind this stream, or null when session
+    /// flow control is not in force — the common case, and the cheap exit.
+    fn limitedSessionForStream(self: *WebTransportConnection, stream_id: u64) ?*Session {
+        if (!self.flowControlEnabled()) return null;
+        // RFC 9000 §2.1 puts the direction in bit 1, so only one map can hold it.
+        const streams = if (stream_id & 0x2 != 0) &self.wt_uni_streams else &self.wt_bidi_streams;
+        return self.getSession(streams.get(stream_id) orelse return null);
+    }
+
+    /// As above, for a session we already have the id of.
+    fn limitedSession(self: *WebTransportConnection, session_id: u64) ?*Session {
+        if (!self.flowControlEnabled()) return null;
+        return self.getSession(session_id);
+    }
+
+    /// Get the peer's maximum allowed sessions from negotiated settings.
+    fn peerMaxSessions(self: *WebTransportConnection) u64 {
+        return self.h3.peer_settings.webtransport_max_sessions orelse 1;
+    }
+
+    /// Client: initiate a WebTransport session via Extended CONNECT.
+    pub fn connect(self: *WebTransportConnection, authority: []const u8, path: []const u8) !u64 {
+        // Enforce peer's session limit
+        if (self.active_session_count >= self.peerMaxSessions()) return error.TooManySessions;
+        const session_id = try self.h3.sendConnectRequest("webtransport", authority, path);
+        _ = self.allocateSession(session_id, .connecting) orelse return error.TooManySessions;
+        self.active_session_count += 1;
+        return session_id;
+    }
+
+    /// Client: initiate a WebTransport session with extra headers (e.g. sec-webtransport-protocol).
+    pub fn connectWithHeaders(self: *WebTransportConnection, authority: []const u8, path: []const u8, extra_headers: []const qpack.Header) !u64 {
+        if (self.active_session_count >= self.peerMaxSessions()) return error.TooManySessions;
+        const session_id = try self.h3.sendConnectRequestWithHeaders("webtransport", authority, path, extra_headers);
+        _ = self.allocateSession(session_id, .connecting) orelse return error.TooManySessions;
+        self.active_session_count += 1;
+        return session_id;
+    }
+
+    /// Server: accept a WebTransport session (send 200 response).
+    pub fn acceptSession(self: *WebTransportConnection, session_id: u64) !void {
+        return self.acceptSessionWithHeaders(session_id, &.{});
+    }
+
+    /// Server: accept a WebTransport session with extra response headers (e.g., sub-protocol).
+    /// Fails with `error.SessionNotPending` for a session that is not waiting
+    /// on an answer: already accepted, refused, withdrawn by the peer, or
+    /// never offered (a CONNECT past the session slots never is).
+    pub fn acceptSessionWithHeaders(self: *WebTransportConnection, session_id: u64, extra_headers: []const qpack.Header) !void {
+        const s = self.getSession(session_id) orelse return error.SessionNotPending;
+        if (!self.is_server or s.state != .connecting) return error.SessionNotPending;
+        try self.h3.sendConnectResponseWithHeaders(session_id, "200", extra_headers);
+        s.state = .active;
+        // Accepted after our GOAWAY: it drains like the rest.
+        if (self.h3.shutdown_state != .active) self.drainSession(session_id) catch {};
+    }
+
+    /// Server: refuse a session the peer asked for, one not yet accepted,
+    /// by answering its CONNECT with `status` — any final status outside
+    /// 2xx, from 300 to 599 — and ending the stream. The peer sees the
+    /// session rejected (a browser's `ready` rejects); every other session
+    /// on the connection carries on. Streams the peer opened for it are
+    /// refused with WEBTRANSPORT_SESSION_GONE on the next poll.
+    ///
+    /// This is how a server says no. A session never accepted has no
+    /// response for a close capsule to follow, and a capsule before the
+    /// response HEADERS is H3_FRAME_UNEXPECTED, which ends the whole
+    /// connection (RFC 9114 §4.1). `closeSession` on such a session
+    /// refuses it with 403.
+    ///
+    /// Fails with `error.InvalidStatus` for a status outside 300–599 and
+    /// `error.SessionNotPending` for a session already accepted, closed or
+    /// unknown, or on a client.
+    pub fn rejectSession(self: *WebTransportConnection, session_id: u64, status: u16) !void {
+        if (status < 300 or status > 599) return error.InvalidStatus;
+        const s = self.getSession(session_id) orelse return error.SessionNotPending;
+        if (!self.is_server or s.state != .connecting) return error.SessionNotPending;
+        // The slot goes either way: a CONNECT we could not answer is no session.
+        defer self.finalizeSession(s);
+        var digits: [3]u8 = undefined;
+        _ = std.fmt.bufPrint(&digits, "{d}", .{status}) catch unreachable;
+        try self.h3.sendConnectResponse(session_id, &digits);
+        const stream = self.quic.streams.getStream(session_id) orelse return;
+        stream.send.close();
+        // RFC 9114 §4.1: the rest of the request is not wanted.
+        stream.recv.stopSending(@backingInt(h3_conn.H3Error.no_error));
+    }
+
+    /// Open a WT bidirectional stream: write type prefix 0x41 + session_id varint.
+    /// Fails with `error.SessionGone` once the session is closed, by either
+    /// side, or when there is no such session; with `error.WtStreamLimitReached`
+    /// when its §5.6.2 credit is spent, and a WT_STREAMS_BLOCKED then asks the
+    /// peer for more.
+    pub fn openBidiStream(self: *WebTransportConnection, session_id: u64, send_order: ?i64) !u64 {
+        const live = try self.liveSession(session_id);
+        const session = if (self.flowControlEnabled()) live else null;
+        if (session) |sess| try spendStreamCredit(&sess.fc.bidi);
+        const stream = try self.quic.openStream();
+        const stream_id = stream.stream_id;
+        stream.send.send_order = send_order;
+        // WT streams have no defined inter-stream ordering; round-robin
+        // interleaving is the correct scheduling (also the quicperf path).
+        stream.send.incremental = true;
+
+        // Write WT bidi stream type prefix
+        var prefix_buf: [16]u8 = undefined;
+        var fbs = io.fixedBufferStream(&prefix_buf);
+        const w = &fbs;
+        try packet.writeVarInt(w, WT_BIDI_STREAM_TYPE);
+        try packet.writeVarInt(w, session_id);
+        try stream.send.writeData(fbs.buffered());
+
+        try self.wt_bidi_streams.put(stream_id, session_id);
+        // The peer's side of it is WT data, never a response for H3 to parse.
+        try self.h3.excluded_streams.put(stream_id, {});
+        if (session) |sess| sess.fc.bidi.open();
+        return stream_id;
+    }
+
+    /// Open a WT unidirectional stream: write type prefix 0x54 + session_id varint.
+    /// Fails as `openBidiStream` does.
+    pub fn openUniStream(self: *WebTransportConnection, session_id: u64, send_order: ?i64) !u64 {
+        const live = try self.liveSession(session_id);
+        const session = if (self.flowControlEnabled()) live else null;
+        if (session) |sess| try spendStreamCredit(&sess.fc.uni);
+        const send_stream = try self.quic.openUniStream();
+        const stream_id = send_stream.stream_id;
+        send_stream.send_order = send_order;
+        // WT streams have no defined inter-stream ordering; round-robin
+        // interleaving is the correct scheduling (also the quicperf path).
+        send_stream.incremental = true;
+
+        // Write WT uni stream type prefix
+        var prefix_buf: [16]u8 = undefined;
+        var fbs = io.fixedBufferStream(&prefix_buf);
+        const w = &fbs;
+        try packet.writeVarInt(w, WT_UNI_STREAM_TYPE);
+        try packet.writeVarInt(w, session_id);
+        try send_stream.writeData(fbs.buffered());
+
+        try self.wt_uni_streams.put(stream_id, session_id);
+        if (session) |sess| sess.fc.uni.open();
+        return stream_id;
+    }
+
+    /// Dynamically update the sendOrder on a stream. Higher values transmitted first.
+    pub fn setSendOrder(self: *WebTransportConnection, stream_id: u64, send_order: ?i64) void {
+        if (self.quic.streams.getStream(stream_id)) |stream| {
+            stream.send.send_order = send_order;
+            return;
+        }
+        if (self.quic.streams.send_streams.get(stream_id)) |send_stream| {
+            send_stream.send_order = send_order;
+        }
+    }
+
+    /// Send data on a WT stream.
+    /// Fails with `error.SessionGone` once the stream's session has ended,
+    /// which reset the stream (§6), and `error.StreamNotFound` for any other
+    /// stream that is not a WebTransport stream we send on; with
+    /// `error.WtDataLimitReached` when the write would exceed the session's
+    /// §5.6.4 credit, and a WT_DATA_BLOCKED then asks the peer for more.
+    pub fn sendStreamData(self: *WebTransportConnection, stream_id: u64, data: []const u8) !void {
+        if (!self.wt_bidi_streams.contains(stream_id) and !self.wt_uni_streams.contains(stream_id)) {
+            return if (self.gone_streams.contains(stream_id)) error.SessionGone else error.StreamNotFound;
+        }
+        const session = self.limitedSessionForStream(stream_id);
+        if (session) |sess| {
+            if (!sess.fc.canSend(data.len)) {
+                sess.fc.recordSendBlocked();
+                return error.WtDataLimitReached;
+            }
+        }
+
+        // A bidi stream we own, or a uni send stream.
+        if (self.quic.streams.getStream(stream_id)) |stream| {
+            try stream.send.writeData(data);
+        } else if (self.quic.streams.send_streams.get(stream_id)) |send_stream| {
+            try send_stream.writeData(data);
+        } else {
+            return error.StreamNotFound;
+        }
+
+        if (session) |sess| sess.fc.recordSent(data.len);
+    }
+
+    /// Close a WT stream with FIN. A stream of an ended session is left as
+    /// §6 left it.
+    pub fn closeStream(self: *WebTransportConnection, stream_id: u64) void {
+        if (self.gone_streams.contains(stream_id)) return;
+        if (self.quic.streams.getStream(stream_id)) |stream| {
+            stream.send.close();
+            return;
+        }
+        if (self.quic.streams.send_streams.get(stream_id)) |send_stream| {
+            send_stream.close();
+        }
+    }
+
+    /// Bytes session `session_id` can still write, over its streams old and
+    /// new, before the peer's credit is spent: QUIC's MAX_DATA, narrowed by the
+    /// session's WT_MAX_DATA where draft-13 flow control is in force. Advisory
+    /// like `Connection.sendCapacity`, except that a write past WT_MAX_DATA is
+    /// refused rather than buffered.
+    ///
+    /// This is a browser `WritableStream`'s `desiredSize`, measured against
+    /// the peer instead of a local high-water mark.
+    pub fn sendCapacity(self: *WebTransportConnection, session_id: u64) u64 {
+        const quic_cap = self.quic.sendCapacity();
+        const sess = self.limitedSession(session_id) orelse return quic_cap;
+        return @min(quic_cap, sess.fc.sendCredit());
+    }
+
+    /// `sendCapacity` narrowed by the stream's own MAX_STREAM_DATA. Null for a
+    /// stream we cannot send on; zero once it is reset or its FIN is queued.
+    pub fn streamSendCapacity(self: *WebTransportConnection, stream_id: u64) ?u64 {
+        const quic_cap = self.quic.streamSendCapacity(stream_id) orelse return null;
+        const sess = self.limitedSessionForStream(stream_id) orelse return quic_cap;
+        return @min(quic_cap, sess.fc.sendCredit());
+    }
+
+    /// Ask for one `writable` event once `min_bytes` fit: on `stream_id`, or
+    /// anywhere in the session when it is null. The session form is for an
+    /// application that opens a stream per message and so has none to wait on.
+    ///
+    /// Checked every poll, so a wait that is already met fires on the next
+    /// one. A second call for the same target replaces the first. A wait on a
+    /// stream that is reset, finished or gone, or on a session that has ended,
+    /// is dropped without an event — `stream_stop_sending` and `session_closed`
+    /// say why. A `min_bytes` larger than the peer's window never fires.
+    pub fn notifyWritable(self: *WebTransportConnection, session_id: u64, stream_id: ?u64, min_bytes: u64) !void {
+        const wait: WritableWait = .{
+            .session_id = session_id,
+            .stream_id = stream_id,
+            .min_bytes = @max(min_bytes, 1),
+        };
+        for (self.writable_waits.items) |*w| {
+            if (w.session_id == session_id and std.meta.eql(w.stream_id, stream_id)) {
+                w.* = wait;
+                return;
+            }
+        }
+        try self.writable_waits.append(self.allocator, wait);
+    }
+
+    /// Send a QUIC DATAGRAM carrying WT session data.
+    /// Format: quarter_stream_id (varint) + payload. Fails with
+    /// `error.SessionGone` as `openBidiStream` does.
+    pub fn sendDatagram(self: *WebTransportConnection, session_id: u64, data: []const u8) !void {
+        _ = try self.liveSession(session_id);
+        var quarter_id: [8]u8 = undefined;
+        var fbs = io.fixedBufferStream(&quarter_id);
+        try packet.writeVarInt(&fbs, session_id / 4);
+        try self.quic.sendDatagramParts(&.{ fbs.buffered(), data });
+    }
+
+    /// Returns connection-level statistics (matches browser WebTransport.getStats()).
+    pub fn getStats(self: *const WebTransportConnection) quic_connection.Connection.Stats {
+        return self.quic.getStats();
+    }
+
+    /// Get per-stream send statistics (bytesWritten, bytesSent, bytesAcknowledged).
+    pub fn getSendStreamStats(self: *const WebTransportConnection, stream_id: u64) ?SendStreamStats {
+        if (self.quic.streams.getStream(stream_id)) |stream| {
+            return .{
+                .bytes_written = stream.send.write_offset,
+                .bytes_sent = stream.send.send_offset,
+                .bytes_acknowledged = stream.send.ack_offset,
+            };
+        }
+        if (self.quic.streams.send_streams.get(stream_id)) |send_stream| {
+            return .{
+                .bytes_written = send_stream.write_offset,
+                .bytes_sent = send_stream.send_offset,
+                .bytes_acknowledged = send_stream.ack_offset,
+            };
+        }
+        return null;
+    }
+
+    /// Get per-stream receive statistics (bytesReceived, bytesRead).
+    pub fn getRecvStreamStats(self: *const WebTransportConnection, stream_id: u64) ?RecvStreamStats {
+        if (self.quic.streams.getStream(stream_id)) |stream| {
+            return .{
+                .bytes_received = stream.recv.sorter.highestReceived(),
+                .bytes_read = stream.recv.bytes_read,
+            };
+        }
+        if (self.quic.streams.recv_streams.get(stream_id)) |recv_stream| {
+            return .{
+                .bytes_received = recv_stream.sorter.highestReceived(),
+                .bytes_read = recv_stream.bytes_read,
+            };
+        }
+        return null;
+    }
+
+    /// Set max age for incoming datagrams (milliseconds). null = no limit.
+    pub fn setIncomingDatagramMaxAge(self: *WebTransportConnection, max_age_ms: ?u64) void {
+        self.quic.setIncomingDatagramMaxAge(max_age_ms);
+    }
+
+    /// Set max age for outgoing datagrams (milliseconds). null = the default,
+    /// max(1.25 × min RTT, 20 ms); see `Connection.setOutgoingDatagramMaxAge`.
+    pub fn setOutgoingDatagramMaxAge(self: *WebTransportConnection, max_age_ms: ?u64) void {
+        self.quic.setOutgoingDatagramMaxAge(max_age_ms);
+    }
+
+    /// Set high water mark for incoming datagram queue (count).
+    pub fn setIncomingDatagramHighWaterMark(self: *WebTransportConnection, count: usize) void {
+        self.quic.setIncomingDatagramHighWaterMark(count);
+    }
+
+    /// Set high water mark for outgoing datagram queue (count).
+    pub fn setOutgoingDatagramHighWaterMark(self: *WebTransportConnection, count: usize) void {
+        self.quic.setOutgoingDatagramHighWaterMark(count);
+    }
+
+    /// Returns true if the datagram send queue is full.
+    pub fn isDatagramSendQueueFull(self: *const WebTransportConnection) bool {
+        return self.quic.isDatagramSendQueueFull();
+    }
+
+    /// Returns the maximum WT datagram payload size, subtracting the
+    /// quarter_stream_id varint overhead from the QUIC-level budget.
+    pub fn maxDatagramPayloadSize(self: *const WebTransportConnection, session_id: u64) ?usize {
+        const quic_max = self.quic.maxDatagramPayloadSize() orelse return null;
+        const quarter_id = session_id / 4;
+        const varint_len = packet.varIntLength(quarter_id);
+        if (varint_len >= quic_max) return null;
+        return quic_max - varint_len;
+    }
+
+    /// Write a capsule onto a session's CONNECT stream.
+    ///
+    /// RFC 9297 §3.2: the capsule stream is the HTTP message content, and in
+    /// HTTP/3 content travels in DATA frames — so the capsule is wrapped, not
+    /// written bare. A bare capsule reaches the peer as an unknown H3 frame
+    /// type, which RFC 9114 §9 tells it to ignore: the session then ends on the
+    /// FIN alone and the close code is lost.
+    fn writeCapsule(self: *WebTransportConnection, session_id: u64, capsule: []const u8) void {
+        const stream = self.quic.streams.getStream(session_id) orelse return;
+        var hdr_buf: [16]u8 = undefined;
+        var hdr = io.fixedBufferStream(&hdr_buf);
+        packet.writeVarInt(&hdr, @backingInt(h3_frame.H3FrameType.data)) catch return;
+        packet.writeVarInt(&hdr, capsule.len) catch return;
+        stream.send.writeData(hdr.buffered()) catch return;
+        stream.send.writeData(capsule) catch {};
+    }
+
+    /// Close a WebTransport session with error code 0 and no reason.
+    pub fn closeSession(self: *WebTransportConnection, session_id: u64) void {
+        self.closeSessionWithError(session_id, 0, "") catch {};
+    }
+
+    /// Close a WebTransport session with an application error code and reason.
+    /// Sends CLOSE_WEBTRANSPORT_SESSION capsule on the CONNECT stream, then FIN.
+    /// `reason` is UTF-8, cut to 1024 bytes at a character boundary per spec.
+    ///
+    /// The session's streams are reset (§6), a FIN already sent included, and
+    /// the peer stops reading its own copies when the close reaches it, so a
+    /// last message cannot ride out on a close. Write it and FIN its stream,
+    /// and let the side that has read it end the session.
+    ///
+    /// Nothing else follows on the CONNECT stream: no STOP_SENDING until the
+    /// peer's FIN, which Chrome and Firefox both turn into an abrupt close
+    /// that loses the code. For the same reason, an application closing the
+    /// connection too should wait for `session_closed`, which comes with the
+    /// peer's FIN.
+    ///
+    /// A server's session not yet accepted is refused instead, as
+    /// `rejectSession(session_id, 403)` would: the code and reason have no
+    /// way to reach the peer.
+    pub fn closeSessionWithError(self: *WebTransportConnection, session_id: u64, error_code: u32, reason: []const u8) !void {
+        const session = self.getSession(session_id) orelse return;
+        switch (session.state) {
+            .draining, .awaiting_fin, .closed => return,
+            .connecting => if (self.is_server) return self.rejectSession(session_id, 403),
+            .active => {},
+        }
+
+        const truncated_reason = truncateReason(reason);
+
+        // Send CLOSE_WEBTRANSPORT_SESSION capsule on the CONNECT stream, then FIN.
+        var frame_buf: [1100]u8 = undefined;
+        var fbs = io.fixedBufferStream(&frame_buf);
+        h3_frame.write(.{ .close_webtransport_session = .{
+            .error_code = error_code,
+            .reason = truncated_reason,
+        } }, &fbs) catch {};
+        self.writeCapsule(session_id, fbs.buffered());
+        if (self.quic.streams.getStream(session_id)) |stream| stream.send.close();
+
+        // Store our close code/reason so pollSessionStreams reports it correctly
+        // when the draining state is finalized
+        session.close_error_code = error_code;
+        self.setCloseReason(session, truncated_reason);
+
+        session.state = .draining;
+
+        // Clean up streams belonging to this session
+        self.cleanupSessionStreams(session_id);
+    }
+
+    /// Send DRAIN_WEBTRANSPORT_SESSION capsule — signals graceful shutdown intent.
+    /// The peer MAY continue using the session and MAY open new streams,
+    /// but should begin winding down.
+    pub fn drainSession(self: *WebTransportConnection, session_id: u64) !void {
+        const session = self.getSession(session_id) orelse return;
+        if (session.state != .active or session.drain_sent) return;
+        session.drain_sent = true;
+
+        var frame_buf: [16]u8 = undefined;
+        var fbs = io.fixedBufferStream(&frame_buf);
+        h3_frame.write(.{ .drain_webtransport_session = {} }, &fbs) catch {};
+        self.writeCapsule(session_id, fbs.buffered());
+    }
+
+    /// Reset a WT stream with an application error code.
+    /// The error code is mapped to the WEBTRANSPORT_APPLICATION_ERROR range.
+    pub fn resetStream(self: *WebTransportConnection, stream_id: u64, error_code: u32) void {
+        if (self.gone_streams.contains(stream_id)) return; // already reset with WT_SESSION_GONE
+        const h3_code = appErrorCodeToH3(error_code);
+        if (self.quic.streams.getStream(stream_id)) |stream| {
+            if (!stream.send.fin_sent) {
+                stream.send.reset(h3_code);
+            }
+            stream.recv.stopSending(h3_code);
+            return;
+        }
+        if (self.quic.streams.send_streams.get(stream_id)) |send_stream| {
+            if (!send_stream.fin_sent) {
+                send_stream.reset(h3_code);
+            }
+        }
+        if (self.quic.streams.recv_streams.get(stream_id)) |recv_stream| {
+            recv_stream.stopSending(h3_code);
+        }
+    }
+
+    /// Stop receiving on a WT stream (sends STOP_SENDING to peer).
+    /// Equivalent to browser's ReadableStream.cancel().
+    /// Unlike resetStream(), this does NOT reset the send side.
+    pub fn stopSending(self: *WebTransportConnection, stream_id: u64, error_code: u32) void {
+        if (self.gone_streams.contains(stream_id)) return;
+        const h3_code = appErrorCodeToH3(error_code);
+        if (self.quic.streams.getStream(stream_id)) |stream| {
+            stream.recv.stopSending(h3_code);
+            return;
+        }
+        if (self.quic.streams.recv_streams.get(stream_id)) |recv_stream| {
+            recv_stream.stopSending(h3_code);
+        }
+    }
+
+    fn setCloseReason(self: *WebTransportConnection, session: *Session, reason: []const u8) void {
+        self.allocator.free(session.close_reason);
+        session.close_reason = self.allocator.dupe(u8, truncateReason(reason)) catch &.{};
+    }
+
+    /// Release a session and report it closed with the code and reason it
+    /// holds. The reason stays in the slot, which outlives the poll.
+    fn sessionClosed(self: *WebTransportConnection, session: *Session, abrupt: bool) WtEvent {
+        const event = closedEvent(session, abrupt);
+        self.finalizeSession(session);
+        return event;
+    }
+
+    fn closedEvent(session: *const Session, abrupt: bool) WtEvent {
+        return .{ .session_closed = .{
+            .session_id = session.session_id,
+            .error_code = session.close_error_code,
+            .reason = session.close_reason,
+            .abrupt = abrupt,
+        } };
+    }
+
+    /// End a live session the peer broke: it reset or stopped the CONNECT
+    /// stream, or sent a malformed message on it (§6 terminates the session
+    /// either way). Whatever of our side is still open is aborted with
+    /// `h3_code` rather than finished, so the peer reads no clean close.
+    fn abortSession(self: *WebTransportConnection, session: *Session, h3_code: u64) WtEvent {
+        self.abortConnectStream(session.session_id, h3_code);
+        self.cleanupSessionStreams(session.session_id);
+        session.close_error_code = 0;
+        self.setCloseReason(session, "");
+        return self.sessionClosed(session, true);
+    }
+
+    /// Client: the server finished or reset a CONNECT it had not answered
+    /// with a 200. One we were waiting on is refused, with no status to show
+    /// (our own server resets a CONNECT past its session slots); one we had
+    /// closed meanwhile is done.
+    fn connectEnded(self: *WebTransportConnection, session: *Session) ?WtEvent {
+        switch (session.state) {
+            .connecting => {
+                if (self.is_server) return null;
+                const sid = session.session_id;
+                self.finalizeSession(session);
+                return .{ .session_rejected = .{ .session_id = sid, .status = "" } };
+            },
+            .draining => return self.sessionClosed(session, false),
+            .active, .awaiting_fin, .closed => return null,
+        }
+    }
+
+    /// The connection has ended or is ending: report the next session the
+    /// application still holds, once, with its own id, and release it. Null
+    /// once none is left. A session we were closing reports our close; one
+    /// the connection took down is `abrupt`, code 0; a client's that was
+    /// still waiting on its response is `session_rejected` with no status.
+    /// A session already reported (the peer's close, awaiting its FIN) is
+    /// released without a word.
+    ///
+    /// `poll` calls this once the QUIC connection is closing; an event loop
+    /// calls it again before it lets the connection go, for one that ended
+    /// without a poll in between (an idle timeout).
+    pub fn nextLostSession(self: *WebTransportConnection) ?WtEvent {
+        for (&self.sessions) |*session| {
+            if (!session.occupied) continue;
+            self.cleanupSessionStreams(session.session_id);
+            switch (session.state) {
+                .draining => return self.sessionClosed(session, false),
+                .active => return self.lostSession(session),
+                .connecting => {
+                    if (self.is_server) return self.lostSession(session);
+                    const sid = session.session_id;
+                    self.finalizeSession(session);
+                    return .{ .session_rejected = .{ .session_id = sid, .status = "" } };
+                },
+                .awaiting_fin, .closed => self.finalizeSession(session),
+            }
+        }
+        return null;
+    }
+
+    fn lostSession(self: *WebTransportConnection, session: *Session) WtEvent {
+        session.close_error_code = 0;
+        self.setCloseReason(session, "");
+        return self.sessionClosed(session, true);
+    }
+
+    /// Server: a CONNECT not answered yet that the peer reset or stopped is
+    /// withdrawn. Its bytes stay unread meanwhile: capsules sent ahead of
+    /// the 200 are only acted on once it is given (draft-16 §3.2).
+    fn connectWithdrawn(self: *WebTransportConnection, session: *Session) ?WtEvent {
+        const stream = self.quic.streams.getStream(session.session_id) orelse return self.lostSession(session);
+        if (stream.recv.reset_err == null and stream.send.peer_stop_sending == null) return null;
+        return self.abortSession(session, @backingInt(h3_conn.H3Error.request_cancelled));
+    }
+
+    /// Close a connection whose WebTransport is over: it carried a session,
+    /// every one has been terminated, and no HTTP/3 request is open. Call it
+    /// on each pass; `Config.wt_close_after_sessions` is the event loops'.
+    ///
+    /// Nothing in draft-16 ends such a connection, and a browser gives each
+    /// session one of its own: Chrome lets it go without a CONNECTION_CLOSE
+    /// once its FIN is acked, which leaves the server holding it until the
+    /// idle timeout. A server first sends GOAWAY naming the next request it
+    /// has not seen (RFC 9114 §5.2), so a client that pools knows what to
+    /// retry elsewhere. CONNECTION_CLOSE, H3_NO_ERROR, then waits for what
+    /// it would discard (§6's SHOULD): the peer's end of every CONNECT
+    /// stream, and the ack of our own capsules, FINs and that GOAWAY. That
+    /// wait is bounded at 3 PTO, as RFC 9000 §10.2 bounds a closing period:
+    /// a peer that left silently answers nothing.
+    pub fn closeIfUnused(self: *WebTransportConnection) void {
+        const quic = self.quic;
+        if (!quic.isEstablished()) return;
+        if (!self.carried_session or self.liveSessions() or self.h3.hasOpenRequests()) {
+            quic.closeBy(null, 0); // a request came in meanwhile
+            return;
+        }
+        const no_error = @backingInt(h3_conn.H3Error.no_error);
+        if (quic.close_deadline == null) {
+            if (self.is_server and self.h3.local_goaway_id == null) {
+                const next = if (quic.streams.highest_peer_bidi_stream_id) |id| id + 4 else 0;
+                self.h3.sendGoaway(next) catch {};
+            }
+            quic.closeBy(sys.nanoTimestamp() + 3 * quic.pkt_handler.rtt_stats.pto(), no_error);
+        }
+        for (self.sessions) |s| if (s.occupied) return; // a CONNECT stream the peer hasn't ended
+        if (quic.sendsSettled()) quic.close(no_error, "");
+    }
+
+    /// A session still connecting or established.
+    fn liveSessions(self: *const WebTransportConnection) bool {
+        for (self.sessions) |s| {
+            if (s.occupied and (s.state == .connecting or s.state == .active)) return true;
+        }
+        return false;
+    }
+
+    /// Mark a session as fully closed and release its slot.
+    fn finalizeSession(self: *WebTransportConnection, session: *Session) void {
+        if (self.stream_bufs.fetchRemove(session.session_id)) |kv| {
+            var buf = kv.value;
+            buf.deinit(self.allocator);
+        }
+        session.state = .closed;
+        session.occupied = false;
+        self.active_session_count -|= 1;
+    }
+
+    /// §6: a terminated session's streams are reset and stopped with
+    /// WEBTRANSPORT_SESSION_GONE, those whose FIN is already out included —
+    /// the peer aborts reading them as it learns of the close, so bytes it
+    /// has not acked are lost either way. Only a side with nothing left to
+    /// abort is left alone. The streams stay in `h3.excluded_streams` until
+    /// QUIC reclaims them: whatever the peer still sends on them is neither a
+    /// request nor a stream type for H3.
+    fn cleanupSessionStreams(self: *WebTransportConnection, session_id: u64) void {
+        // Removed in batches: the maps cannot change while iterated.
+        while (true) {
+            var batch: [64]u64 = undefined;
+            var n: usize = 0;
+            var it = self.wt_bidi_streams.iterator();
+            while (n < batch.len) {
+                const entry = it.next() orelse break;
+                if (entry.value_ptr.* == session_id) {
+                    batch[n] = entry.key_ptr.*;
+                    n += 1;
+                }
+            }
+            if (n == 0) break;
+            for (batch[0..n]) |sid| {
+                _ = self.wt_bidi_streams.remove(sid);
+                if (self.quic.streams.getStream(sid)) |st| {
+                    abortSend(&st.send);
+                    abortRecv(&st.recv);
+                    self.gone_streams.put(self.allocator, sid, {}) catch {};
+                }
+                self.dropStreamState(sid);
+            }
+        }
+        while (true) {
+            var batch: [64]u64 = undefined;
+            var n: usize = 0;
+            var it = self.wt_uni_streams.iterator();
+            while (n < batch.len) {
+                const entry = it.next() orelse break;
+                if (entry.value_ptr.* == session_id) {
+                    batch[n] = entry.key_ptr.*;
+                    n += 1;
+                }
+            }
+            if (n == 0) break;
+            for (batch[0..n]) |sid| {
+                _ = self.wt_uni_streams.remove(sid);
+                if (self.quic.streams.send_streams.get(sid)) |send_stream| {
+                    abortSend(send_stream);
+                    self.gone_streams.put(self.allocator, sid, {}) catch {};
+                }
+                if (self.quic.streams.recv_streams.get(sid)) |recv_stream| {
+                    abortRecv(recv_stream);
+                    self.quic.streams.releaseRecvStream(sid);
+                }
+                self.dropStreamState(sid);
+            }
+        }
+    }
+
+    /// RESET_STREAM, unless the peer has acked every byte and the FIN
+    /// (RFC 9000 §3.1 "Data Recvd"), when there is nothing left to abandon.
+    fn abortSend(ss: *stream_mod.SendStream) void {
+        if (ss.reset_err != null) return;
+        if (ss.fin_acked and !ss.hasUnackedData()) return;
+        ss.reset(WEBTRANSPORT_SESSION_GONE);
+    }
+
+    /// STOP_SENDING, unless the peer has nothing more to send: it reset the
+    /// stream or every byte has arrived. What arrived is dropped unread.
+    fn abortRecv(rs: *stream_mod.ReceiveStream) void {
+        if (rs.reset_err != null or rs.stop_sending_err != null or rs.allReceived()) return;
+        rs.stopSending(WEBTRANSPORT_SESSION_GONE);
+    }
+
+    fn dropStreamState(self: *WebTransportConnection, sid: u64) void {
+        if (self.stream_bufs.fetchRemove(sid)) |kv| {
+            var buf = kv.value;
+            buf.deinit(self.allocator);
+        }
+        _ = self.reset_delivered.remove(sid);
+    }
+
+    /// Drain the QUIC-layer disposal queue and clean up corresponding WT bookkeeping.
+    /// O(k) where k = number of streams just disposed (typically 0-2 per cycle).
+    pub fn drainDisposalQueue(self: *WebTransportConnection) void {
+        self.h3.drainDisposalQueue();
+        const disposed = self.quic.streams.disposal_queue[0..self.quic.streams.disposal_count];
+        for (disposed) |id| {
+            _ = self.wt_bidi_streams.remove(id);
+            _ = self.wt_uni_streams.remove(id);
+            _ = self.fin_delivered.remove(id);
+            _ = self.reset_delivered.remove(id);
+            _ = self.paused_streams.remove(id);
+            _ = self.held_streams.remove(id);
+            _ = self.gone_streams.remove(id);
+            if (self.stream_bufs.fetchRemove(id)) |kv| {
+                var buf = kv.value;
+                buf.deinit(self.allocator);
+            }
+        }
+    }
+
+    /// Stop delivering `stream_id`'s data: no `.stream_data` for it, FIN
+    /// included, until `resumeStream`. Its bytes stay unread in QUIC, where
+    /// MAX_STREAM_DATA only grows as they are read, so the peer stalls at one
+    /// stream window. Aborts are still reported.
+    ///
+    /// The first read, which identified the stream, has already taken its
+    /// bytes from QUIC, so the peer may get one window beyond them.
+    pub fn pauseStream(self: *WebTransportConnection, stream_id: u64) !void {
+        try self.paused_streams.put(self.allocator, stream_id, {});
+    }
+
+    /// Undo `pauseStream`. What arrived meanwhile, and the FIN, is surfaced
+    /// by a later poll().
+    pub fn resumeStream(self: *WebTransportConnection, stream_id: u64) void {
+        _ = self.paused_streams.remove(stream_id);
+    }
+
+    pub fn isStreamPaused(self: *const WebTransportConnection, stream_id: u64) bool {
+        return self.paused_streams.contains(stream_id);
+    }
+
+    /// Poll for the next WebTransport event.
+    pub fn poll(self: *WebTransportConnection) !?WtEvent {
+        // 0. Hand out session flow control credit. First, so a peer holding a
+        //    stream back for want of it is unblocked before we look for one.
+        self.flushFlowControl();
+
+        // 1. Check CONNECT streams for capsules
+        if (self.pollSessionStreams()) |event| return event;
+        if (self.pendingDrain()) |event| return event;
+
+        // 2. Check for incoming WT datagrams
+        if (self.pollDatagrams()) |event| return event;
+
+        // 3. Check for incoming WT uni streams with type prefix
+        if (try self.identifyWtUniStreams()) |event| return event;
+
+        // 4. Check for incoming WT bidi streams with type prefix
+        if (try self.identifyWtBidiStreams()) |event| return event;
+
+        // Streams whose session has just been accepted, before their data.
+        if (self.pollHeldStreams()) |event| return event;
+
+        // 5. Check for data on known WT streams
+        if (self.pollWtStreamData()) |event| return event;
+
+        // 6. Report peer aborts — after data, so whatever arrived before the
+        //    reset is delivered first.
+        if (self.pollWtStreamAborts()) |event| return event;
+
+        // 7. Wake writers whose credit has arrived — after aborts, so a stopped
+        //    stream's wait is dropped rather than fired.
+        if (self.pollWritable()) |event| return event;
+
+        // 8. Poll H3 for events (settings, connect requests, responses)
+        if (try self.pollH3Events()) |event| return event;
+
+        // Credit the steps above earned the peer (a WT_*_BLOCKED answered,
+        // a stream opened) goes now: null tells a server nothing is pending.
+        self.flushFlowControl();
+
+        // Last, so what arrived ahead of a CONNECTION_CLOSE is delivered first.
+        switch (self.quic.state) {
+            .closing, .draining, .terminated => return self.nextLostSession(),
+            .first_flight, .handshake, .connected => return null,
+        }
+    }
+
+    /// Poll established sessions' CONNECT streams: their capsules, then
+    /// whether the stream itself has ended.
+    fn pollSessionStreams(self: *WebTransportConnection) ?WtEvent {
+        for (&self.sessions) |*session| {
+            if (!session.occupied) continue;
+            switch (session.state) {
+                .active, .draining, .awaiting_fin => {},
+                .connecting => {
+                    if (self.is_server) if (self.connectWithdrawn(session)) |ev| return ev;
+                    continue;
+                },
+                .closed => continue,
+            }
+
+            const stream = self.quic.streams.getStream(session.session_id) orelse {
+                // Reclaimed: both sides are over.
+                if (session.state == .awaiting_fin) self.finalizeSession(session);
+                continue;
+            };
+
+            // Buffer all that arrived: one read can carry several capsules, or
+            // half of one, and `finished` flips only on the read after the
+            // last. read() transfers ownership of the FrameSorter's copy.
+            while (stream.recv.read()) |data| {
+                defer self.allocator.free(data);
+                const buf = self.streamBuf(session.session_id) catch continue;
+                buf.appendSlice(self.allocator, data) catch {};
+            }
+
+            if (session.state == .awaiting_fin) {
+                self.awaitPeerFin(session, stream);
+                continue;
+            }
+            if (self.consumeCapsules(session)) |event| return event;
+            if (self.connectStreamEnd(session, stream)) |event| return event;
+        }
+        return null;
+    }
+
+    /// §6: the CONNECT stream closing, cleanly or abruptly, on either side
+    /// ends the session. Looked at once the capsules before the end are
+    /// spent, so a WT_CLOSE_SESSION sharing a packet with the FIN, or with a
+    /// STOP_SENDING, keeps its code.
+    fn connectStreamEnd(self: *WebTransportConnection, session: *Session, stream: *stream_mod.Stream) ?WtEvent {
+        const fin = stream.recv.finished;
+        const aborted = stream.recv.reset_err != null or stream.send.peer_stop_sending != null;
+        if (!fin and !aborted) return null;
+
+        // Our close, answered: a FIN, or the reset §6 also allows. Our code stands.
+        if (session.state == .draining) return self.sessionClosed(session, false);
+
+        if (aborted and !fin) {
+            // RFC 9114 §4.1.1 cancels a request with H3_REQUEST_CANCELLED.
+            return self.abortSession(session, @backingInt(h3_conn.H3Error.request_cancelled));
+        }
+        // RFC 9297 §3.3: a FIN that cuts a capsule short is a malformed message.
+        const left = if (self.stream_bufs.getPtr(session.session_id)) |b| b.items.len else 0;
+        if (left > 0 or session.capsule_skip > 0) {
+            return self.abortSession(session, @backingInt(h3_conn.H3Error.message_error));
+        }
+        // WT_CLOSE_SESSION(0, ""), in effect: answered with our FIN.
+        if (stream.send.reset_err == null) stream.send.close();
+        self.cleanupSessionStreams(session.session_id);
+        session.close_error_code = 0;
+        self.setCloseReason(session, "");
+        return self.sessionClosed(session, false);
+    }
+
+    /// A session the peer closed, already reported: its slot goes once the
+    /// CONNECT stream ends, or once it carries a byte past the capsule, which
+    /// §6 answers with H3_MESSAGE_ERROR.
+    fn awaitPeerFin(self: *WebTransportConnection, session: *Session, stream: *stream_mod.Stream) void {
+        const left = if (self.stream_bufs.getPtr(session.session_id)) |b| b.items.len else 0;
+        if (left > 0) return self.refuseAfterClose(session);
+        if (stream.recv.finished or stream.recv.reset_err != null or stream.send.peer_stop_sending != null) {
+            self.finalizeSession(session);
+        }
+    }
+
+    fn refuseAfterClose(self: *WebTransportConnection, session: *Session) void {
+        self.abortConnectStream(session.session_id, @backingInt(h3_conn.H3Error.message_error));
+        self.finalizeSession(session);
+    }
+
+    /// Take over what HTTP/3 read past the CONNECT's HEADERS: capsules that
+    /// came in the same read — a close sent right after the 200, say — would
+    /// otherwise sit in its buffer, which it no longer looks at.
+    fn adoptConnectStream(self: *WebTransportConnection, stream_id: u64) !void {
+        var kv = self.h3.stream_bufs.fetchRemove(stream_id) orelse return;
+        defer kv.value.deinit(self.allocator);
+        if (kv.value.items.len == 0) return;
+        // HTTP/3 held these back from flow control until consumed; we read
+        // capsules as they come, so they are credited now.
+        if (self.quic.streams.getStream(stream_id)) |s| s.recv.release(kv.value.items.len);
+        const buf = try self.streamBuf(stream_id);
+        try buf.insertSlice(self.allocator, 0, kv.value.items);
+    }
+
+    /// The buffer holding a stream's not-yet-parsed bytes, created on first
+    /// use. A session's CONNECT stream is keyed here like any other, and freed
+    /// by the same disposal path.
+    fn streamBuf(self: *WebTransportConnection, stream_id: u64) !*std.ArrayList(u8) {
+        const gop = try self.stream_bufs.getOrPut(stream_id);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        return gop.value_ptr;
+    }
+
+    /// Parse and act on every whole capsule buffered for a session.
+    ///
+    /// RFC 9297 §3.2 puts the capsule stream in the HTTP message content, so in
+    /// HTTP/3 capsules travel inside DATA frames; a Zig or Go peer writes them
+    /// bare. Both framings are accepted. A DATA frame is assumed to hold whole
+    /// capsules — which is what every peer we have met writes — so unwrapping is
+    /// just dropping the frame header.
+    fn consumeCapsules(self: *WebTransportConnection, session: *Session) ?WtEvent {
+        while (true) {
+            const buf = self.stream_bufs.getPtr(session.session_id) orelse return null;
+
+            // Finish discarding a capsule we decided not to hold on to.
+            if (session.capsule_skip > 0) {
+                const n = @min(session.capsule_skip, buf.items.len);
+                h3_frame.consumeFromBuf(buf, n);
+                session.capsule_skip -= n;
+                if (session.capsule_skip > 0) return null;
+                continue;
+            }
+            if (buf.items.len == 0) return null;
+
+            const header = peekCapsuleHeader(buf.items) orelse return null;
+
+            // A DATA frame is the RFC 9297 container, not a capsule: drop the
+            // header and what follows is the capsule stream itself.
+            if (header.frame_type == @backingInt(h3_frame.H3FrameType.data)) {
+                h3_frame.consumeFromBuf(buf, header.header_len);
+                continue;
+            }
+
+            const kind = h3_frame.H3FrameType.fromInt(header.frame_type);
+            // §6: a reason past 1024 bytes is a malformed close, not a long one.
+            if (kind == .close_webtransport_session and header.length > 4 + max_close_reason) {
+                return self.malformedCapsule(session);
+            }
+            // RFC 9297 §3.2: a capsule type we do not know is dropped.
+            if (kind == null or !isSessionCapsule(kind.?) or header.length > MAX_CAPSULE_PAYLOAD) {
+                h3_frame.consumeFromBuf(buf, header.header_len);
+                session.capsule_skip = header.length;
+                continue;
+            }
+            if (buf.items.len < header.header_len + header.length) return null; // more to come
+
+            const result = h3_frame.parse(buf.items) catch return self.malformedCapsule(session);
+            const sid = session.session_id;
+
+            // Act before consuming: a capsule's payload points into the buffer.
+            // An abrupt close releases the session and its buffer with it, so
+            // the pointer is re-read rather than reused.
+            const event = self.handleCapsule(session, result.frame);
+            if (self.stream_bufs.getPtr(sid)) |live| {
+                h3_frame.consumeFromBuf(live, @min(result.consumed, live.items.len));
+            }
+            const ev = event orelse continue;
+            // §6: stream data after a received WT_CLOSE_SESSION MUST reset the
+            // stream with H3_MESSAGE_ERROR, whichever read it comes in. The
+            // close itself stands.
+            if (session.occupied and session.state == .awaiting_fin) {
+                const left = if (self.stream_bufs.getPtr(sid)) |b| b.items.len else 0;
+                if (left > 0) self.refuseAfterClose(session);
+            }
+            return ev;
+        }
+    }
+
+    /// The capsules a session's CONNECT stream carries that we act on; any
+    /// other type, H3 frame types included, is an unknown capsule.
+    fn isSessionCapsule(kind: h3_frame.H3FrameType) bool {
+        return switch (kind) {
+            .close_webtransport_session,
+            .drain_webtransport_session,
+            .wt_max_data,
+            .wt_max_streams_bidi,
+            .wt_max_streams_uni,
+            .wt_data_blocked,
+            .wt_streams_blocked_bidi,
+            .wt_streams_blocked_uni,
+            => true,
+            else => false,
+        };
+    }
+
+    /// RFC 9297 §3.3 makes a malformed capsule a malformed message, which
+    /// RFC 9114 §4.1.2 answers with H3_MESSAGE_ERROR: a live session ends
+    /// abruptly. One we are closing ignores the rest of the stream and keeps
+    /// waiting for the peer's FIN: a reset now could overtake our own close.
+    fn malformedCapsule(self: *WebTransportConnection, session: *Session) ?WtEvent {
+        if (self.stream_bufs.getPtr(session.session_id)) |buf| buf.clearRetainingCapacity();
+        if (session.state != .active) {
+            session.capsule_skip = std.math.maxInt(u64);
+            return null;
+        }
+        session.capsule_skip = 0;
+        return self.abortSession(session, @backingInt(h3_conn.H3Error.message_error));
+    }
+
+    /// Abort whatever of a CONNECT stream is still open, both ways.
+    fn abortConnectStream(self: *WebTransportConnection, session_id: u64, h3_code: u64) void {
+        const s = self.quic.streams.getStream(session_id) orelse return;
+        if (s.send.reset_err == null and !s.send.fin_acked) s.send.reset(h3_code);
+        if (s.recv.reset_err == null and !s.recv.allReceived()) s.recv.stopSending(h3_code);
+    }
+
+    fn drainEvent(_: *WebTransportConnection, session: *Session) ?WtEvent {
+        if (!(session.drain_by_capsule or session.drain_by_goaway)) return null;
+        if (session.drain_reported or session.state != .active) return null;
+        session.drain_reported = true;
+        return .{ .session_draining = .{ .session_id = session.session_id } };
+    }
+
+    /// The next session a GOAWAY drained that has not heard so yet.
+    fn pendingDrain(self: *WebTransportConnection) ?WtEvent {
+        for (&self.sessions) |*session| {
+            if (!session.occupied) continue;
+            if (self.drainEvent(session)) |ev| return ev;
+        }
+        return null;
+    }
+
+    /// Act on one capsule from a session's CONNECT stream.
+    fn handleCapsule(self: *WebTransportConnection, session: *Session, frame: h3_frame.H3Frame) ?WtEvent {
+        // §5.1: capsules that arrive while flow control is not in force MUST be
+        // ignored — the peer may have sent them before seeing our SETTINGS.
+        const fc_live = self.flowControlEnabled();
+        switch (frame) {
+            .close_webtransport_session => |cls| {
+                if (!std.unicode.utf8ValidateSlice(cls.reason)) return self.malformedCapsule(session);
+                // Closes that crossed: ours stands, as a browser's does for
+                // its page, and the peer's FIN is still what ends it.
+                if (session.state == .draining) {
+                    session.capsule_skip = std.math.maxInt(u64);
+                    return null;
+                }
+                const sid = session.session_id;
+                session.close_error_code = cls.error_code;
+                self.setCloseReason(session, cls.reason);
+
+                // §6: answered with our FIN. No STOP_SENDING: browsers count a
+                // close as clean only once both FINs have crossed.
+                if (self.quic.streams.getStream(sid)) |s| {
+                    if (s.send.reset_err == null) s.send.close();
+                }
+                self.cleanupSessionStreams(sid);
+                session.state = .awaiting_fin;
+                return closedEvent(session, false);
+            },
+            .drain_webtransport_session => {
+                session.drain_by_capsule = true;
+                return self.drainEvent(session);
+            },
+            .wt_max_streams_bidi => |n| if (fc_live) session.fc.bidi.raiseSendLimit(n),
+            .wt_max_streams_uni => |n| if (fc_live) session.fc.uni.raiseSendLimit(n),
+            .wt_max_data => |n| if (fc_live) session.fc.raiseSendDataLimit(n),
+            .wt_streams_blocked_bidi => |n| if (fc_live) session.fc.bidi.peerBlockedAt(n),
+            .wt_streams_blocked_uni => |n| if (fc_live) session.fc.uni.peerBlockedAt(n),
+            .wt_data_blocked => |n| if (fc_live) session.fc.peerDataBlockedAt(n),
+            else => {}, // consumeCapsules drops these unparsed
+        }
+        return null;
+    }
+
+    /// Write the flow control capsules the active sessions owe their peers
+    /// (§5.6): the credit each one starts with, and every raise it has earned.
+    fn flushFlowControl(self: *WebTransportConnection) void {
+        if (!self.grantsCredit()) return;
+        const rtt = &self.quic.pkt_handler.rtt_stats;
+
+        for (&self.sessions) |*session| {
+            if (!session.occupied or session.state != .active) continue;
+
+            while (session.fc.nextCapsule(rtt)) |capsule| {
+                var buf: [32]u8 = undefined;
+                var fbs = io.fixedBufferStream(&buf);
+                const frame: h3_frame.H3Frame = switch (capsule) {
+                    .max_streams_bidi => |n| .{ .wt_max_streams_bidi = n },
+                    .max_streams_uni => |n| .{ .wt_max_streams_uni = n },
+                    .max_data => |n| .{ .wt_max_data = n },
+                    .streams_blocked_bidi => |n| .{ .wt_streams_blocked_bidi = n },
+                    .streams_blocked_uni => |n| .{ .wt_streams_blocked_uni = n },
+                    .data_blocked => |n| .{ .wt_data_blocked = n },
+                };
+                h3_frame.write(frame, &fbs) catch continue;
+                self.writeCapsule(session.session_id, fbs.buffered());
+            }
+        }
+    }
+
+    /// Check for incoming QUIC DATAGRAM frames and demux by quarter_stream_id.
+    pub fn pollDatagrams(self: *WebTransportConnection) ?WtEvent {
+        // Read in place: the bytes stay put until the next datagram arrives,
+        // which is after the caller is done with this one.
+        const dgram = self.quic.peekDatagram() orelse return null;
+        self.quic.consumeDatagram();
+        if (dgram.len == 0) return null;
+
+        // Parse quarter_stream_id
+        var fbs = io.fixedBufferStream(dgram);
+        const reader = &fbs;
+        const quarter_id = packet.readVarInt(reader) catch return null;
+        const session_id = quarter_id * 4;
+
+        if (self.sessionActive(session_id)) {
+            return .{ .datagram = .{
+                .session_id = session_id,
+                .data = dgram[fbs.seek..],
+            } };
+        }
+
+        return null;
+    }
+
+    /// Identify incoming WT unidirectional streams by reading type prefix.
+    fn identifyWtUniStreams(self: *WebTransportConnection) !?WtEvent {
+        var recv_it = self.quic.streams.recv_streams.iterator();
+        while (recv_it.next()) |entry| {
+            const stream_id = entry.key_ptr.*;
+            const recv_stream = entry.value_ptr.*;
+
+            // Skip already-identified streams
+            if (self.wt_uni_streams.contains(stream_id)) continue;
+            // Skip H3 control/QPACK streams
+            if (self.h3.peer_control_stream_id != null and self.h3.peer_control_stream_id.? == stream_id) continue;
+            if (self.h3.peer_qpack_enc_stream_id != null and self.h3.peer_qpack_enc_stream_id.? == stream_id) continue;
+            if (self.h3.peer_qpack_dec_stream_id != null and self.h3.peer_qpack_dec_stream_id.? == stream_id) continue;
+            // Handed to H3 and abandoned as a type neither layer takes.
+            if (recv_stream.released) continue;
+
+            // Try to read data (read() transfers ownership)
+            const data = recv_stream.read() orelse {
+                // FIN with nothing to identify it by — no layer will claim it.
+                if (recv_stream.finished) self.quic.streams.releaseRecvStream(stream_id);
+                continue;
+            };
+            defer self.allocator.free(data);
+            if (data.len == 0) continue;
+
+            var fbs = io.fixedBufferStream(data);
+            const reader = &fbs;
+            // Unparsable, it goes to H3 to be abandoned: the bytes are gone.
+            const stream_type = packet.readVarInt(reader) catch {
+                try self.h3.adoptUniStream(stream_id, data);
+                continue;
+            };
+
+            if (stream_type == WT_UNI_STREAM_TYPE) {
+                const session_id = packet.readVarInt(reader) catch {
+                    self.h3.abandonUniStream(stream_id);
+                    continue;
+                };
+
+                // Validate session ID: must be a client-initiated bidi stream (divisible by 4)
+                if (session_id % 4 != 0) {
+                    // Invalid session ID — close connection with H3_ID_ERROR
+                    self.h3.closeWithError(.id_error, "invalid WT session ID");
+                    return null;
+                }
+
+                // Registered whatever its session's state: admitStream decides
+                // whether the application hears of it yet.
+                try self.wt_uni_streams.put(stream_id, session_id);
+                // A paused stream keeps its data in QUIC, where H3 would
+                // otherwise take it for a new stream's type.
+                try self.h3.excluded_streams.put(stream_id, {});
+                if (self.getSession(session_id)) |session| session.fc.uni.peerOpened();
+
+                // Buffer remaining data after the type prefix
+                if (fbs.seek < data.len) {
+                    const buf = try self.streamBuf(stream_id);
+                    buf.appendSlice(self.allocator, data[fbs.seek..]) catch {};
+                }
+
+                if (try self.admitStream(stream_id, session_id)) |ev| return ev;
+                continue;
+            }
+            // Not a WT stream. The read took the bytes H3 identifies it by —
+            // the peer's control stream carries its SETTINGS in that first read
+            // — so hand them over rather than drop them.
+            try self.h3.adoptUniStream(stream_id, data);
+        }
+        return null;
+    }
+
+    /// Identify incoming WT bidirectional streams by reading type prefix.
+    const Classified = union(enum) { waiting, done, closed, wt: WtEvent };
+
+    /// Classify the peer's bidi streams, which H3 leaves alone until this has
+    /// (`H3Connection.defer_peer_bidi`): a WT stream is registered, anything
+    /// else handed to H3 unread. A stream whose preamble has not all arrived
+    /// waits without holding up the ones after it.
+    fn identifyWtBidiStreams(self: *WebTransportConnection) !?WtEvent {
+        const highest = self.quic.streams.highest_peer_bidi_stream_id orelse return null;
+        var settled = true; // every stream below `id` is classified
+        var id = self.next_peer_bidi_to_examine;
+        while (id <= highest) : (id += 4) {
+            const c = try self.classifyBidi(id);
+            if (c == .waiting) settled = false else if (settled) self.next_peer_bidi_to_examine = id + 4;
+            switch (c) {
+                .waiting, .done => {},
+                .closed => return null,
+                .wt => |ev| return ev,
+            }
+        }
+        return null;
+    }
+
+    fn classifyBidi(self: *WebTransportConnection, stream_id: u64) !Classified {
+        if (self.wt_bidi_streams.contains(stream_id) or
+            self.h3.stream_bufs.contains(stream_id) or
+            self.h3.finished_streams.contains(stream_id) or
+            self.getSession(stream_id) != null) return .done;
+        const stream = self.quic.streams.getStream(stream_id) orelse return .done; // reclaimed
+
+        // Type and session ID: two varints, 16 bytes at most.
+        var pre: [16]u8 = undefined;
+        const n = stream.recv.peek(&pre);
+        var fbs = io.fixedBufferStream(pre[0..n]);
+        const ended = stream.recv.reset_err != null or stream.recv.allReceived();
+        const stream_type = packet.readVarInt(&fbs) catch
+            return if (ended) self.handToH3(stream_id) else .waiting;
+        if (stream_type != WT_BIDI_STREAM_TYPE) return self.handToH3(stream_id);
+        const session_id = packet.readVarInt(&fbs) catch
+            return if (ended) self.handToH3(stream_id) else .waiting;
+
+        // Validate session ID: must be a client-initiated bidi stream (divisible by 4)
+        if (session_id % 4 != 0) {
+            self.h3.closeWithError(.id_error, "invalid WT session ID");
+            return .closed;
+        }
+
+        // Register the stream (even if session not yet accepted —
+        // the Go client may open bidi streams before CONNECT is processed).
+        try self.wt_bidi_streams.put(stream_id, session_id);
+        try self.h3.excluded_streams.put(stream_id, {});
+        if (self.getSession(session_id)) |session| session.fc.bidi.peerOpened();
+
+        // Take the preamble; what follows it in the same reads is buffered
+        // for pollWtStreamData, after .bidi_stream lets the application
+        // register the stream.
+        var left = fbs.seek;
+        while (left > 0) {
+            const data = stream.recv.read() orelse break;
+            defer self.allocator.free(data);
+            const take = @min(left, data.len);
+            left -= take;
+            if (take < data.len) {
+                const buf = try self.streamBuf(stream_id);
+                try buf.appendSlice(self.allocator, data[take..]);
+            }
+        }
+        return if (try self.admitStream(stream_id, session_id)) |ev| .{ .wt = ev } else .done;
+    }
+
+    const Association = enum { active, pending, gone };
+
+    /// Whether streams naming `session_id` may reach the application yet.
+    fn association(self: *WebTransportConnection, session_id: u64) Association {
+        if (self.getSession(session_id)) |s| return switch (s.state) {
+            .active => .active,
+            .connecting => .pending,
+            .draining, .awaiting_fin, .closed => .gone,
+        };
+        // A client's sessions are its own CONNECTs: no session, none coming.
+        if (!self.is_server) return .gone;
+        // Its CONNECT may still be on the way, or not yet decoded.
+        const highest = self.quic.streams.highest_peer_bidi_stream_id orelse return .pending;
+        if (session_id > highest) return .pending;
+        if (self.quic.streams.getStream(session_id) == null) return .gone; // reclaimed
+        return if (self.h3.headers_received_streams.contains(session_id)) .gone else .pending;
+    }
+
+    /// Surface a newly registered stream, hold it for a session still on the
+    /// way, or refuse it.
+    fn admitStream(self: *WebTransportConnection, stream_id: u64, session_id: u64) !?WtEvent {
+        switch (self.association(session_id)) {
+            .active => return self.streamEvent(stream_id, session_id),
+            .pending => {
+                if (self.held_streams.count() < MAX_HELD_STREAMS) {
+                    try self.held_streams.put(self.allocator, stream_id, {});
+                } else {
+                    self.refuseStream(stream_id, WEBTRANSPORT_BUFFERED_STREAM_REJECTED);
+                }
+                return null;
+            },
+            .gone => {
+                self.refuseStream(stream_id, WEBTRANSPORT_SESSION_GONE);
+                return null;
+            },
+        }
+    }
+
+    fn streamEvent(self: *WebTransportConnection, stream_id: u64, session_id: u64) WtEvent {
+        return if (self.wt_bidi_streams.contains(stream_id))
+            .{ .bidi_stream = .{ .session_id = session_id, .stream_id = stream_id } }
+        else
+            .{ .uni_stream = .{ .session_id = session_id, .stream_id = stream_id } };
+    }
+
+    /// Reset a stream the application never heard of. It stays excluded from
+    /// H3 until QUIC reclaims it.
+    fn refuseStream(self: *WebTransportConnection, stream_id: u64, code: u64) void {
+        if (self.wt_bidi_streams.remove(stream_id)) {
+            if (self.quic.streams.getStream(stream_id)) |st| {
+                st.send.reset(code);
+                st.recv.stopSending(code);
+            }
+        } else if (self.wt_uni_streams.remove(stream_id)) {
+            if (self.quic.streams.recv_streams.get(stream_id)) |rs| {
+                rs.stopSending(code);
+                self.quic.streams.releaseRecvStream(stream_id);
+            }
+        }
+        _ = self.held_streams.remove(stream_id);
+        self.dropStreamState(stream_id);
+    }
+
+    /// Surface held streams whose session is now established; refuse those
+    /// whose session will not be.
+    fn pollHeldStreams(self: *WebTransportConnection) ?WtEvent {
+        while (true) {
+            var settled: ?struct { id: u64, session: u64, to: Association } = null;
+            var it = self.held_streams.keyIterator();
+            while (it.next()) |id| {
+                const session_id = self.wt_bidi_streams.get(id.*) orelse self.wt_uni_streams.get(id.*) orelse {
+                    settled = .{ .id = id.*, .session = 0, .to = .gone };
+                    break;
+                };
+                const to = self.association(session_id);
+                if (to != .pending) {
+                    settled = .{ .id = id.*, .session = session_id, .to = to };
+                    break;
+                }
+            }
+            const s = settled orelse return null;
+            if (s.to == .active) {
+                _ = self.held_streams.remove(s.id);
+                return self.streamEvent(s.id, s.session);
+            }
+            self.refuseStream(s.id, WEBTRANSPORT_SESSION_GONE);
+        }
+    }
+
+    /// Not a WT stream: H3 reads it from here on.
+    fn handToH3(self: *WebTransportConnection, stream_id: u64) !Classified {
+        try self.h3.stream_bufs.put(stream_id, .empty);
+        return .done;
+    }
+
+    /// Poll known WT streams for data, counting what arrives against the
+    /// session's §5.6.4 window. The stream header is not counted: it is
+    /// consumed before the stream joins a session, which is what §5.4 requires.
+    fn pollWtStreamData(self: *WebTransportConnection) ?WtEvent {
+        const event = self.readWtStreamData() orelse return null;
+        const data = switch (event) {
+            .stream_data => |sd| sd,
+            else => return event,
+        };
+        if (data.data.len > 0) {
+            if (self.limitedSessionForStream(data.stream_id)) |session| {
+                session.fc.recordReceived(data.data.len);
+            }
+        }
+        return event;
+    }
+
+    /// The `fin` field is set when the peer has finished sending (FIN received
+    /// and all data consumed). A final event with empty data + fin=true is
+    /// emitted when FIN arrives after the last data chunk.
+    fn readWtStreamData(self: *WebTransportConnection) ?WtEvent {
+        // Check bidi streams
+        var bidi_it = self.wt_bidi_streams.iterator();
+        while (bidi_it.next()) |entry| {
+            const stream_id = entry.key_ptr.*;
+            if (self.paused_streams.contains(stream_id) or self.held_streams.contains(stream_id)) continue;
+
+            // First check WT buffer for data left over from prefix parsing
+            if (self.stream_bufs.getPtr(stream_id)) |buf| {
+                if (buf.items.len > 0) {
+                    const data_slice = self.allocator.dupe(u8, buf.items) catch {
+                        std.log.err("WT bidi stream data alloc failed (OOM)", .{});
+                        continue;
+                    };
+                    buf.items.len = 0;
+                    const fin = if (self.quic.streams.getStream(stream_id)) |stream|
+                        stream.recv.finished or stream.recv.sorter.isComplete()
+                    else
+                        false;
+                    if (fin) self.fin_delivered.put(stream_id, {}) catch {};
+                    return .{ .stream_data = .{
+                        .stream_id = stream_id,
+                        .data = data_slice,
+                        .fin = fin,
+                    } };
+                }
+            }
+
+            if (self.quic.streams.getStream(stream_id)) |stream| {
+                if (stream.recv.read()) |data| {
+                    const fin = stream.recv.finished or stream.recv.sorter.isComplete();
+                    if (fin) self.fin_delivered.put(stream_id, {}) catch {};
+                    return .{ .stream_data = .{
+                        .stream_id = stream_id,
+                        .data = data,
+                        .fin = fin,
+                    } };
+                } else if (stream.recv.finished and !self.fin_delivered.contains(stream_id)) {
+                    self.fin_delivered.put(stream_id, {}) catch {};
+                    return .{ .stream_data = .{
+                        .stream_id = stream_id,
+                        .data = &[_]u8{},
+                        .fin = true,
+                    } };
+                }
+            }
+        }
+
+        // Check uni recv streams
+        var uni_it = self.wt_uni_streams.iterator();
+        while (uni_it.next()) |entry| {
+            const stream_id = entry.key_ptr.*;
+            if (self.paused_streams.contains(stream_id) or self.held_streams.contains(stream_id)) continue;
+
+            // First check WT buffer
+            if (self.stream_bufs.getPtr(stream_id)) |buf| {
+                if (buf.items.len > 0) {
+                    const data_slice = self.allocator.dupe(u8, buf.items) catch {
+                        std.log.err("WT uni stream data alloc failed (OOM)", .{});
+                        continue;
+                    };
+                    buf.items.len = 0;
+                    const fin = if (self.quic.streams.recv_streams.get(stream_id)) |recv_stream|
+                        recv_stream.finished or recv_stream.sorter.isComplete()
+                    else
+                        false;
+                    if (fin) {
+                        self.fin_delivered.put(stream_id, {}) catch {};
+                        self.quic.streams.releaseRecvStream(stream_id);
+                    }
+                    return .{ .stream_data = .{
+                        .stream_id = stream_id,
+                        .data = data_slice,
+                        .fin = fin,
+                    } };
+                }
+            }
+
+            if (self.quic.streams.recv_streams.get(stream_id)) |recv_stream| {
+                if (recv_stream.read()) |data| {
+                    const fin = recv_stream.finished or recv_stream.sorter.isComplete();
+                    if (fin) {
+                        self.fin_delivered.put(stream_id, {}) catch {};
+                        self.quic.streams.releaseRecvStream(stream_id);
+                    }
+                    return .{ .stream_data = .{
+                        .stream_id = stream_id,
+                        .data = data,
+                        .fin = fin,
+                    } };
+                } else if (recv_stream.finished and !self.fin_delivered.contains(stream_id)) {
+                    self.fin_delivered.put(stream_id, {}) catch {};
+                    self.quic.streams.releaseRecvStream(stream_id);
+                    return .{ .stream_data = .{
+                        .stream_id = stream_id,
+                        .data = &[_]u8{},
+                        .fin = true,
+                    } };
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// Report a peer RESET_STREAM or STOP_SENDING on a WT stream, once each.
+    ///
+    /// The QUIC layer records these but goes quiet about them: a reset recv
+    /// stream returns null from `read()` and never flips `finished`, so without
+    /// this pass the application never learns the stream died, let alone with
+    /// what code.
+    fn pollWtStreamAborts(self: *WebTransportConnection) ?WtEvent {
+        var bidi_it = self.wt_bidi_streams.iterator();
+        while (bidi_it.next()) |entry| {
+            const stream_id = entry.key_ptr.*;
+            const session_id = entry.value_ptr.*;
+            if (self.held_streams.contains(stream_id)) continue;
+            const stream = self.quic.streams.getStream(stream_id) orelse continue;
+            if (self.abortEvent(session_id, stream_id, stream.recv.reset_err, stream.send.peer_stop_sending)) |ev| {
+                return ev;
+            }
+        }
+
+        var uni_it = self.wt_uni_streams.iterator();
+        while (uni_it.next()) |entry| {
+            const stream_id = entry.key_ptr.*;
+            const session_id = entry.value_ptr.*;
+            if (self.held_streams.contains(stream_id)) continue;
+            const recv_err = if (self.quic.streams.recv_streams.get(stream_id)) |r| r.reset_err else null;
+            const send_err = if (self.quic.streams.send_streams.get(stream_id)) |sn| sn.peer_stop_sending else null;
+            if (self.abortEvent(session_id, stream_id, recv_err, send_err)) |ev| return ev;
+        }
+
+        return null;
+    }
+
+    /// Turn a not-yet-reported abort code into an event and mark it delivered.
+    /// H3 codes outside the WebTransport range map to 0, matching the browser's
+    /// treatment of a reset it cannot attribute to the application.
+    fn abortEvent(
+        self: *WebTransportConnection,
+        session_id: u64,
+        stream_id: u64,
+        recv_err: ?u64,
+        send_err: ?u64,
+    ) ?WtEvent {
+        if (recv_err == null and send_err == null) return null;
+        const gop = self.reset_delivered.getOrPut(stream_id) catch return null;
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+
+        if (recv_err) |code| {
+            if (!gop.value_ptr.reset) {
+                gop.value_ptr.reset = true;
+                return .{ .stream_reset = .{
+                    .session_id = session_id,
+                    .stream_id = stream_id,
+                    .error_code = h3ToAppErrorCode(code) orelse 0,
+                } };
+            }
+        }
+        if (send_err) |code| {
+            if (!gop.value_ptr.stop_sending) {
+                gop.value_ptr.stop_sending = true;
+                return .{ .stream_stop_sending = .{
+                    .session_id = session_id,
+                    .stream_id = stream_id,
+                    .error_code = h3ToAppErrorCode(code) orelse 0,
+                } };
+            }
+        }
+        return null;
+    }
+
+    /// The first `notifyWritable` wait the peer's credit now meets, as an
+    /// event. Waits that can no longer be met are dropped on the way.
+    fn pollWritable(self: *WebTransportConnection) ?WtEvent {
+        var i: usize = 0;
+        while (i < self.writable_waits.items.len) {
+            const w = self.writable_waits.items[i];
+            const cap = self.waitCapacity(w) orelse {
+                _ = self.writable_waits.swapRemove(i);
+                continue;
+            };
+            if (cap >= w.min_bytes) {
+                _ = self.writable_waits.swapRemove(i);
+                return .{ .writable = .{ .session_id = w.session_id, .stream_id = w.stream_id } };
+            }
+            i += 1;
+        }
+        return null;
+    }
+
+    /// What a wait is measured against, or null once it can never be met.
+    fn waitCapacity(self: *WebTransportConnection, w: WritableWait) ?u64 {
+        const sess = self.getSession(w.session_id) orelse return null;
+        if (sess.state != .active and sess.state != .connecting) return null;
+        const stream_id = w.stream_id orelse return self.sendCapacity(w.session_id);
+        const ss = self.quic.streams.getSendStream(stream_id) orelse return null;
+        if (ss.reset_err != null or ss.fin_queued) return null;
+        return self.streamSendCapacity(stream_id);
+    }
+
+    /// The extended CONNECT tokens that open a session: draft-13's
+    /// `webtransport`, and the `webtransport-h3` that later drafts renamed it
+    /// to (picoquic and moq5 send the latter by default).
+    fn isWebTransportProtocol(token: []const u8) bool {
+        return std.mem.eql(u8, token, "webtransport") or std.mem.eql(u8, token, "webtransport-h3");
+    }
+
+    /// Poll H3 events and translate to WT events. One with no WebTransport
+    /// meaning is taken and the next looked at: null has to mean H3 holds
+    /// nothing more, as a server polls again only when something new arrives.
+    fn pollH3Events(self: *WebTransportConnection) !?WtEvent {
+        while (try self.h3.poll()) |event| switch (event) {
+            .connect_request => |req| {
+                if (isWebTransportProtocol(req.protocol)) {
+                    // Register as a connecting session; past our slots the
+                    // request is refused before the application sees it.
+                    if (self.allocateSession(req.stream_id, .connecting) == null) {
+                        if (self.quic.streams.getStream(req.stream_id)) |st| {
+                            st.send.reset(@backingInt(h3_conn.H3Error.request_rejected));
+                            st.recv.stopSending(@backingInt(h3_conn.H3Error.request_rejected));
+                        }
+                        try self.h3.excluded_streams.put(req.stream_id, {});
+                        continue;
+                    }
+                    self.active_session_count += 1;
+                    // Exclude this stream from H3 bidi processing
+                    try self.h3.excluded_streams.put(req.stream_id, {});
+                    try self.adoptConnectStream(req.stream_id);
+                    return .{ .connect_request = .{
+                        .session_id = req.stream_id,
+                        .protocol = req.protocol,
+                        .authority = req.authority,
+                        .path = req.path,
+                        .headers = req.headers,
+                    } };
+                }
+                if (self.is_server) return .{ .request = .{ .stream_id = req.stream_id, .headers = req.headers } };
+            },
+            .headers => |hdr| {
+                // Client: check if this is a response to our CONNECT
+                if (self.getSession(hdr.stream_id)) |session| {
+                    if (session.state == .connecting) {
+                        // Check status code
+                        for (hdr.headers) |h_item| {
+                            if (std.mem.eql(u8, h_item.name, ":status")) {
+                                if (std.mem.eql(u8, h_item.value, "200")) {
+                                    session.state = .active;
+                                    // Exclude CONNECT stream from H3 — WT layer owns it now
+                                    self.h3.excluded_streams.put(hdr.stream_id, {}) catch {};
+                                    try self.adoptConnectStream(hdr.stream_id);
+                                    return .{ .session_ready = .{ .session_id = hdr.stream_id, .headers = hdr.headers } };
+                                } else {
+                                    self.finalizeSession(session);
+                                    return .{ .session_rejected = .{
+                                        .session_id = hdr.stream_id,
+                                        .status = h_item.value,
+                                    } };
+                                }
+                            }
+                        }
+                    }
+                } else if (self.is_server) {
+                    return .{ .request = .{ .stream_id = hdr.stream_id, .headers = hdr.headers } };
+                }
+            },
+            .settings => {
+                // §5.5 credits arrive with the peer's SETTINGS, once per
+                // connection — a session opened before they landed is holding
+                // "unknown, so unlimited" and is corrected here.
+                for (&self.sessions) |*session| {
+                    if (session.occupied) self.applyPeerCredit(&session.fc);
+                }
+            },
+            .data => |d| {
+                // The body has to be drained either way: poll stalls on it.
+                if (self.is_server) {
+                    self.request_body.clearRetainingCapacity();
+                    try self.request_body.resize(self.allocator, d.len);
+                    const n = self.h3.recvBody(self.request_body.items);
+                    return .{ .request_data = .{ .stream_id = d.stream_id, .data = self.request_body.items[0..n] } };
+                }
+                var sink: [4096]u8 = undefined;
+                while (self.h3.recvBody(&sink) > 0) {}
+            },
+            .finished => |stream_id| {
+                // H3 reads a client's CONNECT until it is answered with a 200:
+                // this is the server ending one we never saw accepted.
+                if (self.getSession(stream_id)) |session| {
+                    if (self.connectEnded(session)) |ev| return ev;
+                } else if (self.is_server) {
+                    return .{ .request_end = stream_id };
+                }
+            },
+            .goaway => {
+                // §4.7: GOAWAY drains every session on the connection; H3
+                // keeps new CONNECTs from going out past it.
+                for (&self.sessions) |*session| {
+                    if (session.occupied) session.drain_by_goaway = true;
+                }
+                if (self.pendingDrain()) |ev| return ev;
+            },
+            .shutdown_complete => {},
+            .request_cancelled => |rc| {
+                // As for .finished; a session's own CONNECT is reset in
+                // pollSessionStreams once it is established.
+                if (self.getSession(rc.stream_id)) |session| {
+                    if (self.connectEnded(session)) |ev| return ev;
+                } else if (self.is_server) {
+                    return .{ .request_cancelled = .{ .stream_id = rc.stream_id, .error_code = rc.error_code } };
+                }
+            },
+            .writable => |sid| return .{ .writable = .{ .session_id = sid, .stream_id = sid } },
+        };
+        return null;
+    }
+};
+
+// Tests
+
+test "Session: basic init" {
+    const s = Session{};
+    try std.testing.expect(!s.occupied);
+    try std.testing.expectEqual(SessionState.closed, s.state);
+}
+
+test "DatagramQueue used by WT" {
+    var q: quic_connection.DatagramQueue = .{};
+    defer q.deinitQueue(std.testing.allocator);
+    const data = "hello";
+    try std.testing.expect(q.push(std.testing.allocator, data));
+    var buf: [1200]u8 = undefined;
+    const len = q.pop(&buf).?;
+    try std.testing.expectEqual(@as(usize, 5), len);
+    try std.testing.expectEqualStrings("hello", buf[0..len]);
+}
+
+// =============================================================================
+// WebTransport integration tests via stream-level injection
+// =============================================================================
+
+const testing = std.testing;
+const ack_handler = @import("../quic/ack_handler.zig");
+const flow_control = @import("../quic/flow_control.zig");
+const crypto_stream = @import("../quic/crypto_stream.zig");
+const packet_packer = @import("../quic/packet_packer.zig");
+const protocol = @import("../quic/protocol.zig");
+
+fn createTestQuicConn(is_server: bool) quic_connection.Connection {
+    const dcid = "testdcid" ++ @as([12]u8, @splat(0));
+    const scid = "testscid" ++ @as([12]u8, @splat(0));
+
+    var conn = quic_connection.Connection{
+        .allocator = testing.allocator,
+        .is_server = is_server,
+        .dcid = dcid.*,
+        .dcid_len = 8,
+        .scid = scid.*,
+        .scid_len = 8,
+        .version = protocol.SUPPORTED_VERSIONS[0],
+        .pkt_handler = ack_handler.PacketHandler.init(testing.allocator),
+        .conn_flow_ctrl = flow_control.ConnectionFlowController.init(1048576, 6 * 1024 * 1024),
+        .streams = stream_mod.StreamsMap.init(testing.allocator, is_server),
+        .crypto_streams = crypto_stream.CryptoStreamManager.init(testing.allocator),
+        .packer = packet_packer.PacketPacker.init(
+            testing.allocator,
+            is_server,
+            dcid[0..8],
+            scid[0..8],
+            protocol.SUPPORTED_VERSIONS[0],
+        ),
+    };
+    conn.streams.setMaxStreams(100, 100);
+    conn.streams.setMaxIncomingStreams(100, 100);
+    conn.streams.peer_initial_max_stream_data_bidi_local = 1048576;
+    conn.streams.peer_initial_max_stream_data_bidi_remote = 1048576;
+    conn.streams.peer_initial_max_stream_data_uni = 1048576;
+    conn.conn_flow_ctrl.base.send_window = 1048576;
+    conn.datagrams_enabled = true;
+    return conn;
+}
+
+// Build control stream type byte + WT-enabled SETTINGS
+fn buildWtControlPayload(buf: []u8) usize {
+    var fbs = io.fixedBufferStream(buf);
+    h3_frame.writeUniStreamType(&fbs, .control) catch unreachable;
+    h3_frame.write(.{ .settings = .{
+        .enable_connect_protocol = true,
+        .h3_datagram = true,
+        .enable_webtransport = true,
+        .webtransport_max_sessions = 4,
+    } }, &fbs) catch unreachable;
+    return fbs.seek;
+}
+
+fn injectPeerControlStream(quic_conn: *quic_connection.Connection, h3: *h3_conn.H3Connection, is_server: bool) !void {
+    const peer_uni_id: u64 = if (is_server) 2 else 3;
+    var buf: [128]u8 = undefined;
+    const len = buildWtControlPayload(&buf);
+    const rs = try quic_conn.streams.getOrCreateRecvStream(peer_uni_id);
+    try rs.handleStreamFrame(0, buf[0..len], false);
+    const ev = try h3.poll();
+    if (ev) |e| {
+        switch (e) {
+            .settings => {},
+            else => return error.UnexpectedEvent,
+        }
+    } else return error.ExpectedSettingsEvent;
+}
+
+// Build a QPACK-encoded Extended CONNECT request
+fn buildConnectRequest(buf: []u8, path: []const u8) usize {
+    return buildConnectRequestFor(buf, path, "webtransport");
+}
+
+fn buildConnectRequestFor(buf: []u8, path: []const u8, token: []const u8) usize {
+    const headers = [_]qpack.Header{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = token },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = path },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    var qpack_buf: [256]u8 = undefined;
+    const qpack_len = qpack.encodeHeaders(&headers, &qpack_buf) catch unreachable;
+    var fbs = io.fixedBufferStream(buf);
+    h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, &fbs) catch unreachable;
+    return fbs.seek;
+}
+
+// Build a QPACK-encoded 200 response
+fn buildConnectResponse(buf: []u8) usize {
+    const headers = [_]qpack.Header{
+        .{ .name = ":status", .value = "200" },
+    };
+    var qpack_buf: [256]u8 = undefined;
+    const qpack_len = qpack.encodeHeaders(&headers, &qpack_buf) catch unreachable;
+    var fbs = io.fixedBufferStream(buf);
+    h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, &fbs) catch unreachable;
+    return fbs.seek;
+}
+
+// Build WT bidi stream type prefix: 0x41 + session_id
+fn buildWtBidiPrefix(buf: []u8, session_id: u64) usize {
+    var fbs = io.fixedBufferStream(buf);
+    const w = &fbs;
+    packet.writeVarInt(w, WT_BIDI_STREAM_TYPE) catch unreachable;
+    packet.writeVarInt(w, session_id) catch unreachable;
+    return fbs.seek;
+}
+
+// Build WT uni stream type prefix: 0x54 + session_id
+fn buildWtUniPrefix(buf: []u8, session_id: u64) usize {
+    var fbs = io.fixedBufferStream(buf);
+    const w = &fbs;
+    packet.writeVarInt(w, WT_UNI_STREAM_TYPE) catch unreachable;
+    packet.writeVarInt(w, session_id) catch unreachable;
+    return fbs.seek;
+}
+
+/// The two halves of a flow-controlled setup: the window we grant the peer,
+/// and the one its SETTINGS granted us. The peer's arrive before the session
+/// does, as they do on the wire.
+const FcCredits = struct {
+    streams: u64,
+    data: u64,
+    peer_bidi: ?u64 = null,
+    peer_uni: ?u64 = null,
+    peer_data: ?u64 = null,
+};
+
+// Full setup: QUIC conn + H3 + WT + peer control stream + active session.
+// Returns the session_id of the active session.
+const WtTestSetup = struct {
+    quic_conn: quic_connection.Connection,
+    h3: h3_conn.H3Connection,
+    wt: WebTransportConnection,
+
+    fn initServer(self: *WtTestSetup) !u64 {
+        return self.initServerWith(null);
+    }
+
+    /// `credits` turns draft-13 §5.1 session flow control on: both endpoints
+    /// advertise WT_MAX_SESSIONS above one on the draft-13 codepoint — which is
+    /// what makes the limits bind at all — and we advertise that per-session
+    /// window. Without it the peer looks like Chrome: WebTransport over the
+    /// pre-draft-13 settings, and no session flow control anywhere.
+    fn initServerWith(self: *WtTestSetup, credits: ?FcCredits) !u64 {
+        self.quic_conn = createTestQuicConn(true);
+        self.h3 = h3_conn.H3Connection.init(testing.allocator, &self.quic_conn, true);
+        self.h3.local_settings.enable_connect_protocol = true;
+        self.h3.local_settings.enable_webtransport = true;
+        self.h3.local_settings.h3_datagram = true;
+        if (credits != null) self.h3.local_settings.wt_max_sessions_v13 = MAX_SESSIONS;
+        try self.h3.initConnection();
+        try injectPeerControlStream(&self.quic_conn, &self.h3, true);
+        if (credits) |c| {
+            self.h3.peer_settings.wt_max_sessions_v13 = MAX_SESSIONS;
+            self.h3.peer_settings.wt_initial_max_streams_bidi = c.peer_bidi;
+            self.h3.peer_settings.wt_initial_max_streams_uni = c.peer_uni;
+            self.h3.peer_settings.wt_initial_max_data = c.peer_data;
+        }
+        self.wt = WebTransportConnection.init(testing.allocator, &self.h3, &self.quic_conn, true);
+        if (credits) |c| self.wt.grants = .{
+            .max_streams_bidi = c.streams,
+            .max_streams_uni = c.streams,
+            .max_data = c.data,
+        };
+
+        // Inject CONNECT request on client bidi stream 0
+        var req_buf: [512]u8 = undefined;
+        const req_len = buildConnectRequest(&req_buf, "/wt");
+        const stream = try self.quic_conn.streams.getOrCreateStream(0);
+        try stream.recv.handleStreamFrame(0, req_buf[0..req_len], false);
+
+        // Poll WT to get connect_request event
+        const ev = try self.wt.poll();
+        if (ev) |e| {
+            switch (e) {
+                .connect_request => {},
+                else => return error.UnexpectedEvent,
+            }
+        } else return error.ExpectedConnectRequest;
+
+        // Accept the session
+        try self.wt.acceptSession(0);
+        return 0;
+    }
+
+    fn initClient(self: *WtTestSetup) !u64 {
+        self.quic_conn = createTestQuicConn(false);
+        self.h3 = h3_conn.H3Connection.init(testing.allocator, &self.quic_conn, false);
+        self.h3.local_settings.enable_connect_protocol = true;
+        self.h3.local_settings.enable_webtransport = true;
+        self.h3.local_settings.h3_datagram = true;
+        try self.h3.initConnection();
+        try injectPeerControlStream(&self.quic_conn, &self.h3, false);
+        self.wt = WebTransportConnection.init(testing.allocator, &self.h3, &self.quic_conn, false);
+
+        // Client initiates connect
+        const session_id = try self.wt.connect("example.com", "/wt");
+
+        // Inject 200 response from server on the CONNECT stream
+        var resp_buf: [256]u8 = undefined;
+        const resp_len = buildConnectResponse(&resp_buf);
+        const stream = self.quic_conn.streams.getStream(session_id).?;
+        const offset = stream.recv.sorter.highestReceived();
+        try stream.recv.handleStreamFrame(offset, resp_buf[0..resp_len], false);
+
+        // Poll to get session_ready
+        const ev = try self.wt.poll();
+        if (ev) |e| {
+            switch (e) {
+                .session_ready => {},
+                else => return error.UnexpectedEvent,
+            }
+        } else return error.ExpectedSessionReady;
+
+        return session_id;
+    }
+
+    fn deinit(self: *WtTestSetup) void {
+        self.wt.deinit();
+        self.h3.deinit();
+        self.quic_conn.deinit();
+    }
+};
+
+// ---- Group A: Session management ----
+
+test "WT integration: connect initiates session" {
+    var quic_conn = createTestQuicConn(false);
+    defer quic_conn.deinit();
+    var h3 = h3_conn.H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    h3.local_settings.enable_connect_protocol = true;
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3, false);
+    var wt = WebTransportConnection.init(testing.allocator, &h3, &quic_conn, false);
+    defer wt.deinit();
+
+    const session_id = try wt.connect("example.com", "/wt");
+    // Session should be allocated in connecting state
+    const session = wt.getSession(session_id).?;
+    try testing.expectEqual(SessionState.connecting, session.state);
+    try testing.expectEqual(@as(u32, 1), wt.active_session_count);
+}
+
+test "WT integration: acceptSession activates session" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const session = setup.wt.getSession(session_id).?;
+    try testing.expectEqual(SessionState.active, session.state);
+    try testing.expectEqual(@as(u32, 1), setup.wt.active_session_count);
+}
+
+test "WT integration: session limit enforced" {
+    var quic_conn = createTestQuicConn(false);
+    defer quic_conn.deinit();
+    var h3 = h3_conn.H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    h3.local_settings.enable_connect_protocol = true;
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3, false);
+    var wt = WebTransportConnection.init(testing.allocator, &h3, &quic_conn, false);
+    defer wt.deinit();
+
+    // Peer advertised webtransport_max_sessions = 4
+    // Connect up to the limit
+    var i: u32 = 0;
+    while (i < 4) : (i += 1) {
+        _ = try wt.connect("example.com", "/wt");
+    }
+
+    // Next connect should fail
+    const result = wt.connect("example.com", "/wt");
+    try testing.expectError(error.TooManySessions, result);
+}
+
+test "WT integration: closeSession sends CLOSE frame and FIN" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    setup.wt.closeSession(session_id);
+
+    const session = setup.wt.getSession(session_id);
+    // Session should be in draining state or finalized
+    if (session) |s| {
+        try testing.expect(s.state == .draining or s.state == .closed);
+    }
+
+    // CONNECT stream should have FIN queued
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    try testing.expect(stream.send.fin_queued);
+    // Write buffer should contain CLOSE_WEBTRANSPORT_SESSION frame
+    try testing.expect(stream.send.write_buffer.items.len > 0);
+}
+
+// ---- Group B: Stream opening ----
+
+test "WT integration: openBidiStream writes type prefix" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
+    const stream = setup.quic_conn.streams.getStream(stream_id).?;
+
+    // Write buffer should contain WT bidi prefix: 0x41 + session_id
+    try testing.expect(stream.send.write_buffer.items.len >= 2);
+    // Parse the prefix
+    var fbs = io.fixedBufferStream(stream.send.write_buffer.items);
+    const reader = &fbs;
+    const stream_type = packet.readVarInt(reader) catch unreachable;
+    try testing.expectEqual(WT_BIDI_STREAM_TYPE, stream_type);
+    const sid = packet.readVarInt(reader) catch unreachable;
+    try testing.expectEqual(session_id, sid);
+
+    // Should be tracked in wt_bidi_streams
+    try testing.expect(setup.wt.wt_bidi_streams.contains(stream_id));
+}
+
+test "WT integration: openUniStream writes type prefix" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openUniStream(session_id, null);
+    const send_stream = setup.quic_conn.streams.send_streams.get(stream_id).?;
+
+    // Write buffer should contain WT uni prefix: 0x54 + session_id
+    try testing.expect(send_stream.write_buffer.items.len >= 2);
+    var fbs = io.fixedBufferStream(send_stream.write_buffer.items);
+    const reader = &fbs;
+    const stream_type = packet.readVarInt(reader) catch unreachable;
+    try testing.expectEqual(WT_UNI_STREAM_TYPE, stream_type);
+    const sid = packet.readVarInt(reader) catch unreachable;
+    try testing.expectEqual(session_id, sid);
+
+    try testing.expect(setup.wt.wt_uni_streams.contains(stream_id));
+}
+
+test "WT integration: sendStreamData writes to bidi stream" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
+    try setup.wt.sendStreamData(stream_id, "Hello WT!");
+
+    const stream = setup.quic_conn.streams.getStream(stream_id).?;
+    // Write buffer should contain prefix + "Hello WT!"
+    const items = stream.send.write_buffer.items;
+    try testing.expect(items.len > 9);
+    // The payload should end with "Hello WT!"
+    try testing.expectEqualStrings("Hello WT!", items[items.len - 9 ..]);
+}
+
+test "WT integration: getSendStreamStats returns byte counters" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
+    try setup.wt.sendStreamData(stream_id, "Hello WT!");
+
+    const stats = setup.wt.getSendStreamStats(stream_id).?;
+    // write_offset includes WT type prefix + session_id varint + "Hello WT!"
+    try testing.expect(stats.bytes_written > 9);
+    // Nothing sent to network yet (no packet packing happened)
+    try testing.expectEqual(@as(u64, 0), stats.bytes_sent);
+    try testing.expectEqual(@as(u64, 0), stats.bytes_acknowledged);
+}
+
+test "WT integration: getRecvStreamStats returns byte counters" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
+    const stats = setup.wt.getRecvStreamStats(stream_id).?;
+    // Fresh stream — no data received or read
+    try testing.expectEqual(@as(u64, 0), stats.bytes_received);
+    try testing.expectEqual(@as(u64, 0), stats.bytes_read);
+}
+
+test "WT integration: stream stats returns null for unknown stream" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+
+    try testing.expect(setup.wt.getSendStreamStats(999) == null);
+    try testing.expect(setup.wt.getRecvStreamStats(999) == null);
+}
+
+test "WT integration: closeStream sends FIN" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
+    setup.wt.closeStream(stream_id);
+
+    const stream = setup.quic_conn.streams.getStream(stream_id).?;
+    try testing.expect(stream.send.fin_queued);
+}
+
+test "WT integration: stopSending sets stop_sending_err without resetting send" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
+    try setup.wt.sendStreamData(stream_id, "data");
+
+    // stopSending should set recv stop_sending_err but NOT reset the send side
+    setup.wt.stopSending(stream_id, 42);
+
+    const stream = setup.quic_conn.streams.getStream(stream_id).?;
+    try testing.expect(stream.recv.stop_sending_err != null);
+    try testing.expect(stream.send.reset_err == null); // send side untouched
+    try testing.expect(!stream.send.fin_queued); // FIN not queued either
+}
+
+// ---- Group C: Incoming stream identification ----
+
+test "WT integration: identifies incoming WT bidi stream" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Inject WT bidi prefix on client-initiated bidi stream 4
+    var prefix_buf: [16]u8 = undefined;
+    const prefix_len = buildWtBidiPrefix(&prefix_buf, session_id);
+    const stream = try setup.quic_conn.streams.getOrCreateStream(4);
+    try stream.recv.handleStreamFrame(0, prefix_buf[0..prefix_len], false);
+
+    const ev = try setup.wt.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .bidi_stream => |bs| {
+            try testing.expectEqual(session_id, bs.session_id);
+            try testing.expectEqual(@as(u64, 4), bs.stream_id);
+        },
+        else => return error.UnexpectedEvent,
+    }
+
+    // Should be tracked and excluded from H3
+    try testing.expect(setup.wt.wt_bidi_streams.contains(4));
+    try testing.expect(setup.h3.excluded_streams.contains(4));
+}
+
+test "WT integration: identifies incoming WT uni stream" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Inject WT uni prefix on client-initiated uni stream
+    // Client uni streams for server: 2, 6, 10, ...
+    // Stream 2 is already used by peer control stream, 6 and 10 might be QPACK
+    // Use a higher one: 14
+    var prefix_buf: [16]u8 = undefined;
+    const prefix_len = buildWtUniPrefix(&prefix_buf, session_id);
+    const rs = try setup.quic_conn.streams.getOrCreateRecvStream(14);
+    try rs.handleStreamFrame(0, prefix_buf[0..prefix_len], false);
+
+    const ev = try setup.wt.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .uni_stream => |us| {
+            try testing.expectEqual(session_id, us.session_id);
+            try testing.expectEqual(@as(u64, 14), us.stream_id);
+        },
+        else => return error.UnexpectedEvent,
+    }
+
+    try testing.expect(setup.wt.wt_uni_streams.contains(14));
+}
+
+test "WT integration: a paused uni stream's data waits for resume, unread by H3" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+    while (try setup.wt.poll()) |_| {}
+
+    var buf: [16]u8 = undefined;
+    const n = buildWtUniPrefix(&buf, session_id);
+    const rs = try setup.quic_conn.streams.getOrCreateRecvStream(14);
+    try rs.handleStreamFrame(0, buf[0..n], false);
+    try testing.expect((try setup.wt.poll()).? == .uni_stream);
+    try setup.wt.pauseStream(14);
+
+    // Bytes H3 would read as a control stream and a GOAWAY.
+    const payload = [_]u8{ 0x00, 0x07, 0x01, 0x00 };
+    try rs.handleStreamFrame(n, &payload, true);
+    while (try setup.wt.poll()) |_| {}
+    try testing.expect(setup.h3.peer_control_stream_id != 14);
+    try testing.expectEqual(@as(u64, n), rs.bytes_read);
+
+    setup.wt.resumeStream(14);
+    const ev = (try setup.wt.poll()).?;
+    try testing.expectEqualSlices(u8, &payload, ev.stream_data.data);
+    try testing.expect(ev.stream_data.fin);
+    testing.allocator.free(ev.stream_data.data);
+}
+
+test "WT integration: bidi stream with trailing data buffers remainder" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Inject WT bidi prefix + "extra data" in one shot
+    var buf: [64]u8 = undefined;
+    const prefix_len = buildWtBidiPrefix(&buf, session_id);
+    const extra = "extra data";
+    @memcpy(buf[prefix_len..][0..extra.len], extra);
+    const total_len = prefix_len + extra.len;
+
+    const stream = try setup.quic_conn.streams.getOrCreateStream(4);
+    try stream.recv.handleStreamFrame(0, buf[0..total_len], false);
+
+    // First poll: bidi_stream event (identification)
+    const ev1 = try setup.wt.poll();
+    try testing.expect(ev1 != null);
+    switch (ev1.?) {
+        .bidi_stream => |bs| {
+            try testing.expectEqual(@as(u64, session_id), bs.session_id);
+            try testing.expectEqual(@as(u64, 4), bs.stream_id);
+        },
+        else => return error.UnexpectedEvent,
+    }
+
+    // Second poll: stream_data with buffered remainder
+    const ev2 = try setup.wt.poll();
+    try testing.expect(ev2 != null);
+    switch (ev2.?) {
+        .stream_data => |sd| {
+            try testing.expectEqual(@as(u64, 4), sd.stream_id);
+            try testing.expectEqualStrings(extra, sd.data);
+            try testing.expect(!sd.fin);
+            // Caller owns this data — free it
+            testing.allocator.free(sd.data);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+// ---- Group D: Datagram handling ----
+
+test "WT integration: sendDatagram writes quarter_stream_id + payload" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    try setup.wt.sendDatagram(session_id, "dgram payload");
+
+    // Read from QUIC datagram send queue
+    var dgram_buf: [1200]u8 = undefined;
+    const dgram_len = setup.quic_conn.datagram_send_queue.pop(&dgram_buf).?;
+
+    // Parse quarter_stream_id
+    var fbs = io.fixedBufferStream(dgram_buf[0..dgram_len]);
+    const quarter_id = packet.readVarInt(&fbs) catch unreachable;
+    try testing.expectEqual(session_id / 4, quarter_id);
+    // Rest is payload
+    try testing.expectEqualStrings("dgram payload", dgram_buf[fbs.seek..dgram_len]);
+}
+
+test "WT integration: poll receives datagram demuxed by session" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Manually push a datagram into the QUIC recv queue
+    const quarter_id = session_id / 4;
+    var dgram_buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&dgram_buf);
+    packet.writeVarInt(&fbs, quarter_id) catch unreachable;
+    fbs.writeAll("hello dgram") catch unreachable;
+    try testing.expect(setup.quic_conn.datagram_recv_queue.push(testing.allocator, dgram_buf[0..fbs.seek]));
+
+    const ev = try setup.wt.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .datagram => |dg| {
+            try testing.expectEqual(session_id, dg.session_id);
+            try testing.expectEqualStrings("hello dgram", dg.data);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+// ---- Group E: H3 event translation ----
+
+test "WT integration: server receives connect_request from H3" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = h3_conn.H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    h3.local_settings.enable_connect_protocol = true;
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3, true);
+    var wt = WebTransportConnection.init(testing.allocator, &h3, &quic_conn, true);
+    defer wt.deinit();
+
+    // Inject CONNECT request
+    var req_buf: [512]u8 = undefined;
+    const req_len = buildConnectRequest(&req_buf, "/webtransport");
+    const stream = try quic_conn.streams.getOrCreateStream(0);
+    try stream.recv.handleStreamFrame(0, req_buf[0..req_len], false);
+
+    const ev = try wt.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .connect_request => |cr| {
+            try testing.expectEqual(@as(u64, 0), cr.session_id);
+            try testing.expectEqualStrings("webtransport", cr.protocol);
+            try testing.expectEqualStrings("/webtransport", cr.path);
+            try testing.expectEqualStrings("example.com", cr.authority);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "WT: a CONNECT behind the peer's SETTINGS comes out of the same poll" {
+    // A poll that took SETTINGS and returned null left the CONNECT for the
+    // next packet, which a server that polls only on news may never get.
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = h3_conn.H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    h3.local_settings.enable_connect_protocol = true;
+    try h3.initConnection();
+    var wt = WebTransportConnection.init(testing.allocator, &h3, &quic_conn, true);
+    defer wt.deinit();
+
+    var ctrl: [128]u8 = undefined;
+    const ctrl_len = buildWtControlPayload(&ctrl);
+    try (try quic_conn.streams.getOrCreateRecvStream(2)).handleStreamFrame(0, ctrl[0..ctrl_len], false);
+    var req: [512]u8 = undefined;
+    const req_len = buildConnectRequest(&req, "/wt");
+    try (try quic_conn.streams.getOrCreateStream(0)).recv.handleStreamFrame(0, req[0..req_len], false);
+
+    const ev = (try wt.poll()) orelse return error.ExpectedConnectRequest;
+    try testing.expect(ev == .connect_request);
+    try testing.expect(h3.peer_settings_received);
+}
+
+test "WT integration: webtransport-h3 opens a session too" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = h3_conn.H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    h3.local_settings.enable_connect_protocol = true;
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3, true);
+    var wt = WebTransportConnection.init(testing.allocator, &h3, &quic_conn, true);
+    defer wt.deinit();
+
+    var req_buf: [512]u8 = undefined;
+    const req_len = buildConnectRequestFor(&req_buf, "/moq", "webtransport-h3");
+    const stream = try quic_conn.streams.getOrCreateStream(0);
+    try stream.recv.handleStreamFrame(0, req_buf[0..req_len], false);
+
+    const ev = (try wt.poll()) orelse return error.NoEvent;
+    try testing.expectEqualStrings("webtransport-h3", ev.connect_request.protocol);
+}
+
+test "WT integration: client receives session_ready on 200 response" {
+    var setup: WtTestSetup = undefined;
+    // initClient already does the full connect+200 flow and verifies session_ready
+    const session_id = try setup.initClient();
+    defer setup.deinit();
+
+    const session = setup.wt.getSession(session_id).?;
+    try testing.expectEqual(SessionState.active, session.state);
+}
+
+test "WT integration: a close arriving with the 200 is not lost" {
+    var quic_conn = createTestQuicConn(false);
+    defer quic_conn.deinit();
+    var h3 = h3_conn.H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    h3.local_settings.enable_connect_protocol = true;
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3, false);
+    var wt = WebTransportConnection.init(testing.allocator, &h3, &quic_conn, false);
+    defer wt.deinit();
+
+    const session_id = try wt.connect("example.com", "/wt");
+
+    // HEADERS and WT_CLOSE_SESSION in one read, as a server closing at once sends them.
+    var buf: [512]u8 = undefined;
+    var fbs = io.fixedBufferStream(@as([]u8, &buf));
+    fbs.seek = buildConnectResponse(&buf);
+    try h3_frame.write(.{ .close_webtransport_session = .{ .error_code = 42, .reason = "test" } }, &fbs);
+    const len = fbs.seek;
+    const stream = quic_conn.streams.getStream(session_id).?;
+    try stream.recv.handleStreamFrame(stream.recv.sorter.highestReceived(), buf[0..len], true);
+
+    _ = try pollFor(&wt, .session_ready);
+    const closed = try pollFor(&wt, .session_closed);
+    try testing.expectEqual(@as(u32, 42), closed.session_closed.error_code);
+    try testing.expectEqualStrings("test", closed.session_closed.reason);
+}
+
+test "WT integration: client receives session_rejected on non-200" {
+    var quic_conn = createTestQuicConn(false);
+    defer quic_conn.deinit();
+    var h3 = h3_conn.H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    h3.local_settings.enable_connect_protocol = true;
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3, false);
+    var wt = WebTransportConnection.init(testing.allocator, &h3, &quic_conn, false);
+    defer wt.deinit();
+
+    const session_id = try wt.connect("example.com", "/wt");
+
+    // Inject 403 response
+    const resp_headers = [_]qpack.Header{
+        .{ .name = ":status", .value = "403" },
+    };
+    var qpack_buf: [256]u8 = undefined;
+    const qpack_len = qpack.encodeHeaders(&resp_headers, &qpack_buf) catch unreachable;
+    var frame_buf: [512]u8 = undefined;
+    var fbs = io.fixedBufferStream(&frame_buf);
+    h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, &fbs) catch unreachable;
+
+    const stream = quic_conn.streams.getStream(session_id).?;
+    const offset = stream.recv.sorter.highestReceived();
+    try stream.recv.handleStreamFrame(offset, fbs.buffered(), false);
+
+    const ev = try wt.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .session_rejected => |rej| {
+            try testing.expectEqual(session_id, rej.session_id);
+            try testing.expectEqualStrings("403", rej.status);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+// ---- Group F: Session close ----
+
+/// Unwrap a capsule written to a CONNECT stream. Asserts the DATA wrapper is
+/// there: sent bare, the peer ignores the capsule as an unknown H3 frame type.
+fn expectCapsulePayload(written: []const u8) ![]const u8 {
+    const outer = try h3_frame.parse(written);
+    switch (outer.frame) {
+        .data => |payload| return payload,
+        else => return error.CapsuleNotWrappedInDataFrame,
+    }
+}
+
+test "WT integration: closeSessionWithError sends CLOSE frame" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Record write buffer length before close (response HEADERS already written)
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    const pre_len = stream.send.write_buffer.items.len;
+
+    try setup.wt.closeSessionWithError(session_id, 42, "test error");
+
+    try testing.expect(stream.send.fin_queued);
+    // Parse the CLOSE frame from the portion written after acceptSession's response
+    const close_data = try expectCapsulePayload(stream.send.write_buffer.items[pre_len..]);
+    try testing.expect(close_data.len > 0);
+    const result = h3_frame.parse(close_data) catch unreachable;
+    switch (result.frame) {
+        .close_webtransport_session => |cls| {
+            try testing.expectEqual(@as(u32, 42), cls.error_code);
+            try testing.expectEqualStrings("test error", cls.reason);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "WT integration: receiving CLOSE_WEBTRANSPORT_SESSION produces session_closed" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Build and inject CLOSE_WEBTRANSPORT_SESSION frame on the CONNECT stream
+    var frame_buf: [256]u8 = undefined;
+    var fbs = io.fixedBufferStream(&frame_buf);
+    h3_frame.write(.{ .close_webtransport_session = .{
+        .error_code = 7,
+        .reason = "goodbye",
+    } }, &fbs) catch unreachable;
+
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    const offset = stream.recv.sorter.highestReceived();
+    try stream.recv.handleStreamFrame(offset, fbs.buffered(), false);
+
+    const ev = try setup.wt.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .session_closed => |sc| {
+            try testing.expectEqual(session_id, sc.session_id);
+            try testing.expectEqual(@as(u32, 7), sc.error_code);
+            try testing.expectEqualStrings("goodbye", sc.reason);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+/// Append `data` to what the peer has sent on a session's CONNECT stream.
+fn peerSends(setup: *WtTestSetup, session_id: u64, data: []const u8, fin: bool) !*stream_mod.Stream {
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    try stream.recv.handleStreamFrame(stream.recv.sorter.highestReceived(), data, fin);
+    return stream;
+}
+
+/// A capsule as a browser sends it: inside an H3 DATA frame.
+fn wrapCapsule(buf: []u8, capsule: h3_frame.H3Frame) []const u8 {
+    var inner: [1200]u8 = undefined;
+    var ifbs = io.fixedBufferStream(&inner);
+    h3_frame.write(capsule, &ifbs) catch unreachable;
+    var fbs = io.fixedBufferStream(buf);
+    h3_frame.write(.{ .data = ifbs.buffered() }, &fbs) catch unreachable;
+    return fbs.buffered();
+}
+
+test "WT: a bare FIN on the CONNECT stream closes the session as code 0, and is answered with ours" {
+    for ([_]bool{ true, false }) |server| {
+        var setup: WtTestSetup = undefined;
+        const session_id = if (server) try setup.initServer() else try setup.initClient();
+        defer setup.deinit();
+        const data_stream = try setup.wt.openBidiStream(session_id, null);
+
+        const stream = try peerSends(&setup, session_id, "", true);
+        const ev = try pollFor(&setup.wt, .session_closed);
+        try testing.expectEqual(session_id, ev.session_closed.session_id);
+        try testing.expectEqual(@as(u32, 0), ev.session_closed.error_code);
+        try testing.expectEqualStrings("", ev.session_closed.reason);
+        try testing.expect(!ev.session_closed.abrupt);
+        try testing.expect(setup.wt.getSession(session_id) == null);
+
+        // §6: our side FINs too, without a STOP_SENDING, and the session's
+        // streams go with it.
+        try testing.expect(stream.send.fin_queued);
+        try testing.expectEqual(@as(?u64, null), stream.send.reset_err);
+        try testing.expectEqual(@as(?u64, null), stream.recv.stop_sending_err);
+        const ds = setup.quic_conn.streams.getStream(data_stream).?;
+        try testing.expectEqual(@as(?u64, WEBTRANSPORT_SESSION_GONE), ds.send.reset_err);
+    }
+}
+
+test "WT: a FIN behind a flow-control capsule in the same read still closes the session" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    var buf: [64]u8 = undefined;
+    _ = try peerSends(&setup, session_id, wrapCapsule(&buf, .{ .wt_max_data = 1 << 20 }), false);
+    _ = try peerSends(&setup, session_id, "", true);
+    const ev = (try setup.wt.poll()).?;
+    try testing.expectEqual(@as(u32, 0), ev.session_closed.error_code);
+}
+
+test "WT: a peer RESET_STREAM on the CONNECT stream ends the session abruptly" {
+    for ([_]bool{ true, false }) |server| {
+        var setup: WtTestSetup = undefined;
+        const session_id = if (server) try setup.initServer() else try setup.initClient();
+        defer setup.deinit();
+        const data_stream = try setup.wt.openBidiStream(session_id, null);
+
+        const stream = setup.quic_conn.streams.getStream(session_id).?;
+        try stream.recv.handleResetStream(@backingInt(h3_conn.H3Error.request_cancelled), stream.recv.sorter.highestReceived());
+        const ev = try pollFor(&setup.wt, .session_closed);
+        try testing.expect(ev.session_closed.abrupt);
+        try testing.expectEqual(@as(u32, 0), ev.session_closed.error_code);
+        try testing.expectEqualStrings("", ev.session_closed.reason);
+
+        // Our half is reset too, never finished: a FIN would read as clean.
+        try testing.expect(!stream.send.fin_queued);
+        try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.request_cancelled)), stream.send.reset_err);
+        const ds = setup.quic_conn.streams.getStream(data_stream).?;
+        try testing.expectEqual(@as(?u64, WEBTRANSPORT_SESSION_GONE), ds.send.reset_err);
+        try testing.expectEqual(@as(?u64, WEBTRANSPORT_SESSION_GONE), ds.recv.stop_sending_err);
+    }
+}
+
+test "WT: a peer STOP_SENDING on the CONNECT stream ends the session abruptly" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // What the QUIC layer does on STOP_SENDING: our send side is reset with its code.
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    stream.send.reset(WEBTRANSPORT_SESSION_GONE);
+    stream.send.peer_stop_sending = WEBTRANSPORT_SESSION_GONE;
+
+    const ev = try pollFor(&setup.wt, .session_closed);
+    try testing.expect(ev.session_closed.abrupt);
+    // Its send side is still open: we stop reading it.
+    try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.request_cancelled)), stream.recv.stop_sending_err);
+}
+
+test "WT: a close capsule arriving with a STOP_SENDING keeps its code" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // webtransport-go closes with capsule, STOP_SENDING and FIN in one flight.
+    var buf: [64]u8 = undefined;
+    const stream = try peerSends(&setup, session_id, wrapCapsule(&buf, .{ .close_webtransport_session = .{ .error_code = 9, .reason = "go" } }), true);
+    stream.send.reset(1337);
+    stream.send.peer_stop_sending = 1337;
+
+    const ev = (try setup.wt.poll()).?;
+    try testing.expect(!ev.session_closed.abrupt);
+    try testing.expectEqual(@as(u32, 9), ev.session_closed.error_code);
+    try testing.expectEqualStrings("go", ev.session_closed.reason);
+}
+
+test "WT: a FIN that cuts a capsule short ends the session with H3_MESSAGE_ERROR" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    var buf: [64]u8 = undefined;
+    const whole = wrapCapsule(&buf, .{ .close_webtransport_session = .{ .error_code = 9, .reason = "truncated" } });
+    const stream = try peerSends(&setup, session_id, whole[0 .. whole.len - 3], true);
+
+    const ev = (try setup.wt.poll()).?;
+    try testing.expect(ev.session_closed.abrupt);
+    try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.message_error)), stream.send.reset_err);
+}
+
+test "WT: a close reason that is not UTF-8 or longer than 1024 bytes is H3_MESSAGE_ERROR" {
+    // 0xff is never UTF-8; the long one is past the 4 KB we would buffer.
+    const bad = [_]u8{ 'a', 0xff };
+    const long: [5000]u8 = @splat('x');
+    for ([_][]const u8{ &bad, long[0..1025], &long }) |reason| {
+        var setup: WtTestSetup = undefined;
+        const session_id = try setup.initServer();
+        defer setup.deinit();
+
+        var payload: [4 + long.len]u8 = undefined;
+        std.mem.writeInt(u32, payload[0..4], 9, .big);
+        @memcpy(payload[4..][0..reason.len], reason);
+        var hdr: [16]u8 = undefined;
+        var fbs = io.fixedBufferStream(&hdr);
+        try packet.writeVarInt(&fbs, @backingInt(h3_frame.H3FrameType.close_webtransport_session));
+        try packet.writeVarInt(&fbs, 4 + reason.len);
+        _ = try peerSends(&setup, session_id, fbs.buffered(), false);
+        const stream = try peerSends(&setup, session_id, payload[0 .. 4 + reason.len], false);
+
+        const ev = (try setup.wt.poll()).?;
+        try testing.expect(ev.session_closed.abrupt);
+        try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.message_error)), stream.send.reset_err);
+    }
+}
+
+test "WT: data after a received close resets the CONNECT stream, and the close stands" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    var buf: [64]u8 = undefined;
+    const close = wrapCapsule(&buf, .{ .close_webtransport_session = .{ .error_code = 5, .reason = "bye" } });
+    _ = try peerSends(&setup, session_id, close, false);
+    var more: [64]u8 = undefined;
+    const stream = try peerSends(&setup, session_id, wrapCapsule(&more, .{ .wt_max_data = 7 }), false);
+
+    const ev = (try setup.wt.poll()).?;
+    try testing.expect(!ev.session_closed.abrupt);
+    try testing.expectEqual(@as(u32, 5), ev.session_closed.error_code);
+    try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.message_error)), stream.send.reset_err);
+}
+
+test "WT: bytes after the peer's close in a later read reset the CONNECT stream" {
+    for ([_]bool{ true, false }) |server| {
+        var setup: WtTestSetup = undefined;
+        const session_id = if (server) try setup.initServer() else try setup.initClient();
+        defer setup.deinit();
+
+        var buf: [64]u8 = undefined;
+        const stream = try peerSends(&setup, session_id, wrapCapsule(&buf, .{ .close_webtransport_session = .{ .error_code = 5, .reason = "bye" } }), false);
+        const ev = try pollFor(&setup.wt, .session_closed);
+        try testing.expectEqual(@as(u32, 5), ev.session_closed.error_code);
+        try testing.expect(stream.send.fin_queued);
+        try testing.expectEqual(@as(?u64, null), stream.send.reset_err);
+
+        // The CONNECT stream is still read: what follows is a §6 violation.
+        _ = try peerSends(&setup, session_id, "x", false);
+        try testing.expectEqual(@as(?WtEvent, null), try setup.wt.poll());
+        try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.message_error)), stream.send.reset_err);
+        try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.message_error)), stream.recv.stop_sending_err);
+        try testing.expect(setup.wt.getSession(session_id) == null);
+    }
+}
+
+test "WT: the peer's FIN after its close ends the wait for it, with nothing more reported" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    var buf: [64]u8 = undefined;
+    const stream = try peerSends(&setup, session_id, wrapCapsule(&buf, .{ .close_webtransport_session = .{ .error_code = 5, .reason = "bye" } }), false);
+    _ = try pollFor(&setup.wt, .session_closed);
+    try testing.expectEqual(SessionState.awaiting_fin, setup.wt.getSession(session_id).?.state);
+
+    _ = try peerSends(&setup, session_id, "", true);
+    try testing.expectEqual(@as(?WtEvent, null), try setup.wt.poll());
+    try testing.expect(setup.wt.getSession(session_id) == null);
+    try testing.expectEqual(@as(?u64, null), stream.send.reset_err);
+    try testing.expectEqual(@as(u32, 0), setup.wt.active_session_count);
+}
+
+test "WT: closes that cross report our own, once the peer's FIN is in" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initClient();
+    defer setup.deinit();
+
+    try setup.wt.closeSessionWithError(session_id, 3, "ours");
+    var buf: [64]u8 = undefined;
+    const stream = try peerSends(&setup, session_id, wrapCapsule(&buf, .{ .close_webtransport_session = .{ .error_code = 9, .reason = "theirs" } }), false);
+    try testing.expectEqual(@as(?WtEvent, null), try setup.wt.poll());
+    _ = try peerSends(&setup, session_id, "", true);
+    const ev = try pollFor(&setup.wt, .session_closed);
+    try testing.expectEqual(@as(u32, 3), ev.session_closed.error_code);
+    try testing.expectEqualStrings("ours", ev.session_closed.reason);
+    try testing.expectEqual(@as(?u64, null), stream.send.reset_err);
+}
+
+/// Every event `poll` has left, up to a bound.
+fn drainEvents(wt: *WebTransportConnection, out: []WtEvent) ![]WtEvent {
+    var n: usize = 0;
+    while (try wt.poll()) |ev| {
+        if (n == out.len) return error.TooManyEvents;
+        out[n] = ev;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+test "WT: a connection that ends reports each session once, by its own id" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer(); // session 0, active
+    defer setup.deinit();
+    try injectConnect(&setup, 4);
+    try setup.wt.acceptSession(4);
+    try setup.wt.closeSessionWithError(4, 44, "ours"); // draining
+    try injectConnect(&setup, 8);
+    try setup.wt.acceptSession(8);
+    var buf: [64]u8 = undefined;
+    _ = try peerSends(&setup, 8, wrapCapsule(&buf, .{ .close_webtransport_session = .{ .error_code = 8, .reason = "theirs" } }), false);
+    _ = try pollFor(&setup.wt, .session_closed); // 8, reported; its FIN still due
+    try injectConnect(&setup, 12); // offered, not answered
+
+    setup.quic_conn.state = .draining;
+    var events: [8]WtEvent = undefined;
+    const got = try drainEvents(&setup.wt, &events);
+    try testing.expectEqual(@as(usize, 3), got.len);
+    try testing.expectEqual(@as(u64, 0), got[0].session_closed.session_id);
+    try testing.expect(got[0].session_closed.abrupt);
+    try testing.expectEqual(@as(u64, 4), got[1].session_closed.session_id);
+    try testing.expectEqual(@as(u32, 44), got[1].session_closed.error_code);
+    try testing.expectEqualStrings("ours", got[1].session_closed.reason);
+    try testing.expect(!got[1].session_closed.abrupt);
+    try testing.expectEqual(@as(u64, 12), got[2].session_closed.session_id);
+    try testing.expect(got[2].session_closed.abrupt);
+    // Nothing is left to report, however often it is asked.
+    try testing.expectEqual(@as(?WtEvent, null), setup.wt.nextLostSession());
+    try testing.expectEqual(@as(u32, 0), setup.wt.active_session_count);
+}
+
+test "WT: a client's session still waiting on its response is rejected when the connection ends" {
+    var setup: WtTestSetup = undefined;
+    const first = try setup.initClient();
+    defer setup.deinit();
+    const second = try setup.wt.connect("example.com", "/wt");
+
+    setup.quic_conn.state = .terminated;
+    var events: [8]WtEvent = undefined;
+    const got = try drainEvents(&setup.wt, &events);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqual(first, got[0].session_closed.session_id);
+    try testing.expect(got[0].session_closed.abrupt);
+    try testing.expectEqual(second, got[1].session_rejected.session_id);
+    try testing.expectEqualStrings("", got[1].session_rejected.status);
+}
+
+test "WT: a CONNECT the peer resets before it is answered ends abruptly, and can't be accepted" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+    try injectConnect(&setup, 4);
+
+    const stream = setup.quic_conn.streams.getStream(4).?;
+    try stream.recv.handleResetStream(@backingInt(h3_conn.H3Error.request_cancelled), stream.recv.sorter.highestReceived());
+    const ev = try pollFor(&setup.wt, .session_closed);
+    try testing.expectEqual(@as(u64, 4), ev.session_closed.session_id);
+    try testing.expect(ev.session_closed.abrupt);
+    try testing.expectError(error.SessionNotPending, setup.wt.acceptSession(4));
+    try testing.expectEqual(@as(u64, 0), stream.send.write_offset);
+    try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.request_cancelled)), stream.send.reset_err);
+}
+
+/// What the peer's ACKs would do: every byte and FIN we have queued counts
+/// as sent and acknowledged.
+fn ackEverything(conn: *quic_connection.Connection) !void {
+    var it = conn.streams.streams.valueIterator();
+    while (it.next()) |st| try ackSends(&st.*.send);
+    var uit = conn.streams.send_streams.valueIterator();
+    while (uit.next()) |ss| try ackSends(ss.*);
+}
+
+fn ackSends(ss: *stream_mod.SendStream) !void {
+    while (ss.popStreamFrame(1 << 20)) |f| try ss.onAck(f.stream.offset, f.stream.length, f.stream.fin);
+    if (ss.reset_err != null) ss.reset_stream_sent = true;
+}
+
+const h3_no_error = @backingInt(h3_conn.H3Error.no_error);
+
+test "WT: a connection whose last session is over closes once the peer has the end of it" {
+    for ([_]bool{ true, false }) |server| {
+        for ([_]Termination{ .ours, .peer_capsule, .peer_fin }) |how| {
+            var setup: WtTestSetup = undefined;
+            const session_id = if (server) try setup.initServer() else try setup.initClient();
+            defer setup.deinit();
+            setup.quic_conn.state = .connected;
+
+            setup.wt.closeIfUnused();
+            try testing.expect(setup.quic_conn.close_deadline == null); // a live session
+
+            try terminate(&setup, session_id, how);
+            if (how == .ours) {
+                // Not before the peer ends its side of the CONNECT stream.
+                setup.wt.closeIfUnused();
+                try testing.expect(setup.quic_conn.isEstablished());
+                _ = try peerSends(&setup, session_id, "", true);
+                _ = try pollFor(&setup.wt, .session_closed);
+            } else if (how == .peer_capsule) {
+                _ = try setup.wt.poll(); // its FIN came with the capsule
+            }
+            setup.wt.closeIfUnused();
+            // A server says first what it will not take (RFC 9114 §5.2).
+            try testing.expectEqual(if (server) @as(?u64, 4) else null, setup.h3.local_goaway_id);
+            try testing.expect(setup.quic_conn.close_deadline != null);
+            // Not before our capsule, FIN and GOAWAY are acked.
+            try testing.expect(setup.quic_conn.isEstablished());
+            try ackEverything(&setup.quic_conn);
+            setup.wt.closeIfUnused();
+            try testing.expectEqual(quic_connection.State.closing, setup.quic_conn.state);
+            try testing.expectEqual(@as(u64, h3_no_error), setup.quic_conn.local_err.?.code);
+        }
+    }
+}
+
+test "WT: a peer that never acks the end is closed on 3 PTO" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+    setup.quic_conn.state = .connected;
+    setup.quic_conn.last_packet_received_time = sys.nanoTimestamp(); // the idle timeout 30 s off
+    try terminate(&setup, session_id, .peer_fin);
+    setup.wt.closeIfUnused();
+    const due = setup.quic_conn.close_deadline.?.at;
+    try testing.expect(due <= sys.nanoTimestamp() + 3 * setup.quic_conn.pkt_handler.rtt_stats.pto());
+    try testing.expectEqual(due, setup.quic_conn.nextOnTimeoutNs().?);
+
+    setup.quic_conn.close_deadline.?.at = sys.nanoTimestamp() - 1;
+    try setup.quic_conn.onTimeout();
+    try testing.expectEqual(quic_connection.State.closing, setup.quic_conn.state);
+    try testing.expectEqual(@as(u64, h3_no_error), setup.quic_conn.local_err.?.code);
+}
+
+test "WT: an open request or another session keeps the connection" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+    setup.quic_conn.state = .connected;
+    try injectConnect(&setup, 4);
+    try setup.wt.acceptSession(4);
+    try terminate(&setup, session_id, .peer_fin);
+    setup.wt.closeIfUnused();
+    try testing.expect(setup.quic_conn.close_deadline == null);
+
+    // A plain request on the connection, its response not yet sent.
+    try terminate(&setup, 4, .peer_fin);
+    const req = try setup.quic_conn.streams.getOrCreateStream(8);
+    var buf: [512]u8 = undefined;
+    const headers = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    var qbuf: [256]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try h3_frame.write(.{ .headers = qbuf[0..try qpack.encodeHeaders(&headers, &qbuf)] }, &fbs);
+    try req.recv.handleStreamFrame(0, fbs.buffered(), true);
+    _ = try pollFor(&setup.wt, .request);
+    setup.wt.closeIfUnused();
+    try testing.expect(setup.quic_conn.close_deadline == null);
+    try ackEverything(&setup.quic_conn);
+    setup.wt.closeIfUnused();
+    try testing.expect(setup.quic_conn.isEstablished());
+}
+
+test "WT: a session accepted after our GOAWAY is drained at once" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+    try injectConnect(&setup, 4);
+    try setup.h3.initiateShutdown();
+
+    try setup.wt.acceptSession(4);
+    const written = setup.quic_conn.streams.getStream(4).?.send.write_buffer.items;
+    const response = try h3_frame.parse(written);
+    const capsule = try h3_frame.parse(try expectCapsulePayload(written[response.consumed..]));
+    try testing.expect(capsule.frame == .drain_webtransport_session);
+}
+
+test "WT: a drain asked by GOAWAY and by capsule is reported once per session" {
+    var setup: WtTestSetup = undefined;
+    const first = try setup.initClient();
+    defer setup.deinit();
+    const second = try setup.wt.connect("example.com", "/wt");
+    var resp: [64]u8 = undefined;
+    _ = try peerSends(&setup, second, resp[0..buildConnectResponse(&resp)], false);
+    _ = try pollFor(&setup.wt, .session_ready);
+
+    var buf: [64]u8 = undefined;
+    _ = try peerSends(&setup, first, wrapCapsule(&buf, .{ .drain_webtransport_session = {} }), false);
+    var goaway: [16]u8 = undefined;
+    var fbs = io.fixedBufferStream(&goaway);
+    try h3_frame.write(.{ .goaway = 8 }, &fbs);
+    const ctrl = setup.quic_conn.streams.recv_streams.get(3).?;
+    try ctrl.handleStreamFrame(ctrl.sorter.highestReceived(), fbs.buffered(), false);
+
+    var events: [8]WtEvent = undefined;
+    const got = try drainEvents(&setup.wt, &events);
+    var seen = [_]u32{ 0, 0 };
+    for (got) |ev| if (ev == .session_draining) {
+        seen[if (ev.session_draining.session_id == first) 0 else 1] += 1;
+    };
+    try testing.expectEqual([_]u32{ 1, 1 }, seen);
+}
+
+test "WT: unknown and malformed capsules reset nothing while our close waits for the peer's FIN" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    try setup.wt.closeSessionWithError(session_id, 3, "ours");
+    // A reserved capsule type and an HTTP/2 frame type, as capsules, then a
+    // close too short for its code, and bytes that would parse as another.
+    var buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    for ([_]u64{ 0x1f * 3 + 0x21, 0x02, @backingInt(h3_frame.H3FrameType.close_webtransport_session) }) |t| {
+        try packet.writeVarInt(&fbs, t);
+        try packet.writeVarInt(&fbs, 2);
+        try fbs.writeAll("zz");
+    }
+    var later: [64]u8 = undefined;
+    const close = wrapCapsule(&later, .{ .close_webtransport_session = .{ .error_code = 9, .reason = "theirs" } });
+    _ = try peerSends(&setup, session_id, fbs.buffered(), false);
+    const stream = try peerSends(&setup, session_id, close, false);
+    try testing.expect(try setup.wt.poll() == null);
+    try testing.expectEqual(@as(?u64, null), stream.send.reset_err);
+    try testing.expectEqual(@as(?u64, null), stream.recv.stop_sending_err);
+
+    _ = try peerSends(&setup, session_id, "", true);
+    const ev = (try setup.wt.poll()).?;
+    try testing.expectEqual(@as(u32, 3), ev.session_closed.error_code);
+    try testing.expectEqualStrings("ours", ev.session_closed.reason);
+}
+
+test "WT: our close answered by a reset ends the session with our code" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    try setup.wt.closeSessionWithError(session_id, 4, "ours");
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    try stream.recv.handleResetStream(WEBTRANSPORT_SESSION_GONE, stream.recv.sorter.highestReceived());
+
+    const ev = (try setup.wt.poll()).?;
+    try testing.expect(!ev.session_closed.abrupt);
+    try testing.expectEqual(@as(u32, 4), ev.session_closed.error_code);
+    try testing.expectEqualStrings("ours", ev.session_closed.reason);
+}
+
+test "WT: a long close reason is cut at a UTF-8 boundary" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // 1023 ASCII bytes, then a 2-byte character straddling the limit.
+    var reason: [1025]u8 = @splat('x');
+    reason[1023] = 0xc3;
+    reason[1024] = 0xa9;
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    const pre_len = stream.send.write_buffer.items.len;
+    try setup.wt.closeSessionWithError(session_id, 1, &reason);
+
+    const cls = (try h3_frame.parse(try expectCapsulePayload(stream.send.write_buffer.items[pre_len..]))).frame.close_webtransport_session;
+    try testing.expectEqual(@as(usize, 1023), cls.reason.len);
+}
+
+/// How a test ends a session: our close, the peer's capsule, or its bare FIN.
+const Termination = enum { ours, peer_capsule, peer_fin };
+
+fn terminate(setup: *WtTestSetup, session_id: u64, how: Termination) !void {
+    var buf: [64]u8 = undefined;
+    switch (how) {
+        .ours => try setup.wt.closeSessionWithError(session_id, 1, "ours"),
+        .peer_capsule => _ = try peerSends(setup, session_id, wrapCapsule(&buf, .{ .close_webtransport_session = .{ .error_code = 2, .reason = "theirs" } }), true),
+        .peer_fin => _ = try peerSends(setup, session_id, "", true),
+    }
+    if (how != .ours) _ = try pollFor(&setup.wt, .session_closed);
+}
+
+test "WT: a terminated session takes no new streams or datagrams, and its streams no writes" {
+    for ([_]bool{ true, false }) |server| {
+        for ([_]Termination{ .ours, .peer_capsule, .peer_fin }) |how| {
+            var setup: WtTestSetup = undefined;
+            const session_id = if (server) try setup.initServer() else try setup.initClient();
+            defer setup.deinit();
+            const bidi = try setup.wt.openBidiStream(session_id, null);
+            const uni = try setup.wt.openUniStream(session_id, null);
+            try setup.wt.sendDatagram(session_id, "before");
+
+            try terminate(&setup, session_id, how);
+            try testing.expectError(error.SessionGone, setup.wt.openBidiStream(session_id, null));
+            try testing.expectError(error.SessionGone, setup.wt.openUniStream(session_id, null));
+            try testing.expectError(error.SessionGone, setup.wt.sendDatagram(session_id, "after"));
+            try testing.expectError(error.SessionGone, setup.wt.sendStreamData(bidi, "after"));
+            try testing.expectError(error.SessionGone, setup.wt.sendStreamData(uni, "after"));
+            // Our own calls on them change nothing the reset set.
+            setup.wt.resetStream(bidi, 7);
+            setup.wt.closeStream(uni);
+            try testing.expectEqual(@as(?u64, WEBTRANSPORT_SESSION_GONE), setup.quic_conn.streams.getStream(bidi).?.send.reset_err);
+            try testing.expect(!setup.quic_conn.streams.send_streams.get(uni).?.fin_queued);
+        }
+    }
+}
+
+test "WT: a session's end resets a stream whose FIN is out but unacked, not one acked whole" {
+    for ([_]Termination{ .ours, .peer_capsule, .peer_fin }) |how| {
+        var setup: WtTestSetup = undefined;
+        const session_id = try setup.initServer();
+        defer setup.deinit();
+
+        // A last message and its FIN on each; both sent, one of them acked.
+        const ids = [_]u64{ try setup.wt.openUniStream(session_id, null), try setup.wt.openUniStream(session_id, null) };
+        for (ids, 0..) |id, i| {
+            try setup.wt.sendStreamData(id, "last words");
+            setup.wt.closeStream(id);
+            const ss = setup.quic_conn.streams.send_streams.get(id).?;
+            const f = ss.popStreamFrame(1000).?.stream;
+            try testing.expect(f.fin and ss.fin_sent);
+            if (i == 1) try ss.onAck(f.offset, f.length, f.fin);
+        }
+        // A bidi stream whose peer has sent everything, FIN included.
+        const bidi = try setup.wt.openBidiStream(session_id, null);
+        const bs = setup.quic_conn.streams.getStream(bidi).?;
+        try bs.recv.handleStreamFrame(0, "done", true);
+
+        try terminate(&setup, session_id, how);
+        // §6: the peer stops reading at the close, so "last words" may never
+        // be read; resetting says so instead of leaving it to retransmit.
+        try testing.expectEqual(@as(?u64, WEBTRANSPORT_SESSION_GONE), setup.quic_conn.streams.send_streams.get(ids[0]).?.reset_err);
+        try testing.expectEqual(@as(?u64, null), setup.quic_conn.streams.send_streams.get(ids[1]).?.reset_err);
+        // Nothing left for the peer to send: no STOP_SENDING, only our reset.
+        try testing.expectEqual(@as(?u64, null), bs.recv.stop_sending_err);
+        try testing.expectEqual(@as(?u64, WEBTRANSPORT_SESSION_GONE), bs.send.reset_err);
+    }
+}
+
+test "WT: streams and datagrams wait for no 200, and need a session that exists" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+
+    // §4: a server may use a session from its CONNECT on.
+    try injectConnect(&setup, 4);
+    _ = try setup.wt.openUniStream(4, null);
+    try setup.wt.sendDatagram(4, "early");
+    try testing.expectError(error.SessionGone, setup.wt.openBidiStream(8, null));
+    try testing.expectError(error.SessionGone, setup.wt.sendDatagram(8, "nobody"));
+    try testing.expectError(error.StreamNotFound, setup.wt.sendStreamData(3, "control"));
+}
+
+test "WT integration: a CONNECT the server resets unanswered is rejected" {
+    var quic_conn = createTestQuicConn(false);
+    defer quic_conn.deinit();
+    var h3 = h3_conn.H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    h3.local_settings.enable_connect_protocol = true;
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3, false);
+    var wt = WebTransportConnection.init(testing.allocator, &h3, &quic_conn, false);
+    defer wt.deinit();
+
+    // Our own server does this to a CONNECT past its session slots.
+    const session_id = try wt.connect("example.com", "/wt");
+    const stream = quic_conn.streams.getStream(session_id).?;
+    try stream.recv.handleResetStream(@backingInt(h3_conn.H3Error.request_rejected), 0);
+
+    const ev = try pollFor(&wt, .session_rejected);
+    try testing.expectEqual(session_id, ev.session_rejected.session_id);
+    try testing.expectEqualStrings("", ev.session_rejected.status);
+    try testing.expect(wt.getSession(session_id) == null);
+}
+
+test "WT integration: session cleanup resets associated streams" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Open a bidi stream belonging to this session
+    const wt_stream_id = try setup.wt.openBidiStream(session_id, null);
+    try testing.expect(setup.wt.wt_bidi_streams.contains(wt_stream_id));
+
+    // Close the session — should clean up associated streams
+    setup.wt.closeSession(session_id);
+
+    // The WT bidi stream should be removed from tracking
+    try testing.expect(!setup.wt.wt_bidi_streams.contains(wt_stream_id));
+}
+
+// ---- Group G: Stream data ----
+
+test "WT integration: poll returns stream_data on known bidi stream" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Inject WT bidi prefix on client-initiated bidi stream 4
+    var prefix_buf: [16]u8 = undefined;
+    const prefix_len = buildWtBidiPrefix(&prefix_buf, session_id);
+    const stream = try setup.quic_conn.streams.getOrCreateStream(4);
+    try stream.recv.handleStreamFrame(0, prefix_buf[0..prefix_len], false);
+
+    // Poll to identify the stream
+    const ev1 = try setup.wt.poll();
+    try testing.expect(ev1 != null);
+    switch (ev1.?) {
+        .bidi_stream => {},
+        else => return error.UnexpectedEvent,
+    }
+
+    // Now inject more data on the same stream
+    const offset = stream.recv.sorter.highestReceived();
+    try stream.recv.handleStreamFrame(offset, "stream payload", false);
+
+    const ev2 = try setup.wt.poll();
+    try testing.expect(ev2 != null);
+    switch (ev2.?) {
+        .stream_data => |sd| {
+            try testing.expectEqual(@as(u64, 4), sd.stream_id);
+            try testing.expectEqualStrings("stream payload", sd.data);
+            try testing.expect(!sd.fin);
+            // Caller owns data from FrameSorter — free it
+            testing.allocator.free(sd.data);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "WT integration: poll returns stream_data on known uni stream" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Inject WT uni prefix on client uni stream 14
+    var prefix_buf: [16]u8 = undefined;
+    const prefix_len = buildWtUniPrefix(&prefix_buf, session_id);
+    const rs = try setup.quic_conn.streams.getOrCreateRecvStream(14);
+    try rs.handleStreamFrame(0, prefix_buf[0..prefix_len], false);
+
+    // Poll to identify
+    const ev1 = try setup.wt.poll();
+    try testing.expect(ev1 != null);
+    switch (ev1.?) {
+        .uni_stream => {},
+        else => return error.UnexpectedEvent,
+    }
+
+    // Inject more data
+    const offset = rs.sorter.highestReceived();
+    try rs.handleStreamFrame(offset, "uni payload", false);
+
+    const ev2 = try setup.wt.poll();
+    try testing.expect(ev2 != null);
+    switch (ev2.?) {
+        .stream_data => |sd| {
+            try testing.expectEqual(@as(u64, 14), sd.stream_id);
+            try testing.expectEqualStrings("uni payload", sd.data);
+            try testing.expect(!sd.fin);
+            testing.allocator.free(sd.data);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "WT integration: poll returns stream_data with fin on completed bidi stream" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    var prefix_buf: [16]u8 = undefined;
+    const prefix_len = buildWtBidiPrefix(&prefix_buf, session_id);
+    const stream = try setup.quic_conn.streams.getOrCreateStream(4);
+    try stream.recv.handleStreamFrame(0, prefix_buf[0..prefix_len], false);
+
+    const ev1 = try setup.wt.poll();
+    try testing.expect(ev1 != null);
+    switch (ev1.?) {
+        .bidi_stream => {},
+        else => return error.UnexpectedEvent,
+    }
+
+    const offset = stream.recv.sorter.highestReceived();
+    try stream.recv.handleStreamFrame(offset, "done", true);
+
+    const ev2 = try setup.wt.poll();
+    try testing.expect(ev2 != null);
+    switch (ev2.?) {
+        .stream_data => |sd| {
+            try testing.expectEqual(@as(u64, 4), sd.stream_id);
+            try testing.expectEqualStrings("done", sd.data);
+            try testing.expect(sd.fin);
+            testing.allocator.free(sd.data);
+        },
+        else => return error.UnexpectedEvent,
+    }
+
+    const ev3 = try setup.wt.poll();
+    try testing.expect(ev3 == null);
+}
+
+test "WT integration: poll returns empty fin event when stream ends after buffered data" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    var prefix_buf: [16]u8 = undefined;
+    const prefix_len = buildWtUniPrefix(&prefix_buf, session_id);
+    const rs = try setup.quic_conn.streams.getOrCreateRecvStream(14);
+    try rs.handleStreamFrame(0, prefix_buf[0..prefix_len], false);
+
+    const ev1 = try setup.wt.poll();
+    try testing.expect(ev1 != null);
+    switch (ev1.?) {
+        .uni_stream => {},
+        else => return error.UnexpectedEvent,
+    }
+
+    const offset = rs.sorter.highestReceived();
+    try rs.handleStreamFrame(offset, "tail", false);
+
+    const ev2 = try setup.wt.poll();
+    try testing.expect(ev2 != null);
+    switch (ev2.?) {
+        .stream_data => |sd| {
+            try testing.expectEqual(@as(u64, 14), sd.stream_id);
+            try testing.expectEqualStrings("tail", sd.data);
+            try testing.expect(!sd.fin);
+            testing.allocator.free(sd.data);
+        },
+        else => return error.UnexpectedEvent,
+    }
+
+    const fin_offset = rs.sorter.highestReceived();
+    try rs.handleStreamFrame(fin_offset, "", true);
+
+    const ev3 = try setup.wt.poll();
+    try testing.expect(ev3 != null);
+    switch (ev3.?) {
+        .stream_data => |sd| {
+            try testing.expectEqual(@as(u64, 14), sd.stream_id);
+            try testing.expectEqual(@as(usize, 0), sd.data.len);
+            try testing.expect(sd.fin);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "WT integration: sendStreamData on uni stream" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openUniStream(session_id, null);
+    try setup.wt.sendStreamData(stream_id, "uni data");
+
+    const send_stream = setup.quic_conn.streams.send_streams.get(stream_id).?;
+    const items = send_stream.write_buffer.items;
+    // Should end with "uni data"
+    try testing.expectEqualStrings("uni data", items[items.len - 8 ..]);
+}
+
+// ---- Group H: Draft-ietf-webtrans-http3 protocol features ----
+
+test "WT: appErrorCodeToH3 and h3ToAppErrorCode round-trip" {
+    // Error code 0
+    const h3_0 = appErrorCodeToH3(0);
+    try testing.expectEqual(@as(u64, 0x52e4a40fa8db), h3_0);
+    try testing.expectEqual(@as(?u32, 0), h3ToAppErrorCode(h3_0));
+
+    // Error code 1
+    const h3_1 = appErrorCodeToH3(1);
+    try testing.expect(h3_1 > h3_0);
+    try testing.expectEqual(@as(?u32, 1), h3ToAppErrorCode(h3_1));
+
+    // Error code 42
+    const h3_42 = appErrorCodeToH3(42);
+    try testing.expectEqual(@as(?u32, 42), h3ToAppErrorCode(h3_42));
+
+    // Reserved codepoints should return null
+    try testing.expectEqual(@as(?u32, null), h3ToAppErrorCode(0x21));
+
+    // Values below base should return null
+    try testing.expectEqual(@as(?u32, null), h3ToAppErrorCode(0));
+}
+
+test "WT: WEBTRANSPORT_SESSION_GONE used in stream cleanup" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Open a bidi stream
+    const wt_stream_id = try setup.wt.openBidiStream(session_id, null);
+
+    // Close the session
+    setup.wt.closeSession(session_id);
+
+    // The stream should have been reset with WEBTRANSPORT_SESSION_GONE
+    const stream = setup.quic_conn.streams.getStream(wt_stream_id).?;
+    try testing.expectEqual(@as(?u64, WEBTRANSPORT_SESSION_GONE), stream.send.reset_err);
+    try testing.expectEqual(@as(?u64, WEBTRANSPORT_SESSION_GONE), stream.recv.stop_sending_err);
+}
+
+/// Poll until the connection yields `want`, or give up. Events arrive in a
+/// fixed order, so the one under test may sit behind a couple of others.
+fn pollFor(wt: *WebTransportConnection, comptime want: std.meta.Tag(WtEvent)) !WtEvent {
+    var tries: usize = 0;
+    while (tries < 16) : (tries += 1) {
+        const ev = (try wt.poll()) orelse continue;
+        if (std.meta.activeTag(ev) == want) return ev;
+        if (ev == .stream_data and ev.stream_data.data.len > 0) {
+            testing.allocator.free(ev.stream_data.data);
+        }
+    }
+    return error.EventNotSeen;
+}
+
+test "WT integration: a peer RESET_STREAM surfaces with its application code" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
+    const stream = setup.quic_conn.streams.getStream(stream_id).?;
+    try stream.recv.handleResetStream(appErrorCodeToH3(42), 0);
+
+    const ev = try pollFor(&setup.wt, .stream_reset);
+    try testing.expectEqual(stream_id, ev.stream_reset.stream_id);
+    try testing.expectEqual(session_id, ev.stream_reset.session_id);
+    try testing.expectEqual(@as(u32, 42), ev.stream_reset.error_code);
+
+    // Once reported, it stays reported once — a reset is news, not a state to
+    // re-announce on every poll.
+    try testing.expectError(error.EventNotSeen, pollFor(&setup.wt, .stream_reset));
+}
+
+test "WT integration: a peer STOP_SENDING surfaces with its application code" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
+    const stream = setup.quic_conn.streams.getStream(stream_id).?;
+    // What Connection.handleFrame does on an inbound STOP_SENDING.
+    stream.send.reset(appErrorCodeToH3(19));
+    stream.send.peer_stop_sending = appErrorCodeToH3(19);
+
+    const ev = try pollFor(&setup.wt, .stream_stop_sending);
+    try testing.expectEqual(stream_id, ev.stream_stop_sending.stream_id);
+    try testing.expectEqual(@as(u32, 19), ev.stream_stop_sending.error_code);
+}
+
+test "WT integration: our own resetStream does not echo back as a peer abort" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
+    setup.wt.resetStream(stream_id, 42);
+
+    // resetStream sets the send side's reset_err, which is also where an
+    // inbound STOP_SENDING lands. Only `peer_stop_sending` distinguishes them.
+    try testing.expectError(error.EventNotSeen, pollFor(&setup.wt, .stream_stop_sending));
+    try testing.expectError(error.EventNotSeen, pollFor(&setup.wt, .stream_reset));
+}
+
+test "WT integration: a reset code outside the WebTransport range reports 0" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
+    const stream = setup.quic_conn.streams.getStream(stream_id).?;
+    // An H3-level code, not an application one: there is no app code to report,
+    // and the peer still needs to hear the stream died.
+    try stream.recv.handleResetStream(@backingInt(h3_conn.H3Error.request_cancelled), 0);
+
+    const ev = try pollFor(&setup.wt, .stream_reset);
+    try testing.expectEqual(@as(u32, 0), ev.stream_reset.error_code);
+}
+
+test "WT: drainSession sends DRAIN_WEBTRANSPORT_SESSION capsule" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    const pre_len = stream.send.write_buffer.items.len;
+
+    try setup.wt.drainSession(session_id);
+
+    // Should have written DRAIN capsule (type 0x78ae, length 0)
+    const drain_data = try expectCapsulePayload(stream.send.write_buffer.items[pre_len..]);
+    try testing.expect(drain_data.len > 0);
+    const result = h3_frame.parse(drain_data) catch unreachable;
+    try testing.expectEqual(h3_frame.H3FrameType.drain_webtransport_session, std.meta.activeTag(result.frame));
+}
+
+test "WT: receiving DRAIN_WEBTRANSPORT_SESSION produces session_draining event" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Inject DRAIN capsule on the CONNECT stream
+    var frame_buf: [16]u8 = undefined;
+    var fbs = io.fixedBufferStream(&frame_buf);
+    h3_frame.write(.{ .drain_webtransport_session = {} }, &fbs) catch unreachable;
+
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    const offset = stream.recv.sorter.highestReceived();
+    try stream.recv.handleStreamFrame(offset, fbs.buffered(), false);
+
+    const ev = try setup.wt.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .session_draining => |sd| {
+            try testing.expectEqual(session_id, sd.session_id);
+        },
+        else => return error.UnexpectedEvent,
+    }
+
+    // Session should still be active (drain is advisory)
+    const session = setup.wt.getSession(session_id).?;
+    try testing.expectEqual(SessionState.active, session.state);
+}
+
+test "WT: resetStream maps app error code to H3 range" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
+    setup.wt.resetStream(stream_id, 42);
+
+    const stream = setup.quic_conn.streams.getStream(stream_id).?;
+    try testing.expectEqual(@as(?u64, appErrorCodeToH3(42)), stream.send.reset_err);
+    try testing.expectEqual(@as(?u64, appErrorCodeToH3(42)), stream.recv.stop_sending_err);
+}
+
+test "WT: close reason supports up to 1024 bytes" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // Create a 1024-byte reason
+    var long_reason: [1024]u8 = undefined;
+    @memset(&long_reason, 'X');
+
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    const pre_len = stream.send.write_buffer.items.len;
+
+    try setup.wt.closeSessionWithError(session_id, 99, &long_reason);
+
+    // Parse the CLOSE frame
+    const close_data = try expectCapsulePayload(stream.send.write_buffer.items[pre_len..]);
+    const result = h3_frame.parse(close_data) catch unreachable;
+    switch (result.frame) {
+        .close_webtransport_session => |cls| {
+            try testing.expectEqual(@as(u32, 99), cls.error_code);
+            try testing.expectEqual(@as(usize, 1024), cls.reason.len);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "WT: invalid session ID triggers H3_ID_ERROR on bidi stream" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+
+    // Inject WT bidi prefix with an odd session ID (invalid — must be client-initiated bidi = 4*n)
+    var prefix_buf: [16]u8 = undefined;
+    var fbs = io.fixedBufferStream(&prefix_buf);
+    packet.writeVarInt(&fbs, WT_BIDI_STREAM_TYPE) catch unreachable;
+    packet.writeVarInt(&fbs, 1) catch unreachable; // Invalid: not divisible by 4
+
+    const stream = try setup.quic_conn.streams.getOrCreateStream(4);
+    try stream.recv.handleStreamFrame(0, fbs.buffered(), false);
+
+    // The connection closes with H3_ID_ERROR (RFC 9114 §8.1), and the
+    // session goes with it, once.
+    const ev = (try setup.wt.poll()).?;
+    try testing.expectEqual(@as(u64, 0), ev.session_closed.session_id);
+    try testing.expect(ev.session_closed.abrupt);
+    try testing.expectEqual(@as(?WtEvent, null), try setup.wt.poll());
+    try testing.expect(setup.quic_conn.local_err != null);
+    try testing.expect(setup.quic_conn.local_err.?.is_app);
+    try testing.expectEqual(@backingInt(h3_conn.H3Error.id_error), setup.quic_conn.local_err.?.code);
+}
+
+const Surfaced = struct { wt: bool = false, request: bool = false };
+
+/// Polls to quiescence: whether stream `wt_id` surfaced as a WT stream, and
+/// whether H3 surfaced any request.
+fn pollClassified(setup: *WtTestSetup, wt_id: u64) !Surfaced {
+    var r: Surfaced = .{};
+    while (try setup.wt.poll()) |ev| switch (ev) {
+        .bidi_stream => |b| r.wt = r.wt or b.stream_id == wt_id,
+        .request, .connect_request => r.request = true,
+        .stream_data => |sd| testing.allocator.free(sd.data),
+        else => {},
+    };
+    return r;
+}
+
+test "WT: bidi streams are classified before H3 reads them, however their bytes arrive" {
+    // H3 read an unclassified stream's preamble as an unknown frame and the
+    // payload after it as a request: forged headers from browser JS.
+    const get = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/secret" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    var qb: [256]u8 = undefined;
+    const ql = try qpack.encodeHeaders(&get, &qb);
+    var payload: [300]u8 = undefined;
+    var pfbs = io.fixedBufferStream(&payload);
+    try h3_frame.write(.{ .headers = qb[0..ql] }, &pfbs);
+
+    // A stream with nothing yet ahead of it.
+    {
+        var setup: WtTestSetup = undefined;
+        const session_id = try setup.initServer();
+        defer setup.deinit();
+        _ = try setup.quic_conn.streams.getOrCreateStream(4);
+        var buf: [320]u8 = undefined;
+        var pos = buildWtBidiPrefix(&buf, session_id);
+        @memcpy(buf[pos..][0..pfbs.seek], payload[0..pfbs.seek]);
+        pos += pfbs.seek;
+        try (try setup.quic_conn.streams.getOrCreateStream(8)).recv.handleStreamFrame(0, buf[0..pos], false);
+        const r = try pollClassified(&setup, 8);
+        try testing.expect(r.wt and !r.request);
+    }
+    // Its preamble split across reads.
+    {
+        var setup: WtTestSetup = undefined;
+        const session_id = try setup.initServer();
+        defer setup.deinit();
+        var buf: [320]u8 = undefined;
+        var pos = buildWtBidiPrefix(&buf, session_id);
+        @memcpy(buf[pos..][0..pfbs.seek], payload[0..pfbs.seek]);
+        pos += pfbs.seek;
+        const s4 = try setup.quic_conn.streams.getOrCreateStream(4);
+        try s4.recv.handleStreamFrame(0, buf[0..1], false);
+        var r = try pollClassified(&setup, 4);
+        try s4.recv.handleStreamFrame(1, buf[1..pos], false);
+        const later = try pollClassified(&setup, 4);
+        r.wt = r.wt or later.wt;
+        r.request = r.request or later.request;
+        try testing.expect(r.wt and !r.request);
+    }
+}
+
+test "WT: a paused stream we opened keeps the peer's data from H3" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+    const sid = try setup.wt.openBidiStream(session_id, null);
+    try setup.wt.pauseStream(sid);
+
+    var buf: [256]u8 = undefined;
+    const len = buildConnectRequest(&buf, "/forged");
+    try setup.quic_conn.streams.getStream(sid).?.recv.handleStreamFrame(0, buf[0..len], false);
+    const r = try pollClassified(&setup, sid);
+    try testing.expect(!r.request);
+}
+
+test "WT: a closed session's streams stay away from H3, however many it had" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    var prefix_buf: [16]u8 = undefined;
+    const prefix_len = buildWtUniPrefix(&prefix_buf, session_id);
+    var id: u64 = 14;
+    while (id < 14 + 4 * 70) : (id += 4) {
+        const rs = try setup.quic_conn.streams.getOrCreateRecvStream(id);
+        try rs.handleStreamFrame(0, prefix_buf[0..prefix_len], false);
+    }
+    _ = try pollClassified(&setup, 0);
+    setup.wt.closeSession(session_id);
+
+    // What arrives on them now is no stream type of their own.
+    const first = setup.quic_conn.streams.recv_streams.get(14).?;
+    try first.handleStreamFrame(prefix_len, &.{0x00}, false);
+    _ = try pollClassified(&setup, 0);
+    try testing.expectEqual(@as(u64, 2), setup.h3.peer_control_stream_id.?);
+    id = 14;
+    while (id < 14 + 4 * 70) : (id += 4) {
+        try testing.expect(setup.quic_conn.streams.recv_streams.get(id).?.stop_sending_err != null);
+    }
+}
+
+test "WT: a CONNECT past the session slots is rejected, never answered 200" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+
+    var buf: [512]u8 = undefined;
+    const len = buildConnectRequest(&buf, "/wt");
+    var sid: u64 = 4;
+    while (sid <= 4 * MAX_SESSIONS) : (sid += 4) {
+        try (try setup.quic_conn.streams.getOrCreateStream(sid)).recv.handleStreamFrame(0, buf[0..len], false);
+        var surfaced = false;
+        while (try setup.wt.poll()) |ev| {
+            if (ev == .connect_request) surfaced = true;
+        }
+        if (sid < 4 * MAX_SESSIONS) {
+            try testing.expect(surfaced);
+            try setup.wt.acceptSession(sid);
+        } else {
+            try testing.expect(!surfaced);
+        }
+    }
+    const extra = setup.quic_conn.streams.getStream(4 * MAX_SESSIONS).?;
+    try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.request_rejected)), extra.send.reset_err);
+    try testing.expectEqual(@as(u32, MAX_SESSIONS), setup.wt.active_session_count);
+
+    try testing.expectError(error.SessionNotPending, setup.wt.acceptSession(4 * MAX_SESSIONS));
+    try testing.expectEqual(@as(u64, 0), extra.send.write_offset);
+}
+
+/// Surface a CONNECT on client bidi stream `sid` to the server's `wt`.
+fn injectConnect(setup: *WtTestSetup, sid: u64) !void {
+    var buf: [512]u8 = undefined;
+    const len = buildConnectRequest(&buf, "/wt");
+    try (try setup.quic_conn.streams.getOrCreateStream(sid)).recv.handleStreamFrame(0, buf[0..len], false);
+    const ev = try pollFor(&setup.wt, .connect_request);
+    try testing.expectEqual(sid, ev.connect_request.session_id);
+}
+
+/// What a refused CONNECT stream carries: one HEADERS frame and its FIN,
+/// never a capsule. Returns the :status.
+fn expectRefusal(stream: *stream_mod.Stream, status_buf: []u8) ![]const u8 {
+    const written = stream.send.write_buffer.items;
+    const parsed = try h3_frame.parse(written);
+    try testing.expectEqual(written.len, parsed.consumed);
+    const block = switch (parsed.frame) {
+        .headers => |b| b,
+        else => return error.UnexpectedFrame,
+    };
+    var headers: [8]qpack.Header = undefined;
+    var scratch: [512]u8 = undefined;
+    const n = try qpack.decodeHeaders(block, &headers, &scratch);
+    try testing.expect(stream.send.fin_queued);
+    try testing.expectEqual(@as(?u64, @backingInt(h3_conn.H3Error.no_error)), stream.recv.stop_sending_err);
+    for (headers[0..n]) |h| if (std.mem.eql(u8, h.name, ":status")) {
+        @memcpy(status_buf[0..h.value.len], h.value);
+        return status_buf[0..h.value.len];
+    };
+    return error.NoStatus;
+}
+
+test "WT: rejectSession answers a second CONNECT with its status and leaves the first session open" {
+    var setup: WtTestSetup = undefined;
+    const first = try setup.initServer();
+    defer setup.deinit();
+
+    try injectConnect(&setup, 4);
+    // A stream the peer opened for the pending session: held until it settles.
+    var prefix: [16]u8 = undefined;
+    const prefix_len = buildWtBidiPrefix(&prefix, 4);
+    try (try setup.quic_conn.streams.getOrCreateStream(8)).recv.handleStreamFrame(0, prefix[0..prefix_len], false);
+    try testing.expectEqual(@as(?WtEvent, null), try setup.wt.poll());
+
+    try testing.expectError(error.InvalidStatus, setup.wt.rejectSession(4, 200));
+    try testing.expectError(error.InvalidStatus, setup.wt.rejectSession(4, 103));
+    try setup.wt.rejectSession(4, 409);
+
+    var status: [3]u8 = undefined;
+    try testing.expectEqualStrings("409", try expectRefusal(setup.quic_conn.streams.getStream(4).?, &status));
+    try testing.expect(setup.wt.getSession(4) == null);
+    try testing.expectEqual(@as(u32, 1), setup.wt.active_session_count);
+    try testing.expectError(error.SessionNotPending, setup.wt.rejectSession(4, 409));
+    try testing.expectError(error.SessionNotPending, setup.wt.rejectSession(first, 409));
+
+    // The held stream goes with its session; the first one is untouched.
+    try testing.expectEqual(@as(?WtEvent, null), try setup.wt.poll());
+    const held = setup.quic_conn.streams.getStream(8).?;
+    try testing.expectEqual(@as(?u64, WEBTRANSPORT_SESSION_GONE), held.send.reset_err);
+    try testing.expectEqual(SessionState.active, setup.wt.getSession(first).?.state);
+    const connect = setup.quic_conn.streams.getStream(first).?;
+    try testing.expect(!connect.send.fin_queued);
+    try testing.expectEqual(@as(?u64, null), connect.recv.stop_sending_err);
+    try setup.wt.sendDatagram(first, "still here");
+}
+
+test "WT: closeSession on a session never accepted refuses it rather than writing a capsule" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+
+    try injectConnect(&setup, 4);
+    setup.wt.closeSession(4);
+    var status: [3]u8 = undefined;
+    try testing.expectEqualStrings("403", try expectRefusal(setup.quic_conn.streams.getStream(4).?, &status));
+    try testing.expect(setup.wt.getSession(4) == null);
+
+    try injectConnect(&setup, 8);
+    try setup.wt.closeSessionWithError(8, 7, "unused");
+    try testing.expectEqualStrings("403", try expectRefusal(setup.quic_conn.streams.getStream(8).?, &status));
+    try testing.expectEqual(@as(u32, 1), setup.wt.active_session_count);
+}
+
+test "WT: invalid session ID triggers H3_ID_ERROR on uni stream" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+
+    // Inject WT uni prefix with an invalid session ID (1 — not a client-initiated bidi = 4*n)
+    var prefix_buf: [16]u8 = undefined;
+    var fbs = io.fixedBufferStream(&prefix_buf);
+    packet.writeVarInt(&fbs, WT_UNI_STREAM_TYPE) catch unreachable;
+    packet.writeVarInt(&fbs, 1) catch unreachable; // Invalid: not divisible by 4
+
+    const rs = try setup.quic_conn.streams.getOrCreateRecvStream(14);
+    try rs.handleStreamFrame(0, fbs.buffered(), false);
+
+    // The connection closes with H3_ID_ERROR (RFC 9114 §8.1), and the
+    // session goes with it, once.
+    const ev = (try setup.wt.poll()).?;
+    try testing.expectEqual(@as(u64, 0), ev.session_closed.session_id);
+    try testing.expect(ev.session_closed.abrupt);
+    try testing.expectEqual(@as(?WtEvent, null), try setup.wt.poll());
+    try testing.expect(setup.quic_conn.local_err != null);
+    try testing.expect(setup.quic_conn.local_err.?.is_app);
+    try testing.expectEqual(@backingInt(h3_conn.H3Error.id_error), setup.quic_conn.local_err.?.code);
+}
+
+test "WT: a uni stream whose type does not parse is abandoned, not read again for one" {
+    // Dropping the bytes and retrying took whatever came next as the type.
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const rs = try setup.quic_conn.streams.getOrCreateRecvStream(14);
+    try rs.handleStreamFrame(0, &.{0x80}, false); // a 4-byte varint, cut short
+    while (try setup.wt.poll()) |_| {}
+
+    var prefix_buf: [16]u8 = undefined;
+    const prefix_len = buildWtUniPrefix(&prefix_buf, session_id);
+    try rs.handleStreamFrame(1, prefix_buf[0..prefix_len], false);
+    while (try setup.wt.poll()) |_| {}
+    try testing.expect(!setup.wt.wt_uni_streams.contains(14));
+    try testing.expect(rs.stop_sending_err != null);
+}
+
+test "WT: streams for a session not yet accepted are held, then surfaced on accept" {
+    // The application vets a session at CONNECT; nothing of it may reach the
+    // application before it says yes.
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+
+    var buf: [512]u8 = undefined;
+    const len = buildConnectRequest(&buf, "/wt");
+    try (try setup.quic_conn.streams.getOrCreateStream(4)).recv.handleStreamFrame(0, buf[0..len], false);
+    try testing.expect((try setup.wt.poll()).? == .connect_request);
+
+    var prefix_buf: [16]u8 = undefined;
+    const prefix_len = buildWtUniPrefix(&prefix_buf, 4);
+    @memcpy(prefix_buf[prefix_len..][0..2], "hi");
+    const rs = try setup.quic_conn.streams.getOrCreateRecvStream(14);
+    try rs.handleStreamFrame(0, prefix_buf[0 .. prefix_len + 2], false);
+    try testing.expectEqual(@as(?WtEvent, null), try setup.wt.poll());
+
+    try setup.wt.acceptSession(4);
+    const ev = (try setup.wt.poll()).?;
+    try testing.expectEqual(@as(u64, 14), ev.uni_stream.stream_id);
+    const data = try pollFor(&setup.wt, .stream_data);
+    defer testing.allocator.free(data.stream_data.data);
+    try testing.expectEqualStrings("hi", data.stream_data.data);
+}
+
+test "WT: a stream naming no session is refused, and held ones are bounded" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+
+    // Stream 4 is a plain GET: whatever claims it as a session is gone.
+    var buf: [512]u8 = undefined;
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    var qb: [256]u8 = undefined;
+    const ql = try qpack.encodeHeaders(&hdrs, &qb);
+    var fbs = io.fixedBufferStream(&buf);
+    try h3_frame.write(.{ .headers = qb[0..ql] }, &fbs);
+    try (try setup.quic_conn.streams.getOrCreateStream(4)).recv.handleStreamFrame(0, fbs.buffered(), false);
+    try testing.expect((try setup.wt.poll()).? == .request);
+
+    var prefix_buf: [16]u8 = undefined;
+    var prefix_len = buildWtUniPrefix(&prefix_buf, 4);
+    const gone = try setup.quic_conn.streams.getOrCreateRecvStream(14);
+    try gone.handleStreamFrame(0, prefix_buf[0..prefix_len], false);
+    try testing.expectEqual(@as(?WtEvent, null), try setup.wt.poll());
+    try testing.expectEqual(@as(?u64, WEBTRANSPORT_SESSION_GONE), gone.stop_sending_err);
+
+    // Session 400's CONNECT has not arrived: held, up to a limit.
+    prefix_len = buildWtUniPrefix(&prefix_buf, 400);
+    var id: u64 = 18;
+    for (0..MAX_HELD_STREAMS + 1) |_| {
+        const rs = try setup.quic_conn.streams.getOrCreateRecvStream(id);
+        try rs.handleStreamFrame(0, prefix_buf[0..prefix_len], false);
+        id += 4;
+    }
+    while (try setup.wt.poll()) |_| return error.TestUnexpectedResult;
+    // Which one goes over is the map's order; that exactly one does is not.
+    var rejected: usize = 0;
+    id = 18;
+    for (0..MAX_HELD_STREAMS + 1) |_| {
+        const err = setup.quic_conn.streams.recv_streams.get(id).?.stop_sending_err;
+        if (err) |e| {
+            try testing.expectEqual(WEBTRANSPORT_BUFFERED_STREAM_REJECTED, e);
+            rejected += 1;
+        }
+        id += 4;
+    }
+    try testing.expectEqual(@as(usize, 1), rejected);
+    try testing.expectEqual(@as(u32, MAX_HELD_STREAMS), setup.wt.held_streams.count());
+}
+
+test "H3Frame: write and parse DRAIN_WEBTRANSPORT_SESSION" {
+    var buf: [16]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try h3_frame.write(.{ .drain_webtransport_session = {} }, &fbs);
+    const written = fbs.buffered();
+    try testing.expect(written.len > 0);
+
+    const result = try h3_frame.parse(written);
+    try testing.expectEqual(h3_frame.H3FrameType.drain_webtransport_session, std.meta.activeTag(result.frame));
+}
+
+test "WT integration: finished uni streams are reclaimed, not retained for the connection" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // The H3 control stream is the one uni stream that must survive.
+    const baseline = setup.quic_conn.streams.recv_streams.count();
+    try testing.expectEqual(@as(u32, 1), baseline);
+
+    // 40 short-lived uni streams, the shape MoQ puts objects on.
+    var i: u64 = 0;
+    while (i < 40) : (i += 1) {
+        const stream_id = 6 + i * 4; // client uni: 2, 6, 10, ... (2 is control)
+        var prefix_buf: [16]u8 = undefined;
+        const prefix_len = buildWtUniPrefix(&prefix_buf, session_id);
+        const rs = try setup.quic_conn.streams.getOrCreateRecvStream(stream_id);
+        try rs.handleStreamFrame(0, prefix_buf[0..prefix_len], false);
+        try rs.handleStreamFrame(prefix_len, "object", true);
+
+        // Drain every event this stream produces, then reclaim as the loop does.
+        while (try setup.wt.poll()) |ev| {
+            switch (ev) {
+                .stream_data => |sd| testing.allocator.free(sd.data),
+                else => {},
+            }
+        }
+        setup.wt.drainDisposalQueue();
+        setup.quic_conn.streams.drainDisposalQueue();
+    }
+
+    try testing.expectEqual(baseline, setup.quic_conn.streams.recv_streams.count());
+    // The per-stream bookkeeping the WT layer keeps alongside them goes too.
+    try testing.expectEqual(@as(u32, 0), setup.wt.wt_uni_streams.count());
+    try testing.expectEqual(@as(u32, 0), setup.wt.fin_delivered.count());
+}
+
+/// Send everything queued on our uni stream `id` in one packet, and have the
+/// peer acknowledge it.
+fn sendAndAck(conn: *quic_connection.Connection, id: u64) !void {
+    const ss = conn.streams.send_streams.get(id).?;
+    const f = ss.popStreamFrame(1 << 16).?.stream;
+    var pkt: ack_handler.SentPacket = .{
+        .pn = conn.pkt_handler.nextPacketNumber(.application),
+        .time_sent = 0,
+        .size = 100,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .enc_level = .application,
+    };
+    pkt.addStreamFrame(.{ .stream_id = id, .offset = f.offset, .length = f.length, .fin = f.fin });
+    try conn.pkt_handler.onPacketSent(pkt);
+    try conn.processFrame(&.{ .ack = .{ .largest_ack = pkt.pn, .ack_delay = 0, .first_ack_range = 0 } }, .application, std.time.ns_per_s);
+}
+
+test "WT integration: finished uni send streams are reclaimed with their bookkeeping" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // H3's control and QPACK streams are the ones that must survive.
+    const baseline = setup.quic_conn.streams.send_streams.count();
+    try testing.expectEqual(@as(u32, 3), baseline);
+
+    // A stream per message, the shape of the firehose and of MoQ groups.
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        const id = try setup.wt.openUniStream(session_id, null);
+        try setup.wt.sendStreamData(id, "object");
+        setup.wt.closeStream(id);
+        try sendAndAck(&setup.quic_conn, id);
+        setup.wt.drainDisposalQueue();
+        setup.quic_conn.streams.drainDisposalQueue();
+    }
+
+    // One the peer stops: the application hears of it, then it goes too.
+    const stopped = try setup.wt.openUniStream(session_id, null);
+    try setup.quic_conn.processFrame(&.{ .stop_sending = .{
+        .stream_id = stopped,
+        .error_code = appErrorCodeToH3(3),
+    } }, .application, 0);
+    _ = try pollFor(&setup.wt, .stream_stop_sending);
+    try testing.expect(setup.wt.reset_delivered.contains(stopped));
+    var out: [1500]u8 = undefined;
+    _ = setup.quic_conn.send(&out) catch 0; // queues its RESET_STREAM
+    setup.wt.drainDisposalQueue();
+    setup.quic_conn.streams.drainDisposalQueue();
+
+    try testing.expectEqual(baseline, setup.quic_conn.streams.send_streams.count());
+    try testing.expectEqual(@as(u32, 0), setup.wt.wt_uni_streams.count());
+    try testing.expectEqual(@as(u32, 0), setup.wt.reset_delivered.count());
+}
+
+// ---- Group H: draft-13 session flow control ----
+
+/// Parse everything written to a CONNECT stream, asserting each capsule is
+/// wrapped in a DATA frame (RFC 9297 §3.2) and unwrapping it.
+fn collectCapsules(written: []const u8, out: []h3_frame.H3Frame) ![]h3_frame.H3Frame {
+    var pos: usize = 0;
+    var count: usize = 0;
+    while (pos < written.len) {
+        const outer = try h3_frame.parse(written[pos..]);
+        pos += outer.consumed;
+        const payload = switch (outer.frame) {
+            .data => |p| p,
+            else => return error.CapsuleNotWrappedInDataFrame,
+        };
+        var inner: usize = 0;
+        while (inner < payload.len) {
+            const capsule = try h3_frame.parse(payload[inner..]);
+            inner += capsule.consumed;
+            if (count == out.len) return error.TooManyCapsules;
+            out[count] = capsule.frame;
+            count += 1;
+        }
+    }
+    return out[0..count];
+}
+
+/// Feed bytes to a session's CONNECT stream as if the peer had sent them.
+fn injectOnConnectStream(setup: *WtTestSetup, session_id: u64, data: []const u8) !void {
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    try stream.recv.handleStreamFrame(stream.recv.sorter.highestReceived(), data, false);
+}
+
+/// Wrap capsules in the DATA frame RFC 9297 §3.2 asks for.
+fn wrapCapsules(buf: []u8, frames: []const h3_frame.H3Frame) []const u8 {
+    var inner_buf: [256]u8 = undefined;
+    var inner = io.fixedBufferStream(&inner_buf);
+    for (frames) |f| h3_frame.write(f, &inner) catch unreachable;
+
+    var fbs = io.fixedBufferStream(buf);
+    h3_frame.write(.{ .data = inner.buffered() }, &fbs) catch unreachable;
+    return fbs.buffered();
+}
+
+test "WT flow control: a draft-13 session is granted its window, once" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServerWith(.{ .streams = 8, .data = 4096 });
+    defer setup.deinit();
+
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    const pre_len = stream.send.write_buffer.items.len;
+    _ = try setup.wt.poll();
+
+    var buf: [8]h3_frame.H3Frame = undefined;
+    const capsules = try collectCapsules(stream.send.write_buffer.items[pre_len..], &buf);
+    try testing.expectEqualDeep(&[_]h3_frame.H3Frame{
+        .{ .wt_max_streams_bidi = 8 },
+        .{ .wt_max_streams_uni = 8 },
+        .{ .wt_max_data = 4096 },
+    }, capsules);
+
+    // §5.6.2 values are cumulative: restating them every poll would be noise.
+    const after = stream.send.write_buffer.items.len;
+    _ = try setup.wt.poll();
+    try testing.expectEqual(after, stream.send.write_buffer.items.len);
+}
+
+test "WT flow control: a peer without draft-13 settings is left alone" {
+    // The Chrome and quic-go shape: WebTransport over the pre-draft-13
+    // settings. Granting credit there would be noise, and reading the absent
+    // credit as §9.2's default of zero would stop us opening a single stream.
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    const pre_len = stream.send.write_buffer.items.len;
+    _ = try setup.wt.poll();
+    try testing.expectEqual(pre_len, stream.send.write_buffer.items.len);
+
+    setup.h3.peer_settings.wt_initial_max_streams_bidi = 0;
+    setup.h3.peer_settings.wt_initial_max_data = 0;
+    _ = try setup.wt.poll();
+    _ = try setup.wt.openBidiStream(session_id, null);
+}
+
+test "WT flow control: a spent stream credit blocks the open and complains once" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServerWith(.{
+        .streams = 8,
+        .data = 4096,
+        .peer_bidi = 1,
+        .peer_uni = 0,
+    });
+    defer setup.deinit();
+
+    _ = try setup.wt.poll(); // drain the grant this session starts with
+    _ = try setup.wt.openBidiStream(session_id, null);
+    try testing.expectError(error.WtStreamLimitReached, setup.wt.openBidiStream(session_id, null));
+    try testing.expectError(error.WtStreamLimitReached, setup.wt.openUniStream(session_id, null));
+
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    const pre_len = stream.send.write_buffer.items.len;
+    _ = try setup.wt.poll();
+
+    var buf: [8]h3_frame.H3Frame = undefined;
+    const capsules = try collectCapsules(stream.send.write_buffer.items[pre_len..], &buf);
+    try testing.expectEqualDeep(&[_]h3_frame.H3Frame{
+        .{ .wt_streams_blocked_bidi = 1 },
+        .{ .wt_streams_blocked_uni = 0 },
+    }, capsules);
+
+    // The limit has not moved, so neither has anything worth saying.
+    const after = stream.send.write_buffer.items.len;
+    try testing.expectError(error.WtStreamLimitReached, setup.wt.openBidiStream(session_id, null));
+    _ = try setup.wt.poll();
+    try testing.expectEqual(after, stream.send.write_buffer.items.len);
+}
+
+test "WT flow control: WT_MAX_STREAMS from the peer unblocks the open" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServerWith(.{ .streams = 8, .data = 4096, .peer_bidi = 0 });
+    defer setup.deinit();
+
+    try testing.expectError(error.WtStreamLimitReached, setup.wt.openBidiStream(session_id, null));
+
+    var wire: [64]u8 = undefined;
+    try injectOnConnectStream(&setup, session_id, wrapCapsules(&wire, &.{.{ .wt_max_streams_bidi = 3 }}));
+    _ = try setup.wt.poll();
+
+    _ = try setup.wt.openBidiStream(session_id, null);
+    _ = try setup.wt.openBidiStream(session_id, null);
+    _ = try setup.wt.openBidiStream(session_id, null);
+    try testing.expectError(error.WtStreamLimitReached, setup.wt.openBidiStream(session_id, null));
+}
+
+test "WT flow control: a spent data credit blocks the write, and WT_MAX_DATA frees it" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServerWith(.{ .streams = 8, .data = 4096, .peer_data = 4 });
+    defer setup.deinit();
+
+    _ = try setup.wt.poll(); // drain the grant this session starts with
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
+    try setup.wt.sendStreamData(stream_id, "abcd");
+    try testing.expectError(error.WtDataLimitReached, setup.wt.sendStreamData(stream_id, "e"));
+
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    const pre_len = stream.send.write_buffer.items.len;
+    _ = try setup.wt.poll();
+    var buf: [4]h3_frame.H3Frame = undefined;
+    const capsules = try collectCapsules(stream.send.write_buffer.items[pre_len..], &buf);
+    try testing.expectEqualDeep(&[_]h3_frame.H3Frame{.{ .wt_data_blocked = 4 }}, capsules);
+
+    var wire: [64]u8 = undefined;
+    try injectOnConnectStream(&setup, session_id, wrapCapsules(&wire, &.{.{ .wt_max_data = 8 }}));
+    _ = try setup.wt.poll();
+    try setup.wt.sendStreamData(stream_id, "efgh");
+    try testing.expectError(error.WtDataLimitReached, setup.wt.sendStreamData(stream_id, "i"));
+}
+
+test "WT backpressure: sendCapacity follows MAX_DATA, and a session wait fires when it rises" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+
+    // What H3 has written already — SETTINGS, the CONNECT response — counts too.
+    const fc = &setup.quic_conn.conn_flow_ctrl;
+    fc.base.send_window = setup.quic_conn.streams.committedSendBytes() + 100;
+    try testing.expectEqual(@as(u64, 100), setup.wt.sendCapacity(session_id));
+
+    const stream_id = try setup.wt.openUniStream(session_id, null);
+    try setup.wt.sendStreamData(stream_id, &@as([200]u8, @splat('x')));
+    try testing.expectEqual(@as(u64, 0), setup.wt.sendCapacity(session_id));
+    try testing.expectEqual(@as(?u64, 0), setup.wt.streamSendCapacity(stream_id));
+
+    try setup.wt.notifyWritable(session_id, null, 50);
+    try testing.expectError(error.EventNotSeen, pollFor(&setup.wt, .writable));
+
+    // Enough to cover the backlog, not yet the 50 bytes asked for.
+    const committed = setup.quic_conn.streams.committedSendBytes();
+    fc.updateSendWindow(committed + 49);
+    try testing.expectError(error.EventNotSeen, pollFor(&setup.wt, .writable));
+
+    fc.updateSendWindow(committed + 50);
+    const ev = try pollFor(&setup.wt, .writable);
+    try testing.expectEqual(session_id, ev.writable.session_id);
+    try testing.expectEqual(@as(?u64, null), ev.writable.stream_id);
+    try testing.expectError(error.EventNotSeen, pollFor(&setup.wt, .writable)); // once
+}
+
+test "WT backpressure: a stream wait fires when MAX_STREAM_DATA rises" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+    setup.quic_conn.conn_flow_ctrl.base.send_window = 1 << 30;
+
+    const stream_id = try setup.wt.openUniStream(session_id, null);
+    const ss = setup.quic_conn.streams.send_streams.get(stream_id).?;
+    ss.send_window = ss.write_offset + 10;
+    try setup.wt.sendStreamData(stream_id, "0123456789");
+    try testing.expectEqual(@as(?u64, 0), setup.wt.streamSendCapacity(stream_id));
+
+    try setup.wt.notifyWritable(session_id, stream_id, 4);
+    try testing.expectError(error.EventNotSeen, pollFor(&setup.wt, .writable));
+
+    ss.updateSendWindow(ss.write_offset + 4);
+    const ev = try pollFor(&setup.wt, .writable);
+    try testing.expectEqual(@as(?u64, stream_id), ev.writable.stream_id);
+}
+
+test "WT backpressure: a wait on a stream the peer stopped is dropped, not fired" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServer();
+    defer setup.deinit();
+    setup.quic_conn.conn_flow_ctrl.base.send_window = 1 << 30;
+
+    const stream_id = try setup.wt.openUniStream(session_id, null);
+    const ss = setup.quic_conn.streams.send_streams.get(stream_id).?;
+    ss.send_window = ss.write_offset + 1;
+    try setup.wt.sendStreamData(stream_id, "x");
+    try setup.wt.notifyWritable(session_id, stream_id, 1);
+
+    ss.reset(appErrorCodeToH3(3));
+    ss.peer_stop_sending = appErrorCodeToH3(3);
+    ss.updateSendWindow(ss.write_offset + 100);
+
+    _ = try pollFor(&setup.wt, .stream_stop_sending);
+    try testing.expectError(error.EventNotSeen, pollFor(&setup.wt, .writable));
+    try testing.expectEqual(@as(usize, 0), setup.wt.writable_waits.items.len);
+}
+
+test "WT backpressure: WT_MAX_DATA narrows the capacity, and raising it wakes the session" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServerWith(.{ .streams = 8, .data = 4096, .peer_data = 4 });
+    defer setup.deinit();
+    setup.quic_conn.conn_flow_ctrl.base.send_window = 1 << 30;
+
+    _ = try setup.wt.poll(); // drain the grant this session starts with
+    try testing.expectEqual(@as(u64, 4), setup.wt.sendCapacity(session_id));
+    const stream_id = try setup.wt.openBidiStream(session_id, null);
+    try setup.wt.sendStreamData(stream_id, "abcd");
+    try testing.expectEqual(@as(u64, 0), setup.wt.sendCapacity(session_id));
+    try testing.expectEqual(@as(?u64, 0), setup.wt.streamSendCapacity(stream_id));
+
+    try setup.wt.notifyWritable(session_id, null, 4);
+    var wire: [64]u8 = undefined;
+    try injectOnConnectStream(&setup, session_id, wrapCapsules(&wire, &.{.{ .wt_max_data = 8 }}));
+    const ev = try pollFor(&setup.wt, .writable);
+    try testing.expectEqual(session_id, ev.writable.session_id);
+    try testing.expectEqual(@as(u64, 4), setup.wt.sendCapacity(session_id));
+}
+
+test "WT flow control: capsules sharing one read are all acted on" {
+    // The CONNECT stream read used to yield one frame and drop the rest, so a
+    // close that shared a packet with a credit update was never seen.
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServerWith(.{ .streams = 8, .data = 4096 });
+    defer setup.deinit();
+
+    var wire: [128]u8 = undefined;
+    const framed = wrapCapsules(&wire, &.{
+        .{ .wt_max_streams_bidi = 2 },
+        .{ .close_webtransport_session = .{ .error_code = 7, .reason = "done" } },
+    });
+    try injectOnConnectStream(&setup, session_id, framed);
+
+    const ev = try pollFor(&setup.wt, .session_closed);
+    try testing.expectEqual(@as(u32, 7), ev.session_closed.error_code);
+    try testing.expectEqualStrings("done", ev.session_closed.reason);
+}
+
+test "WT flow control: the peer's opens slide our grant forward" {
+    var setup: WtTestSetup = undefined;
+    const session_id = try setup.initServerWith(.{ .streams = 2, .data = 4096 });
+    defer setup.deinit();
+
+    const stream = setup.quic_conn.streams.getStream(session_id).?;
+    _ = try setup.wt.poll(); // initial grant
+
+    // Peer opens one of its two bidi streams: half the window, so top it up.
+    var prefix: [16]u8 = undefined;
+    const len = buildWtBidiPrefix(&prefix, session_id);
+    const peer_stream = try setup.quic_conn.streams.getOrCreateStream(4);
+    try peer_stream.recv.handleStreamFrame(0, prefix[0..len], false);
+
+    const pre_len = stream.send.write_buffer.items.len;
+    _ = try setup.wt.poll();
+    _ = try setup.wt.poll();
+
+    var buf: [4]h3_frame.H3Frame = undefined;
+    const capsules = try collectCapsules(stream.send.write_buffer.items[pre_len..], &buf);
+    try testing.expectEqualDeep(&[_]h3_frame.H3Frame{.{ .wt_max_streams_bidi = 3 }}, capsules);
+}
+
+test "WT integration: a server delivers ordinary HTTP/3 requests alongside sessions" {
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initServer();
+    defer setup.deinit();
+
+    const req_headers = [_]qpack.Header{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/upload" },
+    };
+    var qpack_buf: [256]u8 = undefined;
+    const qpack_len = try qpack.encodeHeaders(&req_headers, &qpack_buf);
+    var buf: [512]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, &fbs);
+    try h3_frame.write(.{ .data = "hello body" }, &fbs);
+    const stream = try setup.quic_conn.streams.getOrCreateStream(4);
+    try stream.recv.handleStreamFrame(0, fbs.buffered(), true);
+
+    const req = try pollFor(&setup.wt, .request);
+    try testing.expectEqual(@as(u64, 4), req.request.stream_id);
+    try testing.expectEqualStrings("POST", req.request.headers[0].value);
+
+    const body = try pollFor(&setup.wt, .request_data);
+    try testing.expectEqual(@as(u64, 4), body.request_data.stream_id);
+    try testing.expectEqualStrings("hello body", body.request_data.data);
+
+    const end = try pollFor(&setup.wt, .request_end);
+    try testing.expectEqual(@as(u64, 4), end.request_end);
+
+    // Answered through H3, like any request; the session is untouched.
+    try setup.h3.sendResponse(4, &.{.{ .name = ":status", .value = "200" }}, "ok");
+    try testing.expect(setup.wt.getSession(0) != null);
+}
+
+test "WT: the peer's QPACK streams arriving after the session are not WebTransport data" {
+    // imquic opens its QPACK streams late, once a session is up. The
+    // encoder stream's type byte (0x02) reached the application as the
+    // first byte of a WebTransport uni stream.
+    var setup: WtTestSetup = undefined;
+    _ = try setup.initClient();
+    defer setup.deinit();
+
+    // Server-initiated uni streams: 3 is its control stream.
+    try (try setup.quic_conn.streams.getOrCreateRecvStream(7)).handleStreamFrame(0, &.{0x02}, false);
+    try (try setup.quic_conn.streams.getOrCreateRecvStream(11)).handleStreamFrame(0, &.{0x03}, false);
+
+    for (0..8) |_| {
+        const ev = try setup.wt.poll() orelse continue;
+        switch (ev) {
+            .stream_data => |sd| {
+                defer if (sd.data.len > 0) testing.allocator.free(sd.data);
+                std.debug.print("surfaced stream {d}: {x}\n", .{ sd.stream_id, sd.data });
+                return error.QpackStreamSurfaced;
+            },
+            .uni_stream => |us| {
+                std.debug.print("surfaced uni stream {d}\n", .{us.stream_id});
+                return error.QpackStreamSurfaced;
+            },
+            else => {},
+        }
+    }
+    try testing.expectEqual(@as(?u64, 7), setup.h3.peer_qpack_enc_stream_id);
+    try testing.expectEqual(@as(?u64, 11), setup.h3.peer_qpack_dec_stream_id);
+}

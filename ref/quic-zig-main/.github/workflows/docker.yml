@@ -1,0 +1,82 @@
+name: Docker Interop Images
+
+on:
+  push:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  # The MoQ runner's implementations.json names these, so they are fixed:
+  # see interop/moq-runner/implementations-entry.json.
+  MOQ_CLIENT_NAME: ${{ github.repository_owner }}/quic-zig-moq-client
+  MOQ_RELAY_NAME: ${{ github.repository_owner }}/quic-zig-moq-relay
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+
+      # interop/runner/Dockerfile packages pre-built binaries; its COPY paths
+      # are relative to the staging dir, as in interop/runner/build_image.sh.
+      - name: Cross-compile interop binaries
+        run: |
+          zig build interop -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3+aes+pclmul -j1 --prefix "$PWD/stage"
+          cp interop/runner/run_endpoint.sh stage/run_endpoint.sh
+
+      - name: Build and push the QUIC interop image
+        uses: docker/build-push-action@v6
+        with:
+          context: stage
+          file: interop/runner/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          platforms: linux/amd64
+
+      # The MoQ runner takes a client and a relay as separate entries, so they
+      # are separate images off one build. Same staging shape as above: both
+      # Dockerfiles COPY out of bin/, which is where --prefix puts them.
+      - name: Cross-compile the MoQ interop binaries
+        run: |
+          zig build moq-interop -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3+aes+pclmul -j1 --prefix "$PWD/moq-stage"
+          cp interop/moq-runner/entrypoint-client.sh moq-stage/entrypoint-client.sh
+          cp interop/moq-runner/entrypoint-relay.sh moq-stage/entrypoint-relay.sh
+
+      - name: Build and push the MoQ interop client
+        uses: docker/build-push-action@v6
+        with:
+          context: moq-stage
+          file: interop/moq-runner/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.MOQ_CLIENT_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.MOQ_CLIENT_NAME }}:${{ github.sha }}
+          platforms: linux/amd64
+
+      - name: Build and push the MoQ interop relay
+        uses: docker/build-push-action@v6
+        with:
+          context: moq-stage
+          file: interop/moq-runner/Dockerfile.relay
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.MOQ_RELAY_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.MOQ_RELAY_NAME }}:${{ github.sha }}
+          platforms: linux/amd64

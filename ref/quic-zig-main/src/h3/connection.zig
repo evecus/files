@@ -1,0 +1,3840 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const testing = std.testing;
+const io = @import("../io_compat.zig");
+
+const quic_connection = @import("../quic/connection.zig");
+const stream_mod = @import("../quic/stream.zig");
+const packet = @import("../quic/packet.zig");
+const h3_frame = @import("frame.zig");
+const qpack = @import("qpack.zig");
+const priority = @import("priority.zig");
+
+/// Re-export the frame module so library consumers can reach `quic.h3.frame`.
+pub const frame = h3_frame;
+
+pub const ALPN = [_][]const u8{ "h3", "h3-32", "h3-31", "h3-30", "h3-29" };
+
+/// HTTP/3 error codes (RFC 9114 Section 8.1).
+pub const H3Error = enum(u64) {
+    no_error = 0x0100,
+    general_protocol_error = 0x0101,
+    internal_error = 0x0102,
+    stream_creation_error = 0x0103,
+    closed_critical_stream = 0x0104,
+    frame_unexpected = 0x0105,
+    frame_error = 0x0106,
+    excessive_load = 0x0107,
+    id_error = 0x0108,
+    settings_error = 0x0109,
+    missing_settings = 0x010a,
+    request_rejected = 0x010b,
+    request_cancelled = 0x010c,
+    request_incomplete = 0x010d,
+    message_error = 0x010e,
+    connect_error = 0x010f,
+    version_fallback = 0x0110,
+    // QPACK error codes (RFC 9204 Section 6)
+    qpack_decompression_failed = 0x0200,
+    qpack_encoder_stream_error = 0x0201,
+    qpack_decoder_stream_error = 0x0202,
+};
+
+/// Graceful shutdown state (RFC 9114 Section 5.2).
+pub const ShutdownState = enum {
+    /// Normal operation.
+    active,
+    /// Sent initial GOAWAY with max stream ID (phase 1).
+    going_away_initial,
+    /// Sent final GOAWAY with actual last-processed stream ID (phase 2).
+    going_away_final,
+    /// All in-flight streams below GOAWAY ID have completed.
+    drain_complete,
+};
+
+/// Events returned by poll().
+pub const H3Event = union(enum) {
+    settings: h3_frame.Settings,
+    headers: struct { stream_id: u64, headers: []const qpack.Header },
+    /// Body data is available on this stream. Call recvBody() to read it.
+    /// A DATA frame is surfaced piecewise as it arrives, so `len` is what is
+    /// buffered now, not the frame's declared length.
+    data: struct { stream_id: u64, len: usize },
+    finished: u64,
+    goaway: u64,
+    connect_request: struct {
+        stream_id: u64,
+        protocol: []const u8,
+        authority: []const u8,
+        path: []const u8,
+        headers: []const qpack.Header,
+    },
+    shutdown_complete: void,
+    /// Server: the peer abandoned a request stream — RESET_STREAM on its
+    /// request, or STOP_SENDING on our response. Reported once per stream.
+    request_cancelled: struct { stream_id: u64, error_code: u64 },
+    /// A `notifyWritable` wait on this stream was met.
+    writable: u64,
+};
+
+/// Maximum number of headers we'll decode from a single HEADERS frame. The
+/// decoded bytes are bounded separately, by the SETTINGS_MAX_FIELD_SECTION_SIZE
+/// we advertise (at most `qpack.SCRATCH_SIZE`). A section past either limit
+/// fails its stream: a request is answered 431, a response is cancelled.
+pub const MAX_HEADERS: usize = 128;
+
+/// Largest HEADERS frame we will buffer to decode. Decoded fields are capped
+/// at `qpack.SCRATCH_SIZE`; this bounds the encoded frame held meanwhile. A
+/// larger one is refused like an oversized section, before it is buffered.
+pub const MAX_HEADERS_FRAME: u64 = 64 * 1024;
+
+/// Largest SETTINGS or PRIORITY_UPDATE frame accepted on the control stream.
+pub const MAX_CONTROL_FRAME: u64 = 16 * 1024;
+
+/// Where a stream's reader is inside the current frame; absent at a frame
+/// boundary.
+const FrameProgress = union(enum) {
+    /// DATA payload bytes the application has yet to take, buffered or not.
+    data: u64,
+    /// Payload bytes of an ignored frame still to discard.
+    skip: u64,
+};
+
+/// What handling the frame at the front of a buffer came to.
+const FrameStep = union(enum) {
+    event: H3Event,
+    /// Consumed something; try again.
+    progressed,
+    /// The frame is not all there yet.
+    need_more,
+    /// The request stream is refused; nothing more is read from it.
+    refused,
+};
+
+/// A `notifyWritable` request waiting on a request stream.
+const WritableWait = struct {
+    stream_id: u64,
+    min_bytes: u64,
+};
+
+/// HTTP/3 connection state machine.
+/// Wraps a QUIC connection and manages H3 framing, control streams, and QPACK.
+const ResponseState = enum { informational, final };
+/// How far a stream's received header sections have got (RFC 9114 §4.1).
+const HeaderPhase = enum { interim, final, trailers };
+
+pub const H3Connection = struct {
+    allocator: Allocator,
+    quic_conn: *quic_connection.Connection,
+    is_server: bool,
+
+    // Our control streams (send-only uni)
+    local_control_stream: ?*stream_mod.SendStream = null,
+    local_qpack_enc_stream: ?*stream_mod.SendStream = null,
+    local_qpack_dec_stream: ?*stream_mod.SendStream = null,
+
+    // Peer's control streams (identified by stream type byte)
+    peer_control_stream_id: ?u64 = null,
+    peer_qpack_enc_stream_id: ?u64 = null,
+    peer_qpack_dec_stream_id: ?u64 = null,
+    peer_settings_received: bool = false,
+    peer_settings: h3_frame.Settings = .{},
+
+    // Local settings
+    local_settings: h3_frame.Settings = .{},
+
+    // Initialization state
+    initialized: bool = false,
+
+    /// Decoded headers, pointing into `qpack_scratch`: shared, left empty or
+    /// owned the same way, and good for as long.
+    headers_buf: []qpack.Header = &.{},
+    headers_buf_owned: bool = false,
+
+    // Per-stream partial frame buffer for streams that haven't delivered a complete frame yet
+    // Key: stream_id, Value: accumulated bytes
+    stream_bufs: std.AutoHashMap(u64, std.ArrayList(u8)),
+
+    // Streams that have been reported as finished (avoid duplicate events)
+    finished_streams: std.AutoHashMap(u64, void),
+
+    // Streams the WebTransport layer owns, in either direction: H3 never
+    // reads them, even while their data sits unread.
+    excluded_streams: std.AutoHashMap(u64, void),
+
+    // How far each stream's received header sections have got.
+    headers_received_streams: std.AutoHashMap(u64, HeaderPhase),
+    /// Set by the WebTransport layer, which classifies the peer's bidi
+    /// streams: until it has handed one over (a `stream_bufs` entry), its
+    /// bytes may be a WT preamble and are not ours to read.
+    defer_peer_bidi: bool = false,
+
+    /// Request streams already reported as `request_cancelled`.
+    cancelled_streams: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    /// How far each response has got: absent until its first HEADERS, then
+    /// informational while only 1xx has gone out, then final. Enforces the
+    /// RFC 9114 4.1 frame order on the send side.
+    response_states: std.AutoHashMapUnmanaged(u64, ResponseState) = .empty,
+
+    /// Outstanding `notifyWritable` requests; few, and re-checked every poll.
+    writable_waits: std.ArrayList(WritableWait) = .empty,
+
+    // Static-only encoder; the decoder accepts a dynamic table.
+    qpack_encoder: qpack.QpackEncoder = .{},
+    /// Made when the peer's encoder stream first sends something: 13 KB of
+    /// table and instruction buffers that a peer keeping to the static table
+    /// never needs. `qpack_capacity` is what our SETTINGS offered it.
+    qpack_decoder: ?*qpack.QpackDecoder = null,
+    qpack_capacity: usize = 0,
+
+    /// Scratch the decoder copies header names/values into; `headers_buf`
+    /// slices point in here and survive only until the next decode into it.
+    /// Point every connection on an event loop at one shared buffer to pay
+    /// 16 KB per loop instead of per connection, and that next decode may be
+    /// another connection's; left empty, the first decode allocates a
+    /// private one.
+    qpack_scratch: []u8 = &.{},
+    qpack_scratch_owned: bool = false,
+
+    // Pending DATA frame body: set by poll() when a DATA frame is found,
+    // consumed by recvBody().  poll() won't advance past this stream
+    // until the body is fully read.
+    pending_body: ?struct {
+        stream_id: u64,
+        offset: usize, // bytes of this piece recvBody() has already returned
+        remaining: usize, // bytes not yet read by recvBody()
+    } = null,
+
+    /// Per-stream position inside a DATA or skipped frame.
+    frame_progress: std.AutoHashMapUnmanaged(u64, FrameProgress) = .empty,
+    /// Server: body bytes still owed on each request that declared a
+    /// content-length (RFC 9114 §4.1.2).
+    body_owed: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+
+    /// Streams reclaimed since the per-stream maps' tombstones were cleared.
+    removed_since_rehash: usize = 0,
+
+    /// Slot in the QUIC streams map of the stream that gave poll() its last
+    /// request-stream event: where `pollBidiStreams` starts next time.
+    bidi_cursor: usize = 0,
+
+    /// Request streams whose body the application has paused. poll() leaves
+    /// their data in QUIC, so the peer is held back by the stream's flow
+    /// control window rather than by our memory.
+    paused_bodies: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    // Graceful shutdown state (RFC 9114 §5.2)
+    shutdown_state: ShutdownState = .active,
+    local_goaway_id: ?u64 = null,
+    peer_goaway_id: ?u64 = null,
+    highest_processed_stream_id: ?u64 = null,
+
+    pub fn init(allocator: Allocator, quic_conn: *quic_connection.Connection, is_server: bool) H3Connection {
+        var conn = H3Connection{
+            .allocator = allocator,
+            .quic_conn = quic_conn,
+            .is_server = is_server,
+            .stream_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(allocator),
+            .finished_streams = std.AutoHashMap(u64, void).init(allocator),
+            .excluded_streams = std.AutoHashMap(u64, void).init(allocator),
+            .headers_received_streams = std.AutoHashMap(u64, HeaderPhase).init(allocator),
+        };
+        // Advertise dynamic table capacity in local settings
+        conn.local_settings.qpack_max_table_capacity = qpack.DynamicTable.MAX_CAPACITY;
+        return conn;
+    }
+
+    pub fn deinit(self: *H3Connection) void {
+        if (self.qpack_scratch_owned) self.allocator.free(self.qpack_scratch);
+        if (self.headers_buf_owned) self.allocator.free(self.headers_buf);
+        if (self.qpack_decoder) |d| self.allocator.destroy(d);
+        var it = self.stream_bufs.valueIterator();
+        while (it.next()) |buf| {
+            buf.deinit(self.allocator);
+        }
+        self.stream_bufs.deinit();
+        self.finished_streams.deinit();
+        self.excluded_streams.deinit();
+        self.headers_received_streams.deinit();
+        self.cancelled_streams.deinit(self.allocator);
+        self.writable_waits.deinit(self.allocator);
+        self.paused_bodies.deinit(self.allocator);
+        self.response_states.deinit(self.allocator);
+        self.frame_progress.deinit(self.allocator);
+        self.body_owed.deinit(self.allocator);
+    }
+
+    fn encoderInstructions(self: *H3Connection, data: []const u8) !void {
+        // Chrome opens its encoder stream with Set Dynamic Table Capacity 0
+        // and goes no further: an empty table needs no decoder for that.
+        if (self.qpack_decoder == null and std.mem.allEqual(u8, data, 0x20)) return;
+        const d = self.qpack_decoder orelse blk: {
+            const d = try self.allocator.create(qpack.QpackDecoder);
+            d.* = .{};
+            d.setCapacity(self.qpack_capacity);
+            self.qpack_decoder = d;
+            break :blk d;
+        };
+        try d.processEncoderInstruction(data);
+    }
+
+    fn qpackScratch(self: *H3Connection) ![]u8 {
+        if (self.qpack_scratch.len == 0) {
+            self.qpack_scratch = try self.allocator.alloc(u8, qpack.SCRATCH_SIZE);
+            self.qpack_scratch_owned = true;
+        }
+        if (self.headers_buf.len == 0) {
+            self.headers_buf = try self.allocator.alloc(qpack.Header, MAX_HEADERS);
+            self.headers_buf_owned = true;
+        }
+        return self.qpack_scratch;
+    }
+
+    /// Initialize the HTTP/3 connection: open control + QPACK streams, send SETTINGS.
+    /// Must be called after the QUIC handshake completes.
+    pub fn initConnection(self: *H3Connection) !void {
+        if (self.initialized) return;
+
+        // Open control stream (type 0x00)
+        // All three are written through pointers kept for the connection's
+        // life, so a peer's STOP_SENDING must not get them reclaimed.
+        // Urgency 0, RFC 9218's highest: they lead any request in a packet,
+        // as browsers send them. imquic misreads them as WebTransport
+        // streams when they follow the CONNECT it has just answered.
+        const ctrl = try self.quic_conn.openUniStream();
+        ctrl.pinned = true;
+        ctrl.urgency = 0;
+        self.local_control_stream = ctrl;
+        // Write stream type
+        var type_buf: [8]u8 = undefined;
+        var type_fbs = io.fixedBufferStream(&type_buf);
+        try h3_frame.writeUniStreamType(&type_fbs, .control);
+        try ctrl.writeData(type_fbs.buffered());
+
+        // The decoder holds the peer to what SETTINGS says, whoever set it,
+        // and SETTINGS can't promise more table than there is.
+        const cap = &self.local_settings.qpack_max_table_capacity;
+        cap.* = @min(cap.*, qpack.DynamicTable.MAX_CAPACITY);
+        self.qpack_capacity = @intCast(cap.*);
+        if (self.qpack_decoder) |d| d.setCapacity(self.qpack_capacity);
+        // RFC 9114 4.2.2: tell the peer where decoding stops. Any section
+        // within it fits the scratch.
+        const fss = &self.local_settings.max_field_section_size;
+        fss.* = @min(fss.* orelse qpack.SCRATCH_SIZE, qpack.SCRATCH_SIZE);
+
+        // Send SETTINGS frame on control stream
+        var settings_buf: [128]u8 = undefined;
+        var settings_fbs = io.fixedBufferStream(&settings_buf);
+        try h3_frame.write(.{ .settings = self.local_settings }, &settings_fbs);
+        try ctrl.writeData(settings_fbs.buffered());
+
+        // Open QPACK encoder stream (type 0x02) — empty for static-only
+        const enc = try self.quic_conn.openUniStream();
+        enc.pinned = true;
+        enc.urgency = 0;
+        self.local_qpack_enc_stream = enc;
+        type_fbs = io.fixedBufferStream(&type_buf);
+        try h3_frame.writeUniStreamType(&type_fbs, .qpack_encoder);
+        try enc.writeData(type_fbs.buffered());
+
+        // Open QPACK decoder stream (type 0x03) — empty for static-only
+        const dec = try self.quic_conn.openUniStream();
+        dec.pinned = true;
+        dec.urgency = 0;
+        self.local_qpack_dec_stream = dec;
+        type_fbs = io.fixedBufferStream(&type_buf);
+        try h3_frame.writeUniStreamType(&type_fbs, .qpack_decoder);
+        try dec.writeData(type_fbs.buffered());
+
+        self.initialized = true;
+    }
+
+    /// Send an HTTP request (client-side).
+    /// Opens a new bidirectional stream, sends HEADERS + optional DATA, returns stream ID.
+    pub fn sendRequest(self: *H3Connection, headers: []const qpack.Header, body: ?[]const u8) !u64 {
+        // RFC 9114 §5.2: must not initiate requests on streams >= peer's GOAWAY ID
+        if (self.peer_goaway_id) |goaway_id| {
+            if (self.quic_conn.streams.next_bidi_stream_id >= goaway_id) {
+                return error.H3RequestRejected;
+            }
+        }
+        const stream = try self.quic_conn.openStream();
+        const stream_id = stream.stream_id;
+
+        try self.writeHeadersFrame(&stream.send, headers);
+        if (body) |b| try writeDataFrame(&stream.send, b);
+
+        stream.send.close();
+        return stream_id;
+    }
+
+    /// Send an Extended CONNECT request (RFC 9220).
+    /// Opens a bidi stream, sends HEADERS with :method=CONNECT, :protocol, etc.
+    /// Does NOT close the stream — session lifetime = stream lifetime.
+    pub fn sendConnectRequest(self: *H3Connection, protocol_name: []const u8, authority: []const u8, path: []const u8) !u64 {
+        return self.sendConnectRequestWithHeaders(protocol_name, authority, path, &.{});
+    }
+
+    /// Send a CONNECT request with additional headers (client-side, RFC 9220).
+    pub fn sendConnectRequestWithHeaders(self: *H3Connection, protocol_name: []const u8, authority: []const u8, path: []const u8, extra_headers: []const qpack.Header) !u64 {
+        // RFC 9114 §5.2: must not initiate requests on streams >= peer's GOAWAY ID
+        if (self.peer_goaway_id) |goaway_id| {
+            if (self.quic_conn.streams.next_bidi_stream_id >= goaway_id) {
+                return error.H3RequestRejected;
+            }
+        }
+        const stream = try self.quic_conn.openStream();
+        const stream_id = stream.stream_id;
+
+        var all_headers: [16]qpack.Header = undefined;
+        all_headers[0] = .{ .name = ":method", .value = "CONNECT" };
+        all_headers[1] = .{ .name = ":protocol", .value = protocol_name };
+        all_headers[2] = .{ .name = ":scheme", .value = "https" };
+        all_headers[3] = .{ .name = ":authority", .value = authority };
+        all_headers[4] = .{ .name = ":path", .value = path };
+        const count = @min(extra_headers.len, 11);
+        for (0..count) |i| {
+            all_headers[5 + i] = extra_headers[i];
+        }
+
+        try self.writeHeadersFrame(&stream.send, all_headers[0 .. 5 + count]);
+        return stream_id;
+    }
+
+    /// Send a CONNECT response (server-side, RFC 9220).
+    /// Sends :status response HEADERS, does NOT close the stream.
+    pub fn sendConnectResponse(self: *H3Connection, stream_id: u64, status: []const u8) !void {
+        return self.sendConnectResponseWithHeaders(stream_id, status, &.{});
+    }
+
+    /// Send a CONNECT response with additional headers (server-side, RFC 9220).
+    /// Sends :status + extra headers, does NOT close the stream.
+    pub fn sendConnectResponseWithHeaders(self: *H3Connection, stream_id: u64, status: []const u8, extra_headers: []const qpack.Header) !void {
+        const stream = self.quic_conn.streams.getStream(stream_id) orelse return error.StreamNotFound;
+
+        var all_headers: [16]qpack.Header = undefined;
+        all_headers[0] = .{ .name = ":status", .value = status };
+        const count = @min(extra_headers.len, 15);
+        for (0..count) |i| {
+            all_headers[1 + i] = extra_headers[i];
+        }
+
+        try self.writeHeadersFrame(&stream.send, all_headers[0 .. 1 + count]);
+        try self.response_states.put(self.allocator, stream_id, .final);
+
+        // Do NOT close the stream — session stays open
+    }
+
+    /// Send a complete HTTP response (server-side): HEADERS, the body as one
+    /// DATA frame when non-empty, then FIN. `sendResponseHeaders` +
+    /// `sendResponseData` + `finishResponse` stream the same thing in pieces.
+    pub fn sendResponse(
+        self: *H3Connection,
+        stream_id: u64,
+        headers: []const qpack.Header,
+        body: ?[]const u8,
+    ) !void {
+        try self.sendResponseHeaders(stream_id, headers);
+        if (body) |b| try self.sendResponseData(stream_id, b);
+        try self.finishResponse(stream_id, null);
+    }
+
+    /// Write a HEADERS frame on a request stream without ending it. Call it
+    /// once per informational (1xx) response and once for the final one.
+    /// Header blocks of any size are encoded; the peer's own limits decide
+    /// whether it accepts them.
+    ///
+    /// Returns `error.ResponseHeadersAlreadySent` once the final (non-1xx)
+    /// headers have gone out: a later HEADERS frame is the trailers, which
+    /// `finishResponse` sends.
+    pub fn sendResponseHeaders(self: *H3Connection, stream_id: u64, headers: []const qpack.Header) !void {
+        const send = try self.responseStream(stream_id);
+        const gop = try self.response_states.getOrPut(self.allocator, stream_id);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .informational;
+        } else if (gop.value_ptr.* == .final) {
+            return error.ResponseHeadersAlreadySent;
+        }
+        try self.writeHeadersFrame(send, headers);
+        if (!isInformational(headers)) gop.value_ptr.* = .final;
+    }
+
+    /// Write `data` as one DATA frame. Nothing is written for empty data.
+    /// The bytes are buffered in full whatever the peer's flow-control credit;
+    /// see `notifyWritable` to pace a large body.
+    ///
+    /// Returns `error.ResponseHeadersNotSent` before the final headers.
+    pub fn sendResponseData(self: *H3Connection, stream_id: u64, data: []const u8) !void {
+        const send = try self.responseStream(stream_id);
+        if (self.response_states.get(stream_id) != .final) return error.ResponseHeadersNotSent;
+        try writeDataFrame(send, data);
+    }
+
+    /// End the response: optional trailers as a last HEADERS frame, then FIN.
+    ///
+    /// Returns `error.ResponseHeadersNotSent` before the final headers; use
+    /// `cancelRequest` to abandon a response instead.
+    pub fn finishResponse(self: *H3Connection, stream_id: u64, trailers: ?[]const qpack.Header) !void {
+        const send = try self.responseStream(stream_id);
+        if (self.response_states.get(stream_id) != .final) return error.ResponseHeadersNotSent;
+        if (trailers) |t| try self.writeHeadersFrame(send, t);
+        send.close();
+    }
+
+    fn hasPseudoHeader(headers: []const qpack.Header) bool {
+        for (headers) |h| if (h.name.len > 0 and h.name[0] == ':') return true;
+        return false;
+    }
+
+    fn isInformational(headers: []const qpack.Header) bool {
+        for (headers) |h| {
+            if (std.mem.eql(u8, h.name, ":status")) return h.value.len == 3 and h.value[0] == '1';
+        }
+        return false;
+    }
+
+    /// The content-length a header section declares: digits only, and every
+    /// copy the same (RFC 9110 §8.6). Null when there is none, or on CONNECT.
+    pub fn contentLength(headers: []const qpack.Header) error{Invalid}!?u64 {
+        var n: ?u64 = null;
+        for (headers) |h| {
+            if (std.mem.eql(u8, h.name, ":method") and std.mem.eql(u8, h.value, "CONNECT")) return null;
+            if (!std.mem.eql(u8, h.name, "content-length")) continue;
+            if (h.value.len == 0) return error.Invalid;
+            for (h.value) |c| if (!std.ascii.isDigit(c)) return error.Invalid;
+            const v = std.fmt.parseInt(u64, h.value, 10) catch return error.Invalid;
+            if (n != null and n.? != v) return error.Invalid;
+            n = v;
+        }
+        return n;
+    }
+
+    /// DATA past the declared content-length.
+    fn bodyMismatch(self: *H3Connection, rs: *stream_mod.ReceiveStream, buf: *std.ArrayList(u8), header_len: usize) error{H3MessageError} {
+        self.consumeRequestBytes(rs, buf, header_len);
+        self.closeWithError(.message_error, "request body longer than its content-length");
+        return error.H3MessageError;
+    }
+
+    /// The send side of a request stream the response can still be written to.
+    fn responseStream(self: *H3Connection, stream_id: u64) !*stream_mod.SendStream {
+        const stream = self.quic_conn.streams.getStream(stream_id) orelse return error.StreamNotFound;
+        if (stream.send.reset_err != null) return error.StreamReset;
+        if (stream.send.fin_queued) return error.StreamFinished;
+        return &stream.send;
+    }
+
+    /// QPACK-encode `headers` into a HEADERS frame on `send`.
+    pub fn writeHeadersFrame(self: *H3Connection, send: *stream_mod.SendStream, headers: []const qpack.Header) !void {
+        var stack_buf: [4096]u8 = undefined;
+        const need = qpack.maxEncodedLen(headers);
+        const block_buf = if (need <= stack_buf.len) stack_buf[0..] else try self.allocator.alloc(u8, need);
+        defer if (block_buf.ptr != &stack_buf) self.allocator.free(block_buf);
+
+        const block_len = try self.qpack_encoder.encode(headers, block_buf);
+        try writeFrameHeader(send, 0x01, block_len);
+        try send.writeData(block_buf[0..block_len]);
+    }
+
+    fn writeDataFrame(send: *stream_mod.SendStream, data: []const u8) !void {
+        if (data.len == 0) return;
+        try writeFrameHeader(send, 0x00, data.len);
+        try send.writeData(data);
+    }
+
+    fn writeFrameHeader(send: *stream_mod.SendStream, frame_type: u64, len: usize) !void {
+        var hdr_buf: [16]u8 = undefined;
+        var fbs = io.fixedBufferStream(&hdr_buf);
+        packet.writeVarInt(&fbs, frame_type) catch unreachable;
+        packet.writeVarInt(&fbs, len) catch unreachable;
+        try send.writeData(fbs.buffered());
+    }
+
+    /// Ask for one `.writable` event on request stream `stream_id` once
+    /// `min_bytes` more fit under the peer's flow-control credit and fewer
+    /// than `min_bytes` still wait unsent in the stream's buffer — room for
+    /// the next chunk without queueing more than one behind it.
+    ///
+    /// Checked every poll. A second call for the same stream replaces the
+    /// first. The wait is dropped without an event once the stream is reset,
+    /// finished or gone.
+    pub fn notifyWritable(self: *H3Connection, stream_id: u64, min_bytes: u64) !void {
+        const wait: WritableWait = .{ .stream_id = stream_id, .min_bytes = @max(min_bytes, 1) };
+        for (self.writable_waits.items) |*w| {
+            if (w.stream_id == stream_id) {
+                w.* = wait;
+                return;
+            }
+        }
+        try self.writable_waits.append(self.allocator, wait);
+    }
+
+    /// Bytes written to `stream_id` that have not been sent yet, whether held
+    /// back by flow control or by congestion control. Null for an unknown
+    /// stream.
+    pub fn streamBufferedBytes(self: *H3Connection, stream_id: u64) ?u64 {
+        return self.quic_conn.streamBufferedBytes(stream_id);
+    }
+
+    fn pollWritable(self: *H3Connection) ?H3Event {
+        var i: usize = 0;
+        while (i < self.writable_waits.items.len) {
+            const w = self.writable_waits.items[i];
+            const ss = self.quic_conn.streams.getSendStream(w.stream_id);
+            if (ss == null or ss.?.reset_err != null or ss.?.fin_queued) {
+                _ = self.writable_waits.swapRemove(i);
+                continue;
+            }
+            const cap = self.quic_conn.streamSendCapacity(w.stream_id) orelse 0;
+            const buffered = self.quic_conn.streamBufferedBytes(w.stream_id) orelse 0;
+            if (cap >= w.min_bytes and buffered < w.min_bytes) {
+                _ = self.writable_waits.swapRemove(i);
+                return .{ .writable = w.stream_id };
+            }
+            i += 1;
+        }
+        return null;
+    }
+
+    /// Begin graceful shutdown (RFC 9114 §5.2, phase 1).
+    /// Sends GOAWAY with max stream ID to signal intent to shut down.
+    /// Call `completeShutdown()` after in-flight requests arrive to send the final GOAWAY.
+    pub fn initiateShutdown(self: *H3Connection) !void {
+        if (self.shutdown_state != .active) return;
+        const ctrl = self.local_control_stream orelse return error.NotInitialized;
+
+        // Max client-initiated bidi stream ID (bits 1:0 = 00) for servers,
+        // max push ID for clients.
+        const max_id: u64 = if (self.is_server) 0x3FFFFFFFFFFFFFFC else 0x3FFFFFFFFFFFFFFF;
+
+        var frame_buf: [32]u8 = undefined;
+        var fbs = io.fixedBufferStream(&frame_buf);
+        try h3_frame.write(.{ .goaway = max_id }, &fbs);
+        try ctrl.writeData(fbs.buffered());
+
+        self.local_goaway_id = max_id;
+        self.shutdown_state = .going_away_initial;
+    }
+
+    /// Complete graceful shutdown (RFC 9114 §5.2, phase 2).
+    /// Sends final GOAWAY with the actual last-processed stream ID.
+    /// Streams >= this ID will be rejected with H3_REQUEST_REJECTED.
+    pub fn completeShutdown(self: *H3Connection) !void {
+        if (self.shutdown_state != .going_away_initial) return;
+        const ctrl = self.local_control_stream orelse return error.NotInitialized;
+
+        // Next client-initiated bidi ID after the highest we processed.
+        // If none processed, reject everything (ID = 0).
+        const final_id: u64 = if (self.highest_processed_stream_id) |hid| hid + 4 else 0;
+
+        // Must not increase from previous GOAWAY
+        const goaway_id = if (self.local_goaway_id) |prev| @min(final_id, prev) else final_id;
+
+        var frame_buf: [32]u8 = undefined;
+        var fbs = io.fixedBufferStream(&frame_buf);
+        try h3_frame.write(.{ .goaway = goaway_id }, &fbs);
+        try ctrl.writeData(fbs.buffered());
+
+        self.local_goaway_id = goaway_id;
+        self.shutdown_state = .going_away_final;
+    }
+
+    /// Send a GOAWAY frame with a specific stream ID (RFC 9114 §5.2).
+    /// Single-step alternative to initiateShutdown + completeShutdown.
+    /// The ID must not increase from any previously sent GOAWAY.
+    /// For servers, must be a client-initiated bidi stream ID (divisible by 4) or 0.
+    pub fn sendGoaway(self: *H3Connection, goaway_id: u64) !void {
+        // Validate before writing
+        if (self.local_goaway_id) |prev| {
+            if (goaway_id > prev) return error.H3IdError;
+        }
+        if (self.is_server and goaway_id != 0 and (goaway_id % 4 != 0)) {
+            return error.H3IdError;
+        }
+        const ctrl = self.local_control_stream orelse return error.NotInitialized;
+
+        var frame_buf: [32]u8 = undefined;
+        var fbs = io.fixedBufferStream(&frame_buf);
+        try h3_frame.write(.{ .goaway = goaway_id }, &fbs);
+        try ctrl.writeData(fbs.buffered());
+
+        self.local_goaway_id = goaway_id;
+        if (self.shutdown_state == .active or self.shutdown_state == .going_away_initial) {
+            self.shutdown_state = .going_away_final;
+        }
+    }
+
+    /// Check if all streams below the GOAWAY ID have completed.
+    pub fn isDrainComplete(self: *H3Connection) bool {
+        if (self.shutdown_state != .going_away_final) return false;
+        const goaway_id = self.local_goaway_id orelse return false;
+
+        var stream_it = self.quic_conn.streams.streams.iterator();
+        while (stream_it.next()) |entry| {
+            const sid = entry.key_ptr.*;
+            const stream = entry.value_ptr.*;
+            if (!stream_mod.isClient(sid) or !stream_mod.isBidi(sid)) continue;
+            if (sid >= goaway_id) continue;
+            // Stream still active?
+            if (!stream.closed_for_gc and
+                !(stream.recv.finished and (stream.send.fin_sent or stream.send.reset_err != null)))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// A request stream, ours or the peer's, still has something to carry:
+    /// any bidi stream the WebTransport layer has not taken, until both its
+    /// halves are done or abandoned. Includes a peer stream not yet read far
+    /// enough to say what it is.
+    pub fn hasOpenRequests(self: *H3Connection) bool {
+        var it = self.quic_conn.streams.streams.iterator();
+        while (it.next()) |entry| {
+            if (self.excluded_streams.contains(entry.key_ptr.*)) continue;
+            const s = entry.value_ptr.*;
+            if (s.closed_for_gc) continue;
+            const recv_done = s.recv.reset_err != null or s.recv.allReceived() or s.recv.stop_sending_err != null;
+            const send_done = s.send.fin_queued or s.send.reset_err != null;
+            if (!recv_done or !send_done) return true;
+        }
+        return false;
+    }
+
+    /// Cancel a request (RFC 9114 §4.1.1).
+    /// Sends RESET_STREAM + STOP_SENDING with the given H3 error code.
+    pub fn cancelRequest(self: *H3Connection, stream_id: u64, error_code: u64) void {
+        if (self.quic_conn.streams.getStream(stream_id)) |stream| {
+            stream.send.reset(error_code);
+            stream.recv.stopSending(error_code);
+        }
+    }
+
+    /// Reject a request with H3_REQUEST_REJECTED (RFC 9114 §4.1.1).
+    /// Used during graceful shutdown for streams above the GOAWAY ID.
+    pub fn rejectRequest(self: *H3Connection, stream_id: u64) void {
+        self.cancelRequest(stream_id, @backingInt(H3Error.request_rejected));
+    }
+
+    /// Send a PRIORITY_UPDATE frame on the control stream (RFC 9218).
+    /// Used by clients to dynamically reprioritize a request stream.
+    pub fn sendPriorityUpdate(self: *H3Connection, stream_id: u64, prio: priority.StreamPriority) !void {
+        const ctrl = self.local_control_stream orelse return error.NotInitialized;
+
+        // Serialize the field value
+        var fv_buf: [32]u8 = undefined;
+        const fv_len = priority.serialize(prio, &fv_buf);
+
+        // Write PRIORITY_UPDATE frame
+        var frame_buf: [64]u8 = undefined;
+        var fbs = io.fixedBufferStream(&frame_buf);
+        try h3_frame.write(.{ .priority_update = .{
+            .stream_id = stream_id,
+            .field_value = fv_buf[0..fv_len],
+        } }, &fbs);
+        try ctrl.writeData(fbs.buffered());
+
+        // Also update local scheduling state
+        if (self.quic_conn.streams.getStream(stream_id)) |stream| {
+            stream.send.urgency = prio.urgency;
+            stream.send.incremental = prio.incremental;
+        }
+    }
+
+    /// Close the connection with an H3 error code (RFC 9114 §8).
+    /// Sends APPLICATION_CLOSE via QUIC with the given error code.
+    pub fn closeWithError(self: *H3Connection, h3_error: H3Error, reason: []const u8) void {
+        self.quic_conn.close(@backingInt(h3_error), reason);
+    }
+
+    /// Drop per-stream bookkeeping for the streams QUIC is about to reclaim.
+    /// Called before `StreamsMap.drainDisposalQueue`, while the IDs are still
+    /// on the queue. O(k) in the number of streams reclaimed this cycle.
+    pub fn drainDisposalQueue(self: *H3Connection) void {
+        const disposed = self.quic_conn.streams.disposal_queue[0..self.quic_conn.streams.disposal_count];
+        for (disposed) |id| {
+            _ = self.finished_streams.remove(id);
+            _ = self.excluded_streams.remove(id);
+            _ = self.headers_received_streams.remove(id);
+            _ = self.cancelled_streams.remove(id);
+            _ = self.paused_bodies.remove(id);
+            _ = self.response_states.remove(id);
+            _ = self.frame_progress.remove(id);
+            _ = self.body_owed.remove(id);
+            if (self.stream_bufs.fetchRemove(id)) |kv| {
+                var buf = kv.value;
+                buf.deinit(self.allocator);
+            }
+            if (self.pending_body) |pb| {
+                if (pb.stream_id == id) self.pending_body = null;
+            }
+        }
+        // Their tombstones, like the QUIC maps' (`StreamsMap.clearTombstones`):
+        // these are asked about every stream on every poll.
+        self.removed_since_rehash += disposed.len;
+        if (self.removed_since_rehash > self.finished_streams.unmanaged.capacity() / 4) {
+            self.removed_since_rehash = 0;
+            const clear = stream_mod.StreamsMap.clearTombstones;
+            clear(&self.finished_streams);
+            clear(&self.excluded_streams);
+            clear(&self.headers_received_streams);
+            clear(&self.stream_bufs);
+            const ctx: std.hash_map.AutoContext(u64) = .{};
+            inline for (.{ &self.cancelled_streams, &self.paused_bodies, &self.response_states, &self.frame_progress, &self.body_owed }) |m| {
+                if (m.capacity() > 0) m.rehash(ctx);
+            }
+        }
+    }
+
+    /// Poll for the next HTTP/3 event.
+    /// Processes incoming QUIC stream data and returns H3 events.
+    pub fn poll(self: *H3Connection) !?H3Event {
+        // Check for critical stream closure (RFC 9114 §6.2.1, RFC 9204 §4.2)
+        if (self.checkCriticalStreams()) |err| return err;
+
+        // First, identify any new peer uni streams
+        if (try self.identifyPeerUniStreams()) |event| {
+            return event;
+        }
+
+        // Check control stream for SETTINGS/GOAWAY
+        if (try self.pollControlStream()) |event| {
+            return event;
+        }
+
+        // Process QPACK encoder/decoder streams
+        try self.pollQpackStreams();
+
+        // Check bidirectional streams for request/response data
+        if (try self.pollBidiStreams()) |event| {
+            return event;
+        }
+
+        // After cancellations, so a stopped stream's wait is dropped, not fired.
+        if (self.pollWritable()) |event| return event;
+
+        // Check if graceful shutdown drain is complete
+        if (self.shutdown_state == .going_away_final and self.isDrainComplete()) {
+            self.shutdown_state = .drain_complete;
+            return .{ .shutdown_complete = {} };
+        }
+
+        return null;
+    }
+
+    /// Stop surfacing `stream_id`'s body: no `.data` or `.finished` for it
+    /// until `resumeBody`. Its bytes stay unread in QUIC, and MAX_STREAM_DATA
+    /// only grows as they are read, so the peer stalls at one window.
+    ///
+    /// Safe mid-way through a DATA frame: what `recvBody` has not returned
+    /// yet stays buffered and comes back first after the resume.
+    pub fn pauseBody(self: *H3Connection, stream_id: u64) !void {
+        try self.paused_bodies.put(self.allocator, stream_id, {});
+        const pb = self.pending_body orelse return;
+        if (pb.stream_id != stream_id) return;
+        // Settle what was taken so poll() is free to serve other streams.
+        self.takeBody(stream_id, pb.offset);
+        self.pending_body = null;
+    }
+
+    /// Drop `n` body bytes the application has taken, crediting the peer.
+    fn takeBody(self: *H3Connection, stream_id: u64, n: usize) void {
+        const buf = self.stream_bufs.getPtr(stream_id) orelse return;
+        const rs: ?*stream_mod.ReceiveStream = if (self.quic_conn.streams.getStream(stream_id)) |s| &s.recv else null;
+        self.consumeRequestBytes(rs, buf, n);
+        const fp = self.frame_progress.getPtr(stream_id) orelse return;
+        fp.data -= n;
+        if (fp.data == 0) _ = self.frame_progress.remove(stream_id);
+    }
+
+    /// Undo `pauseBody`. The buffered body is surfaced by a later poll().
+    pub fn resumeBody(self: *H3Connection, stream_id: u64) void {
+        _ = self.paused_bodies.remove(stream_id);
+    }
+
+    pub fn isBodyPaused(self: *const H3Connection, stream_id: u64) bool {
+        return self.paused_bodies.contains(stream_id);
+    }
+
+    /// Read body data from a stream after a `.data` event.
+    /// Copies into the caller-provided buffer and returns the number of bytes read.
+    /// Call repeatedly until 0 is returned to drain the piece the event announced.
+    pub fn recvBody(self: *H3Connection, buf: []u8) usize {
+        const pb = self.pending_body orelse return 0;
+        const stream_buf = self.stream_bufs.getPtr(pb.stream_id) orelse {
+            self.pending_body = null;
+            return 0;
+        };
+
+        const available = @min(pb.remaining, buf.len);
+        if (available == 0) return 0;
+
+        @memcpy(buf[0..available], stream_buf.items[pb.offset..][0..available]);
+
+        if (available == pb.remaining) {
+            self.takeBody(pb.stream_id, pb.offset + available);
+            self.pending_body = null;
+        } else {
+            self.pending_body = .{
+                .stream_id = pb.stream_id,
+                .offset = pb.offset + available,
+                .remaining = pb.remaining - available,
+            };
+        }
+
+        return available;
+    }
+
+    /// RFC 9114 §6.2.1: Closing a critical uni stream (control, QPACK encoder, QPACK decoder)
+    /// MUST be treated as H3_CLOSED_CRITICAL_STREAM.
+    fn checkCriticalStreams(self: *H3Connection) ?error{H3ClosedCriticalStream} {
+        const critical_ids = [_]?u64{
+            self.peer_control_stream_id,
+            self.peer_qpack_enc_stream_id,
+            self.peer_qpack_dec_stream_id,
+        };
+        for (critical_ids) |maybe_id| {
+            const stream_id = maybe_id orelse continue;
+            if (self.quic_conn.streams.recv_streams.get(stream_id)) |recv_stream| {
+                // RFC 9114 §6.2.1: closing a critical stream (reset or FIN) is an error
+                if (recv_stream.reset_err != null or recv_stream.finished) {
+                    self.closeWithError(.closed_critical_stream, "critical stream closed");
+                    return error.H3ClosedCriticalStream;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Identify peer-initiated unidirectional streams by reading their type byte.
+    fn identifyPeerUniStreams(self: *H3Connection) !?H3Event {
+        var recv_it = self.quic_conn.streams.recv_streams.iterator();
+        while (recv_it.next()) |entry| {
+            const stream_id = entry.key_ptr.*;
+            const recv_stream = entry.value_ptr.*;
+
+            // Skip already-identified streams, and ones abandoned as unknown
+            if (self.peer_control_stream_id != null and self.peer_control_stream_id.? == stream_id) continue;
+            if (self.peer_qpack_enc_stream_id != null and self.peer_qpack_enc_stream_id.? == stream_id) continue;
+            if (self.peer_qpack_dec_stream_id != null and self.peer_qpack_dec_stream_id.? == stream_id) continue;
+            if (self.excluded_streams.contains(stream_id)) continue;
+            if (recv_stream.released) continue;
+
+            // Try to read type byte (read() transfers ownership of heap-allocated data)
+            const data = recv_stream.read() orelse {
+                // FIN with nothing to identify it by — no layer will claim it.
+                if (recv_stream.finished) self.quic_conn.streams.releaseRecvStream(stream_id);
+                continue;
+            };
+            defer self.allocator.free(data);
+            if (data.len == 0) continue;
+
+            try self.adoptUniStream(stream_id, data);
+        }
+
+        return null;
+    }
+
+    /// Claim a peer uni stream by its type byte, and take whatever followed it.
+    ///
+    /// Public because the WebTransport layer polls the same receive streams
+    /// looking for its own stream type, and `read()` transfers ownership: the
+    /// first read of the peer's control stream usually carries the SETTINGS
+    /// with it, and whoever gets there first has to hand them over.
+    pub fn adoptUniStream(self: *H3Connection, stream_id: u64, data: []const u8) !void {
+        var fbs = io.fixedBufferStream(data);
+        const stream_type = h3_frame.readUniStreamType(&fbs) catch |err| {
+            std.log.debug("H3 uni stream type parse error on stream {d}: {}", .{ stream_id, err });
+            return self.abandonUniStream(stream_id);
+        };
+        const remaining = data[fbs.seek..];
+
+        // RFC 9114 6.2.1: one of each critical stream.
+        const already = switch (stream_type) {
+            .control => self.peer_control_stream_id,
+            .qpack_encoder => self.peer_qpack_enc_stream_id,
+            .qpack_decoder => self.peer_qpack_dec_stream_id,
+            .push => null,
+        };
+        if (already != null) {
+            self.closeWithError(.stream_creation_error, "second critical stream of one type");
+            return error.H3StreamCreationError;
+        }
+
+        switch (stream_type) {
+            .control => {
+                self.peer_control_stream_id = stream_id;
+                // If there's remaining data, buffer it for SETTINGS parsing
+                if (remaining.len > 0) {
+                    var buf: std.ArrayList(u8) = .empty;
+                    try buf.appendSlice(self.allocator, remaining);
+                    try self.stream_bufs.put(stream_id, buf);
+                }
+            },
+            .qpack_encoder => {
+                self.peer_qpack_enc_stream_id = stream_id;
+                // Buffer remaining data (encoder instructions after type byte)
+                if (remaining.len > 0) {
+                    self.encoderInstructions(remaining) catch {
+                        self.closeWithError(.general_protocol_error, "QPACK encoder stream error");
+                        return error.H3GeneralProtocolError;
+                    };
+                }
+            },
+            .qpack_decoder => {
+                self.peer_qpack_dec_stream_id = stream_id;
+                // Buffer remaining data (decoder instructions after type byte)
+                if (remaining.len > 0) {
+                    self.qpack_encoder.processDecoderInstruction(remaining) catch {
+                        self.closeWithError(.general_protocol_error, "QPACK decoder stream error");
+                        return error.H3GeneralProtocolError;
+                    };
+                }
+            },
+            // RFC 9114 6.2.2: only a server pushes. We never send MAX_PUSH_ID.
+            .push => {
+                if (self.is_server) {
+                    self.closeWithError(.stream_creation_error, "push stream from a client");
+                    return error.H3StreamCreationError;
+                }
+                self.abandonUniStream(stream_id);
+            },
+        }
+    }
+
+    /// RFC 9114 6.2: stop reading a stream of a type we don't take. Released,
+    /// it is skipped from then on, and whatever follows is never read as a
+    /// stream type of its own.
+    pub fn abandonUniStream(self: *H3Connection, stream_id: u64) void {
+        const streams = &self.quic_conn.streams;
+        if (streams.recv_streams.get(stream_id)) |rs| rs.stopSending(@backingInt(H3Error.stream_creation_error));
+        streams.releaseRecvStream(stream_id);
+    }
+
+    /// Poll the peer's control stream for SETTINGS/GOAWAY frames.
+    ///
+    /// Reads from QUIC only when the buffer holds no complete frame, so what
+    /// it buffers is bounded by `MAX_CONTROL_FRAME` plus one QUIC chunk.
+    fn pollControlStream(self: *H3Connection) !?H3Event {
+        const ctrl_id = self.peer_control_stream_id orelse return null;
+        while (true) {
+            if (self.stream_bufs.getPtr(ctrl_id)) |buf| {
+                if (self.frame_progress.getPtr(ctrl_id)) |fp| {
+                    if (self.skipBuffered(ctrl_id, fp, buf, null)) continue;
+                } else if (buf.items.len > 0) {
+                    switch (try self.parseControlFrame(ctrl_id, buf)) {
+                        .event => |ev| return ev,
+                        .progressed => continue,
+                        .need_more => {},
+                        .refused => unreachable, // request streams only
+                    }
+                }
+            }
+            const rs = self.quic_conn.streams.recv_streams.get(ctrl_id) orelse return null;
+            if (!try self.pullChunk(ctrl_id, rs, false)) return null;
+        }
+    }
+
+    /// Handle the frame at the front of the control stream buffer.
+    fn parseControlFrame(self: *H3Connection, ctrl_id: u64, buf: *std.ArrayList(u8)) !FrameStep {
+        const hdr = h3_frame.parseHeader(buf.items) catch {
+            // RFC 9114 §7.2.8: reserved HTTP/2 frame types
+            self.closeWithError(.frame_unexpected, "HTTP/2 frame type on H3 control stream");
+            return error.H3FrameUnexpected;
+        } orelse return .need_more;
+        const frame_type = h3_frame.H3FrameType.fromInt(hdr.frame_type) orelse .unknown;
+        switch (frame_type) {
+            // RFC 9114 §7.2.1, §7.2.2
+            .data => {
+                self.closeWithError(.frame_unexpected, "DATA on control stream");
+                return error.H3FrameUnexpected;
+            },
+            .headers => {
+                self.closeWithError(.frame_unexpected, "HEADERS on control stream");
+                return error.H3FrameUnexpected;
+            },
+            else => {},
+        }
+        // RFC 9114 §6.2.1: SETTINGS must be the first frame on the control stream
+        if (!self.peer_settings_received and frame_type != .settings) {
+            self.closeWithError(.missing_settings, "non-SETTINGS first frame");
+            return error.H3MissingSettings;
+        }
+        switch (frame_type) {
+            .settings, .priority_update => if (hdr.length > MAX_CONTROL_FRAME) {
+                self.closeWithError(.excessive_load, "control frame too large");
+                return error.H3ExcessiveLoad;
+            },
+            // One varint each; anything longer is malformed (RFC 9114 §7.1).
+            .goaway, .cancel_push, .max_push_id => if (hdr.length > 8) {
+                self.closeWithError(.frame_error, "malformed frame");
+                return error.H3FrameError;
+            },
+            // Ignored frames are dropped as they arrive, never buffered whole.
+            else => {
+                h3_frame.consumeFromBuf(buf, hdr.len);
+                if (hdr.length > 0) try self.frame_progress.put(self.allocator, ctrl_id, .{ .skip = hdr.length });
+                return .progressed;
+            },
+        }
+        const total = hdr.len + @as(usize, @intCast(hdr.length));
+        if (buf.items.len < total) return .need_more;
+
+        const result = h3_frame.parse(buf.items[0..total]) catch |err| {
+            // RFC 9114 §7: malformed frames → H3_FRAME_ERROR
+            if (err == error.MalformedSettings) {
+                self.closeWithError(.frame_error, "malformed SETTINGS");
+                return error.H3FrameError;
+            }
+            if (err == error.MalformedGoaway) {
+                self.closeWithError(.frame_error, "malformed GOAWAY");
+                return error.H3FrameError;
+            }
+            if (err == error.MalformedFrame) {
+                self.closeWithError(.frame_error, "malformed frame");
+                return error.H3FrameError;
+            }
+            // RFC 9114 §7.2.4.1: reserved HTTP/2 settings
+            if (err == error.H3SettingsError) {
+                self.closeWithError(.settings_error, "reserved HTTP/2 settings identifier");
+                return error.H3SettingsError;
+            }
+            return err;
+        };
+        // Handled before the buffer is compacted: payload slices point into it.
+        defer h3_frame.consumeFromBuf(buf, total);
+
+        switch (result.frame) {
+            .settings => |settings| {
+                if (self.peer_settings_received) {
+                    // RFC 9114 §7.2.4: receiving a second SETTINGS frame
+                    self.closeWithError(.frame_unexpected, "duplicate SETTINGS");
+                    return error.H3FrameUnexpected;
+                }
+                self.peer_settings_received = true;
+                self.peer_settings = settings;
+                return .{ .event = .{ .settings = settings } };
+            },
+            .goaway => |id| {
+                // RFC 9114 §5.2: successive GOAWAY IDs must not increase
+                if (self.peer_goaway_id) |prev| {
+                    if (id > prev) {
+                        self.closeWithError(.id_error, "GOAWAY ID increased");
+                        return error.H3IdError;
+                    }
+                }
+                self.peer_goaway_id = id;
+                return .{ .event = .{ .goaway = id } };
+            },
+            .priority_update => |pu| {
+                const prio = priority.parse(pu.field_value);
+                if (self.quic_conn.streams.getStream(pu.stream_id)) |stream| {
+                    stream.send.urgency = prio.urgency;
+                    stream.send.incremental = prio.incremental;
+                }
+                return .progressed; // Internal, don't surface as event
+            },
+            else => return .progressed,
+        }
+    }
+
+    /// RFC 9114 §4.1.2: invalid characters in a field name or value make the
+    /// message malformed. The byte ranges are RFC 9113 §8.2.1's: a name is
+    /// visible lowercase ASCII, and a value carries no NUL, CR or LF.
+    /// Pseudo-header names are matched exactly by the callers.
+    fn fieldsValid(headers: []const qpack.Header) bool {
+        for (headers) |h| {
+            const pseudo = h.name.len > 0 and h.name[0] == ':';
+            if (!pseudo and (h.name.len == 0 or !nameValid(h.name) or connectionSpecific(h.name))) return false;
+            if (anyByte(h.value, badValueBytes)) return false;
+        }
+        return true;
+    }
+
+    /// RFC 9110 §5.1 tchar, lowercase only (RFC 9114 §4.2).
+    const name_bytes: [256]bool = blk: {
+        var t: [256]bool = @splat(false);
+        for ("!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyz") |c| t[c] = true;
+        break :blk t;
+    };
+
+    fn nameValid(name: []const u8) bool {
+        for (name) |c| if (!name_bytes[c]) return false;
+        return true;
+    }
+
+    /// RFC 9114 §4.2: a message carrying any of these is malformed. Passed on
+    /// to HTTP/1.1 they would reframe the message.
+    fn connectionSpecific(name: []const u8) bool {
+        for ([_][]const u8{ "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade" }) |n| {
+            if (std.mem.eql(u8, name, n)) return true;
+        }
+        return false;
+    }
+
+    fn anyByte(bytes: []const u8, comptime bad: anytype) bool {
+        const V = std.simd.suggestVectorLength(u8) orelse 16;
+        var i: usize = 0;
+        while (i + V <= bytes.len) : (i += V) {
+            if (bad(V, bytes[i..][0..V].*)) return true;
+        }
+        for (bytes[i..]) |c| {
+            if (bad(1, .{c})) return true;
+        }
+        return false;
+    }
+
+    fn badValueBytes(comptime V: usize, c: @Vector(V, u8)) bool {
+        return @reduce(.Or, c == @as(@Vector(V, u8), @splat(0))) or
+            @reduce(.Or, c == @as(@Vector(V, u8), @splat('\r'))) or
+            @reduce(.Or, c == @as(@Vector(V, u8), @splat('\n')));
+    }
+
+    /// Validate request pseudo-headers per RFC 9114 §4.1.2, §4.3.
+    fn validateRequestHeaders(headers: []const qpack.Header) bool {
+        if (!fieldsValid(headers)) return false;
+        var method_count: u8 = 0;
+        var scheme_count: u8 = 0;
+        var path_count: u8 = 0;
+        var authority_count: u8 = 0;
+        var path_empty = false;
+        var has_status = false;
+        var pseudo_done = false;
+        var is_connect = false;
+        var protocol_count: u8 = 0;
+        var host: ?[]const u8 = null;
+        var authority: []const u8 = "";
+        var scheme_value: []const u8 = "";
+
+        for (headers) |h| {
+            if (h.name.len > 0 and h.name[0] == ':') {
+                if (pseudo_done) return false; // pseudo after regular
+                if (std.mem.eql(u8, h.name, ":method")) {
+                    method_count += 1;
+                    is_connect = std.mem.eql(u8, h.value, "CONNECT");
+                } else if (std.mem.eql(u8, h.name, ":scheme")) {
+                    scheme_count += 1;
+                    scheme_value = h.value;
+                } else if (std.mem.eql(u8, h.name, ":path")) {
+                    path_count += 1;
+                    if (h.value.len == 0) path_empty = true;
+                } else if (std.mem.eql(u8, h.name, ":status")) {
+                    has_status = true;
+                } else if (std.mem.eql(u8, h.name, ":protocol")) {
+                    protocol_count += 1;
+                } else if (std.mem.eql(u8, h.name, ":authority")) {
+                    authority_count += 1;
+                    authority = h.value;
+                } else {
+                    return false; // unknown pseudo-header (RFC 9114 §4.1.1)
+                }
+            } else {
+                pseudo_done = true;
+                if (std.mem.eql(u8, h.name, "host")) {
+                    if (host != null) return false;
+                    host = h.value;
+                }
+                // te header: only "trailers" allowed
+                if (std.mem.eql(u8, h.name, "te") and !std.mem.eql(u8, h.value, "trailers")) {
+                    return false;
+                }
+            }
+        }
+
+        if (has_status) return false; // request must not have :status
+        if (method_count != 1) return false;
+        if (method_count > 1 or scheme_count > 1 or path_count > 1 or authority_count > 1 or protocol_count > 1) return false;
+        // RFC 9220 §3: :protocol belongs to extended CONNECT alone.
+        if (protocol_count == 1 and !is_connect) return false;
+        // RFC 9114 §4.3.1: both present, they must agree.
+        if (authority_count == 1 and host != null and !std.mem.eql(u8, authority, host.?)) return false;
+
+        // Plain CONNECT: no :scheme/:path required, :authority mandatory
+        // Extended CONNECT (with :protocol): all pseudo-headers required
+        if (is_connect and protocol_count == 0) return authority_count == 1;
+
+        if (scheme_count != 1) return false;
+        if (path_count != 1) return false;
+        if (path_empty) return false;
+
+        // RFC 9114 §4.3.1: for http/https, a non-empty :authority or Host
+        if (std.mem.eql(u8, scheme_value, "http") or std.mem.eql(u8, scheme_value, "https")) {
+            const named = if (authority_count == 1) authority else host orelse "";
+            if (named.len == 0) return false;
+        }
+
+        return true;
+    }
+
+    /// Validate response pseudo-headers per RFC 9114 §4.1, §4.3.
+    fn validateResponseHeaders(headers: []const qpack.Header) bool {
+        if (!fieldsValid(headers)) return false;
+        var status_count: u8 = 0;
+        var pseudo_done = false;
+
+        for (headers) |h| {
+            if (h.name.len > 0 and h.name[0] == ':') {
+                if (pseudo_done) return false;
+                if (std.mem.eql(u8, h.name, ":status")) {
+                    status_count += 1;
+                } else {
+                    return false; // responses must only have :status
+                }
+            } else {
+                pseudo_done = true;
+            }
+        }
+
+        return status_count == 1;
+    }
+
+    /// Poll bidirectional streams for HEADERS/DATA frames.
+    fn pollBidiStreams(self: *H3Connection) !?H3Event {
+        // Can't parse more frames while a body read is pending
+        if (self.pending_body != null) return null;
+
+        // Round the map from where the last event came from, and wrap once.
+        // Starting from the top each time, a pass that surfaces one event per
+        // poll() visited every stream once per event: with 16 requests in
+        // flight on a connection, ~190 hash lookups per request, the largest
+        // cost of serving them.
+        const map = &self.quic_conn.streams.streams.unmanaged;
+        const cap = map.capacity();
+        if (cap == 0) return null;
+        const start: @TypeOf(cap) = @intCast(self.bidi_cursor % cap);
+        var it: @TypeOf(map.*).Iterator = .{ .hm = map, .index = start };
+        var wrapped = false;
+        while (true) {
+            const entry = it.next() orelse {
+                if (wrapped or start == 0) break;
+                wrapped = true;
+                it = .{ .hm = map, .index = 0 };
+                continue;
+            };
+            const slot = it.index - 1;
+            if (wrapped and slot >= start) break;
+            if (try self.pollBidiStream(entry.key_ptr.*, entry.value_ptr.*)) |ev| {
+                // This stream may have more to say: start with it next time.
+                self.bidi_cursor = slot;
+                return ev;
+            }
+        }
+        return null;
+    }
+
+    fn pollBidiStream(self: *H3Connection, stream_id: u64, stream: *stream_mod.Stream) !?H3Event {
+        // Skip streams owned by the WebTransport layer
+        if (self.excluded_streams.contains(stream_id)) return null;
+        if (self.defer_peer_bidi and !stream_mod.isLocal(stream_id, self.is_server) and
+            !self.stream_bufs.contains(stream_id)) return null;
+
+        // The peer can walk away from the response after its request is
+        // complete, so this is checked on finished streams too.
+        if (self.is_server) {
+            if (stream.send.peer_stop_sending) |code| {
+                const gop = try self.cancelled_streams.getOrPut(self.allocator, stream_id);
+                if (!gop.found_existing) {
+                    try self.finished_streams.put(stream_id, {});
+                    return .{ .request_cancelled = .{ .stream_id = stream_id, .error_code = code } };
+                }
+            }
+        }
+
+        // Skip already-finished streams
+        if (self.finished_streams.contains(stream_id)) return null;
+
+        // Paused: its data stays in QUIC. Only a reset is still news.
+        if (self.paused_bodies.contains(stream_id)) {
+            if (stream.recv.reset_err) |err_code| {
+                if (try self.reportCancelled(stream_id, err_code)) |ev| return ev;
+            }
+            return null;
+        }
+
+        // RFC 9114 §5.2: reject client-initiated bidi streams >= our GOAWAY ID
+        if (self.shutdown_state == .going_away_final or self.shutdown_state == .drain_complete) {
+            if (self.local_goaway_id) |goaway_id| {
+                if (stream_mod.isClient(stream_id) and stream_mod.isBidi(stream_id) and stream_id >= goaway_id) {
+                    stream.send.reset(@backingInt(H3Error.request_rejected));
+                    return null;
+                }
+            }
+        }
+
+        return try self.pollRequestStream(stream_id, stream);
+    }
+
+    /// Advance one request stream to its next event.
+    ///
+    /// QUIC data is pulled a chunk at a time and only once the buffer can make
+    /// no further progress, and DATA payloads are surfaced as they arrive, so
+    /// nothing buffers a whole frame the peer declared: flow control, which
+    /// only credits what the application takes, holds the peer back instead.
+    fn pollRequestStream(self: *H3Connection, stream_id: u64, stream: *stream_mod.Stream) !?H3Event {
+        const rs = &stream.recv;
+        while (true) {
+            if (self.stream_bufs.getPtr(stream_id)) |buf| {
+                if (self.frame_progress.getPtr(stream_id)) |fp| switch (fp.*) {
+                    .data => |left| if (buf.items.len > 0) {
+                        const n: usize = @intCast(@min(left, buf.items.len));
+                        self.pending_body = .{ .stream_id = stream_id, .offset = 0, .remaining = n };
+                        return .{ .data = .{ .stream_id = stream_id, .len = n } };
+                    },
+                    .skip => if (self.skipBuffered(stream_id, fp, buf, rs)) continue,
+                } else if (buf.items.len > 0) {
+                    switch (try self.parseRequestFrame(stream_id, rs, buf)) {
+                        .event => |ev| return ev,
+                        .progressed => continue,
+                        .need_more => {},
+                        .refused => return null,
+                    }
+                }
+            }
+            if (!try self.pullChunk(stream_id, rs, true)) break;
+        }
+
+        const buf = self.stream_bufs.getPtr(stream_id) orelse {
+            // Client: reset before a byte of response arrived, e.g. a
+            // request the server rejected. A server never surfaced it.
+            if (rs.reset_err != null and !self.is_server) {
+                return self.reportCancelled(stream_id, rs.reset_err.?);
+            }
+            // Ended before a byte of it arrived: still news to whoever waits.
+            if (!rs.finished) return null;
+            try self.finished_streams.put(stream_id, {});
+            return .{ .finished = stream_id };
+        };
+        // RFC 9114 §4.1.1: the peer cancelled. Everything that could be
+        // delivered has been; a partial frame never will be.
+        if (rs.reset_err) |err_code| return self.reportCancelled(stream_id, err_code);
+        if (!rs.finished) return null;
+        // RFC 9114 §7.1: a stream may not end mid-frame.
+        if (buf.items.len > 0 or self.frame_progress.contains(stream_id)) {
+            self.closeWithError(.frame_error, "request stream ended mid-frame");
+            return error.H3FrameError;
+        }
+        if ((self.body_owed.get(stream_id) orelse 0) != 0) {
+            self.closeWithError(.message_error, "request body shorter than its content-length");
+            return error.H3MessageError;
+        }
+        try self.finished_streams.put(stream_id, {});
+        return .{ .finished = stream_id };
+    }
+
+    /// Handle the frame at the front of a request stream's buffer.
+    fn parseRequestFrame(self: *H3Connection, stream_id: u64, rs: *stream_mod.ReceiveStream, buf: *std.ArrayList(u8)) !FrameStep {
+        const hdr = h3_frame.parseHeader(buf.items) catch {
+            self.closeWithError(.frame_unexpected, "HTTP/2 frame type on request stream");
+            return error.H3FrameUnexpected;
+        } orelse return .need_more;
+        switch (h3_frame.H3FrameType.fromInt(hdr.frame_type) orelse .unknown) {
+            // RFC 9114 §7.2.4: SETTINGS on bidi stream is H3_FRAME_UNEXPECTED
+            .settings, .goaway, .cancel_push, .max_push_id, .priority_update => {
+                self.closeWithError(.frame_unexpected, "control frame on request stream");
+                return error.H3FrameUnexpected;
+            },
+            .data => {
+                // RFC 9114 §4.1: DATA only between the final header section
+                // and the trailers.
+                if (self.headers_received_streams.get(stream_id) != .final) {
+                    self.consumeRequestBytes(rs, buf, hdr.len);
+                    self.closeWithError(.frame_unexpected, "DATA outside the message body");
+                    return error.H3FrameUnexpected;
+                }
+                if (self.body_owed.getPtr(stream_id)) |owed| {
+                    if (hdr.length > owed.*) return self.bodyMismatch(rs, buf, hdr.len);
+                    owed.* -= hdr.length;
+                }
+                self.consumeRequestBytes(rs, buf, hdr.len);
+                if (hdr.length > 0) try self.frame_progress.put(self.allocator, stream_id, .{ .data = hdr.length });
+                return .progressed;
+            },
+            .headers => {
+                if (hdr.length > MAX_HEADERS_FRAME) return self.refuseHeaderSection(stream_id, rs, buf);
+                const total = hdr.len + @as(usize, @intCast(hdr.length));
+                if (buf.items.len < total) return .need_more;
+                const ev = self.handleHeadersFrame(stream_id, rs, buf, buf.items[hdr.len..total], total) catch |err| switch (err) {
+                    error.FieldSectionTooLarge, error.TooManyHeaders => return self.refuseHeaderSection(stream_id, rs, buf),
+                    else => |e| return e,
+                } orelse return .progressed;
+                return .{ .event = ev };
+            },
+            // Unknown, reserved and unsupported frames are dropped as they
+            // arrive (RFC 9114 §9), never buffered whole.
+            else => {
+                self.consumeRequestBytes(rs, buf, hdr.len);
+                if (hdr.length > 0) try self.frame_progress.put(self.allocator, stream_id, .{ .skip = hdr.length });
+                return .progressed;
+            },
+        }
+    }
+
+    /// Decode a complete HEADERS frame and consume it from `buf`. Null for
+    /// trailers, which nothing surfaces yet.
+    fn handleHeadersFrame(
+        self: *H3Connection,
+        stream_id: u64,
+        rs: *stream_mod.ReceiveStream,
+        buf: *std.ArrayList(u8),
+        qpack_data: []const u8,
+        frame_len: usize,
+    ) !?H3Event {
+        const scratch = try self.qpackScratch();
+        // Decoding stops at the size our SETTINGS gave the peer.
+        const limit: usize = @intCast(@min(self.local_settings.max_field_section_size orelse scratch.len, scratch.len));
+        // RFC 9204 §2.2.3: a block that does not decode fails the connection;
+        // decoding around its dynamic references would drop fields.
+        const hdr_count = qpack.decodeBlock(self.qpack_decoder, qpack_data, self.headers_buf, scratch[0..limit], stream_id) catch |err| {
+            self.consumeRequestBytes(rs, buf, frame_len);
+            switch (err) {
+                // The message is too large, not undecodable: the stream's problem.
+                error.FieldSectionTooLarge, error.TooManyHeaders => return err,
+                else => {},
+            }
+            self.closeWithError(.qpack_decompression_failed, "QPACK decode failure");
+            return error.H3FrameError;
+        };
+        // Decoded headers live in `scratch`, so the frame can go now.
+        self.consumeRequestBytes(rs, buf, frame_len);
+        const hdrs = self.headers_buf[0..hdr_count];
+
+        // Flush decoder instructions (header ack)
+        self.flushDecoderInstructions() catch {};
+
+        // RFC 9114 §4.1: one final header section, after any 1xx ones on a
+        // response, then at most the trailers. A request has no 1xx.
+        const phase = self.headers_received_streams.get(stream_id);
+        if (phase == .trailers or (phase == .final and hasPseudoHeader(hdrs))) {
+            self.closeWithError(.frame_unexpected, "HEADERS after the message's last header section");
+            return error.H3FrameUnexpected;
+        }
+        if (phase == .final) {
+            if (!fieldsValid(hdrs) or (self.body_owed.get(stream_id) orelse 0) != 0) {
+                self.closeWithError(.message_error, "invalid trailer field or short body");
+                return error.H3MessageError;
+            }
+            try self.headers_received_streams.put(stream_id, .trailers);
+            return null;
+        }
+
+        // RFC 9114 §4.1.2, §4.3: validate pseudo-headers
+        const valid = if (self.is_server)
+            validateRequestHeaders(hdrs)
+        else
+            validateResponseHeaders(hdrs);
+        if (!valid) {
+            self.closeWithError(.message_error, "invalid pseudo-headers");
+            return error.H3MessageError;
+        }
+
+        try self.headers_received_streams.put(stream_id, if (!self.is_server and isInformational(hdrs)) .interim else .final);
+        if (self.is_server) {
+            const declared = contentLength(hdrs) catch {
+                self.closeWithError(.message_error, "invalid content-length");
+                return error.H3MessageError;
+            };
+            if (declared) |n| try self.body_owed.put(self.allocator, stream_id, n);
+        }
+
+        // Check for Extended CONNECT (:method=CONNECT + :protocol)
+        var method: ?[]const u8 = null;
+        var proto: ?[]const u8 = null;
+        var authority: []const u8 = "";
+        var path: []const u8 = "";
+        for (hdrs) |h_item| {
+            if (std.mem.eql(u8, h_item.name, ":method")) method = h_item.value;
+            if (std.mem.eql(u8, h_item.name, ":protocol")) proto = h_item.value;
+            if (std.mem.eql(u8, h_item.name, ":authority")) authority = h_item.value;
+            if (std.mem.eql(u8, h_item.name, ":path")) path = h_item.value;
+            // RFC 9218: extract Priority header field
+            if (std.mem.eql(u8, h_item.name, "priority")) {
+                const prio = priority.parse(h_item.value);
+                if (self.quic_conn.streams.getStream(stream_id)) |prio_stream| {
+                    prio_stream.send.urgency = prio.urgency;
+                    prio_stream.send.incremental = prio.incremental;
+                }
+            }
+        }
+
+        // Track highest processed client-initiated bidi stream (for GOAWAY)
+        if (self.is_server and stream_mod.isClient(stream_id) and stream_mod.isBidi(stream_id)) {
+            if (self.highest_processed_stream_id == null or stream_id > self.highest_processed_stream_id.?) {
+                self.highest_processed_stream_id = stream_id;
+            }
+        }
+
+        if (method != null and std.mem.eql(u8, method.?, "CONNECT") and proto != null) {
+            return .{ .connect_request = .{
+                .stream_id = stream_id,
+                .protocol = proto.?,
+                .authority = authority,
+                .path = path,
+                .headers = hdrs,
+            } };
+        }
+
+        return .{ .headers = .{
+            .stream_id = stream_id,
+            .headers = hdrs,
+        } };
+    }
+
+    /// RFC 9114 4.2.2: a header section past what we decode fails its stream,
+    /// not the connection. A server answers a request it has not surfaced
+    /// with 431 and stops reading it; anything else — a response, trailers —
+    /// is cancelled and reported as `request_cancelled`.
+    fn refuseHeaderSection(self: *H3Connection, stream_id: u64, rs: *stream_mod.ReceiveStream, buf: *std.ArrayList(u8)) !FrameStep {
+        // The rest of the buffer is the refused message's.
+        self.consumeRequestBytes(rs, buf, buf.items.len);
+        buf.clearAndFree(self.allocator);
+        // RFC 9204 4.4.2: with nothing inserted there is nothing to release.
+        if (self.qpack_decoder) |d| if (d.dynamic.insert_count > 0) {
+            d.cancelStream(stream_id);
+            self.flushDecoderInstructions() catch {};
+        };
+
+        const code = @backingInt(H3Error.excessive_load);
+        if (!self.is_server or self.headers_received_streams.contains(stream_id)) {
+            self.cancelRequest(stream_id, code);
+            const ev = try self.reportCancelled(stream_id, code) orelse return .refused;
+            return .{ .event = ev };
+        }
+        try self.finished_streams.put(stream_id, {});
+        // RFC 9114 4.1: the response is complete without the rest of the
+        // request, so H3_NO_ERROR asks the client to stop sending it.
+        rs.stopSending(@backingInt(H3Error.no_error));
+        self.sendResponse(stream_id, &.{.{ .name = ":status", .value = "431" }}, null) catch
+            self.cancelRequest(stream_id, code);
+        return .refused;
+    }
+
+    /// Move one more QUIC chunk into the stream's H3 buffer. False when QUIC
+    /// has nothing more yet. With `retain`, the bytes are credited to the
+    /// peer only as `consumeRequestBytes` lets them go.
+    fn pullChunk(self: *H3Connection, stream_id: u64, rs: *stream_mod.ReceiveStream, retain: bool) !bool {
+        const data = rs.read() orelse return false;
+        defer self.allocator.free(data);
+        const gop = try self.stream_bufs.getOrPut(stream_id);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.appendSlice(self.allocator, data);
+        if (retain) rs.retained += data.len;
+        return true;
+    }
+
+    /// Drop `n` bytes from the front of a request stream's buffer and let
+    /// flow control credit them.
+    fn consumeRequestBytes(_: *H3Connection, rs: ?*stream_mod.ReceiveStream, buf: *std.ArrayList(u8), n: usize) void {
+        h3_frame.consumeFromBuf(buf, n);
+        if (rs) |r| r.release(n);
+    }
+
+    /// Discard what is buffered of a skipped frame. True once it is gone.
+    fn skipBuffered(self: *H3Connection, stream_id: u64, fp: *FrameProgress, buf: *std.ArrayList(u8), rs: ?*stream_mod.ReceiveStream) bool {
+        const n: usize = @intCast(@min(fp.skip, buf.items.len));
+        self.consumeRequestBytes(rs, buf, n);
+        fp.skip -= n;
+        if (fp.skip > 0) return false;
+        _ = self.frame_progress.remove(stream_id);
+        return true;
+    }
+
+    /// The one `request_cancelled` a reset stream gets; null if already sent.
+    fn reportCancelled(self: *H3Connection, stream_id: u64, error_code: u64) !?H3Event {
+        try self.finished_streams.put(stream_id, {});
+        const gop = try self.cancelled_streams.getOrPut(self.allocator, stream_id);
+        if (gop.found_existing) return null;
+        return .{ .request_cancelled = .{ .stream_id = stream_id, .error_code = error_code } };
+    }
+
+    /// Process data from peer's QPACK encoder and decoder streams.
+    /// RFC 9204 §4: errors on QPACK streams close the connection.
+    fn pollQpackStreams(self: *H3Connection) !void {
+        // Read from peer's encoder stream → feed to our decoder
+        if (self.peer_qpack_enc_stream_id) |enc_id| {
+            if (self.quic_conn.streams.recv_streams.get(enc_id)) |recv_stream| {
+                if (recv_stream.read()) |data| {
+                    defer self.allocator.free(data);
+                    if (data.len > 0) {
+                        self.encoderInstructions(data) catch |err| {
+                            if (err == error.CapacityExceeded) {
+                                self.closeWithError(.qpack_encoder_stream_error, "QPACK encoder stream error");
+                            } else if (err == error.ExcessiveLoad) {
+                                self.closeWithError(.excessive_load, "QPACK encoder stream inserts too much");
+                            } else {
+                                self.closeWithError(.general_protocol_error, "QPACK encoder stream error");
+                            }
+                            return error.H3GeneralProtocolError;
+                        };
+                    }
+                }
+            }
+        }
+
+        // Read from peer's decoder stream → feed to our encoder
+        if (self.peer_qpack_dec_stream_id) |dec_id| {
+            if (self.quic_conn.streams.recv_streams.get(dec_id)) |recv_stream| {
+                if (recv_stream.read()) |data| {
+                    defer self.allocator.free(data);
+                    if (data.len > 0) {
+                        self.qpack_encoder.processDecoderInstruction(data) catch |err| {
+                            if (err == error.QpackDecoderStreamError) {
+                                self.closeWithError(.qpack_decoder_stream_error, "QPACK decoder stream error");
+                            } else {
+                                self.closeWithError(.general_protocol_error, "QPACK decoder stream error");
+                            }
+                            return error.H3GeneralProtocolError;
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    /// Send pending decoder instructions on the QPACK decoder stream.
+    fn flushDecoderInstructions(self: *H3Connection) !void {
+        const dec_stream = self.local_qpack_dec_stream orelse return;
+        const decoder = self.qpack_decoder orelse return;
+        const instructions = decoder.getInstructions();
+        if (instructions.len > 0) {
+            try dec_stream.writeData(instructions);
+        }
+    }
+};
+
+// Tests
+
+test "H3Connection: init and deinit" {
+    // Just verify struct construction doesn't crash
+    var conn: H3Connection = undefined;
+    conn.stream_bufs = std.AutoHashMap(u64, std.ArrayList(u8)).init(testing.allocator);
+    conn.finished_streams = std.AutoHashMap(u64, void).init(testing.allocator);
+    conn.excluded_streams = std.AutoHashMap(u64, void).init(testing.allocator);
+    conn.headers_received_streams = std.AutoHashMap(u64, HeaderPhase).init(testing.allocator);
+    conn.cancelled_streams = .empty;
+    conn.writable_waits = .empty;
+    conn.paused_bodies = .empty;
+    conn.response_states = .empty;
+    conn.frame_progress = .empty;
+    conn.body_owed = .empty;
+    conn.qpack_scratch_owned = false;
+    conn.headers_buf_owned = false;
+    conn.qpack_decoder = null;
+    conn.deinit();
+}
+
+test "ShutdownState: initial state is active" {
+    var conn: H3Connection = undefined;
+    conn.shutdown_state = .active;
+    conn.local_goaway_id = null;
+    conn.peer_goaway_id = null;
+    conn.highest_processed_stream_id = null;
+
+    try testing.expectEqual(ShutdownState.active, conn.shutdown_state);
+    try testing.expect(conn.local_goaway_id == null);
+    try testing.expect(conn.peer_goaway_id == null);
+}
+
+test "ShutdownState: peer GOAWAY monotonic decrease" {
+    var conn: H3Connection = undefined;
+    conn.peer_goaway_id = null;
+
+    // First GOAWAY is accepted
+    conn.peer_goaway_id = 100;
+    try testing.expectEqual(@as(u64, 100), conn.peer_goaway_id.?);
+
+    // Lower GOAWAY is accepted
+    conn.peer_goaway_id = 50;
+    try testing.expectEqual(@as(u64, 50), conn.peer_goaway_id.?);
+
+    // Zero GOAWAY is accepted
+    conn.peer_goaway_id = 0;
+    try testing.expectEqual(@as(u64, 0), conn.peer_goaway_id.?);
+}
+
+test "ShutdownState: sendGoaway validates server stream ID" {
+    var conn: H3Connection = undefined;
+    conn.is_server = true;
+    conn.local_goaway_id = null;
+    conn.shutdown_state = .active;
+    conn.local_control_stream = null;
+
+    // No control stream → error
+    try testing.expectError(error.NotInitialized, conn.sendGoaway(0));
+}
+
+test "ShutdownState: sendGoaway rejects increasing ID" {
+    var conn: H3Connection = undefined;
+    conn.is_server = true;
+    conn.local_goaway_id = 8;
+    conn.shutdown_state = .going_away_final;
+    conn.local_control_stream = null;
+
+    // Trying to increase → H3IdError (validated before control stream check)
+    try testing.expectError(error.H3IdError, conn.sendGoaway(12));
+}
+
+test "ShutdownState: sendGoaway rejects non-bidi server ID" {
+    var conn: H3Connection = undefined;
+    conn.is_server = true;
+    conn.local_goaway_id = null;
+    conn.shutdown_state = .active;
+    conn.local_control_stream = null;
+
+    // Odd ID (not client-initiated bidi) → H3IdError
+    try testing.expectError(error.H3IdError, conn.sendGoaway(5));
+}
+
+test "ShutdownState: highest_processed_stream_id tracking" {
+    var conn: H3Connection = undefined;
+    conn.highest_processed_stream_id = null;
+    conn.is_server = true;
+
+    // Simulate processing streams 0, 4, 8
+    conn.highest_processed_stream_id = 0;
+    try testing.expectEqual(@as(u64, 0), conn.highest_processed_stream_id.?);
+
+    conn.highest_processed_stream_id = 4;
+    try testing.expectEqual(@as(u64, 4), conn.highest_processed_stream_id.?);
+
+    conn.highest_processed_stream_id = 8;
+    try testing.expectEqual(@as(u64, 8), conn.highest_processed_stream_id.?);
+}
+
+test "ShutdownState: state transitions" {
+    var conn: H3Connection = undefined;
+    conn.shutdown_state = .active;
+
+    conn.shutdown_state = .going_away_initial;
+    try testing.expectEqual(ShutdownState.going_away_initial, conn.shutdown_state);
+
+    conn.shutdown_state = .going_away_final;
+    try testing.expectEqual(ShutdownState.going_away_final, conn.shutdown_state);
+
+    conn.shutdown_state = .drain_complete;
+    try testing.expectEqual(ShutdownState.drain_complete, conn.shutdown_state);
+}
+
+// RFC 9114 §4.1.2, §4.3: Header validation tests
+
+test "fieldsValid: rejects invalid name and value bytes at any offset" {
+    const long = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz0123456789-_";
+    try testing.expect(H3Connection.fieldsValid(&.{.{ .name = long, .value = long }}));
+    // obs-text (0x80+) and interior spaces/tabs are legal in values
+    try testing.expect(H3Connection.fieldsValid(&.{.{ .name = "x", .value = "caf\xc3\xa9 a\tb" }}));
+    try testing.expect(!H3Connection.fieldsValid(&.{.{ .name = "", .value = "v" }}));
+
+    for ([_]u8{ 0x00, ' ', 'A', 'Z', 0x7f, 0x80, 0xff }) |bad| {
+        for ([_]usize{ 0, 15, 16, 31, 32, 63 }) |at| {
+            var name: [64]u8 = long.*;
+            name[at] = bad;
+            try testing.expect(!H3Connection.fieldsValid(&.{.{ .name = &name, .value = "v" }}));
+        }
+    }
+    for ([_]u8{ 0x00, '\r', '\n' }) |bad| {
+        for ([_]usize{ 0, 15, 16, 31, 32, 63 }) |at| {
+            var value: [64]u8 = long.*;
+            value[at] = bad;
+            try testing.expect(!H3Connection.fieldsValid(&.{.{ .name = "x", .value = &value }}));
+        }
+    }
+    // pseudo-header values are checked as well: CRLF in :path is request smuggling
+    try testing.expect(!H3Connection.fieldsValid(&.{.{ .name = ":path", .value = "/a\r\nx: y" }}));
+}
+
+test "validateRequestHeaders: valid GET" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    try testing.expect(H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: refuses what a proxy to HTTP/1 could be smuggled with" {
+    const base = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+    };
+    const authority: qpack.Header = .{ .name = ":authority", .value = "example.com" };
+    const bad = [_][]const qpack.Header{
+        &.{ authority, .{ .name = "transfer-encoding", .value = "chunked" } },
+        &.{ authority, .{ .name = "connection", .value = "keep-alive" } },
+        &.{ authority, .{ .name = "keep-alive", .value = "timeout=5" } },
+        &.{ authority, .{ .name = "proxy-connection", .value = "close" } },
+        &.{ authority, .{ .name = "upgrade", .value = "websocket" } },
+        &.{ authority, .{ .name = "host:evil", .value = "x" } },
+        &.{ authority, .{ .name = "x(y)", .value = "x" } },
+        &.{ authority, .{ .name = "a\"b", .value = "x" } },
+        &.{.{ .name = ":authority", .value = "" }},
+        &.{.{ .name = "host", .value = "" }},
+        &.{ authority, .{ .name = "host", .value = "other.example" } },
+        &.{ authority, .{ .name = ":protocol", .value = "websocket" } },
+    };
+    for (bad) |extra| {
+        var hdrs: [8]qpack.Header = undefined;
+        @memcpy(hdrs[0..base.len], &base);
+        @memcpy(hdrs[base.len..][0..extra.len], extra);
+        // Pseudo-headers go first.
+        std.mem.sort(qpack.Header, hdrs[0 .. base.len + extra.len], {}, struct {
+            fn lt(_: void, a: qpack.Header, b: qpack.Header) bool {
+                return a.name[0] == ':' and b.name[0] != ':';
+            }
+        }.lt);
+        try testing.expect(!H3Connection.validateRequestHeaders(hdrs[0 .. base.len + extra.len]));
+    }
+    const same_host = base ++ [_]qpack.Header{ authority, .{ .name = "host", .value = "example.com" } };
+    try testing.expect(H3Connection.validateRequestHeaders(&same_host));
+    const host_only = base ++ [_]qpack.Header{.{ .name = "host", .value = "example.com" }};
+    try testing.expect(H3Connection.validateRequestHeaders(&host_only));
+}
+
+test "validateRequestHeaders: valid POST with body headers" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/submit" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = "content-type", .value = "application/json" },
+    };
+    try testing.expect(H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: missing method" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+    };
+    try testing.expect(!H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: missing scheme" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/" },
+    };
+    try testing.expect(!H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: missing path" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+    };
+    try testing.expect(!H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: empty path" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "" },
+    };
+    try testing.expect(!H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: status in request" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":status", .value = "200" },
+    };
+    try testing.expect(!H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: pseudo after regular" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = "host", .value = "example.com" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+    };
+    try testing.expect(!H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: uppercase header name" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "Content-Type", .value = "text/html" },
+    };
+    try testing.expect(!H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: invalid te header" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "te", .value = "gzip" },
+    };
+    try testing.expect(!H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: valid te trailers" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = "te", .value = "trailers" },
+    };
+    try testing.expect(H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: CONNECT without scheme/path" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "proxy.example.com:443" },
+    };
+    try testing.expect(H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: extended CONNECT requires scheme/path" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "webtransport" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    // Extended CONNECT needs :scheme and :path
+    try testing.expect(!H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateRequestHeaders: valid extended CONNECT" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "webtransport" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    try testing.expect(H3Connection.validateRequestHeaders(&hdrs));
+}
+
+test "validateResponseHeaders: valid 200" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-type", .value = "text/html" },
+    };
+    try testing.expect(H3Connection.validateResponseHeaders(&hdrs));
+}
+
+test "validateResponseHeaders: missing status" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = "content-type", .value = "text/html" },
+    };
+    try testing.expect(!H3Connection.validateResponseHeaders(&hdrs));
+}
+
+test "validateResponseHeaders: method in response" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = ":method", .value = "GET" },
+    };
+    try testing.expect(!H3Connection.validateResponseHeaders(&hdrs));
+}
+
+test "validateResponseHeaders: duplicate status" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = ":status", .value = "404" },
+    };
+    try testing.expect(!H3Connection.validateResponseHeaders(&hdrs));
+}
+
+test "validateResponseHeaders: pseudo after regular" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = "server", .value = "zig" },
+        .{ .name = ":status", .value = "200" },
+    };
+    try testing.expect(!H3Connection.validateResponseHeaders(&hdrs));
+}
+
+test "validateResponseHeaders: uppercase header" {
+    const hdrs = [_]qpack.Header{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "Server", .value = "zig" },
+    };
+    try testing.expect(!H3Connection.validateResponseHeaders(&hdrs));
+}
+
+// RFC 9114 §8: Error handling tests
+
+test "H3Error: all error codes defined" {
+    // Verify all RFC 9114 §8.1 error codes are present and have correct values
+    try testing.expectEqual(@as(u64, 0x0100), @backingInt(H3Error.no_error));
+    try testing.expectEqual(@as(u64, 0x0101), @backingInt(H3Error.general_protocol_error));
+    try testing.expectEqual(@as(u64, 0x0102), @backingInt(H3Error.internal_error));
+    try testing.expectEqual(@as(u64, 0x0103), @backingInt(H3Error.stream_creation_error));
+    try testing.expectEqual(@as(u64, 0x0104), @backingInt(H3Error.closed_critical_stream));
+    try testing.expectEqual(@as(u64, 0x0105), @backingInt(H3Error.frame_unexpected));
+    try testing.expectEqual(@as(u64, 0x0106), @backingInt(H3Error.frame_error));
+    try testing.expectEqual(@as(u64, 0x0107), @backingInt(H3Error.excessive_load));
+    try testing.expectEqual(@as(u64, 0x0108), @backingInt(H3Error.id_error));
+    try testing.expectEqual(@as(u64, 0x0109), @backingInt(H3Error.settings_error));
+    try testing.expectEqual(@as(u64, 0x010a), @backingInt(H3Error.missing_settings));
+    try testing.expectEqual(@as(u64, 0x010b), @backingInt(H3Error.request_rejected));
+    try testing.expectEqual(@as(u64, 0x010c), @backingInt(H3Error.request_cancelled));
+    try testing.expectEqual(@as(u64, 0x010d), @backingInt(H3Error.request_incomplete));
+    try testing.expectEqual(@as(u64, 0x010e), @backingInt(H3Error.message_error));
+    try testing.expectEqual(@as(u64, 0x010f), @backingInt(H3Error.connect_error));
+    try testing.expectEqual(@as(u64, 0x0110), @backingInt(H3Error.version_fallback));
+}
+
+test "H3 frame error: malformed SETTINGS detected" {
+    // Verify that MalformedSettings maps to H3_FRAME_ERROR in frame parsing
+    // A SETTINGS frame with incomplete varint value should fail
+    var buf: [10]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const writer = &fbs;
+    // Write SETTINGS type (0x04) + length (3) + valid id varint + truncated value
+    packet.writeVarInt(writer, 0x04) catch unreachable;
+    packet.writeVarInt(writer, 3) catch unreachable;
+    // Write a setting ID that's valid but value is incomplete (starts with 0xC0 = 8-byte varint prefix)
+    buf[fbs.seek] = 0x01; // QPACK_MAX_TABLE_CAPACITY
+    buf[fbs.seek + 1] = 0xC0; // 8-byte varint prefix but only 2 bytes follow
+    buf[fbs.seek + 2] = 0x00;
+    const result = h3_frame.parse(buf[0 .. fbs.seek + 3]);
+    try testing.expectError(error.MalformedSettings, result);
+}
+
+test "H3 frame error: reserved HTTP/2 frame type" {
+    // Type 0x02 (HTTP/2 PRIORITY) should be H3_FRAME_UNEXPECTED
+    var buf: [4]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const writer = &fbs;
+    packet.writeVarInt(writer, 0x02) catch unreachable; // HTTP/2 PRIORITY type
+    packet.writeVarInt(writer, 0) catch unreachable; // length 0
+    const result = h3_frame.parse(buf[0..fbs.seek]);
+    try testing.expectError(error.H3FrameUnexpected, result);
+}
+
+test "H3 frame error: malformed GOAWAY varint" {
+    // GOAWAY with invalid payload should be MalformedGoaway
+    var buf: [4]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const writer = &fbs;
+    packet.writeVarInt(writer, 0x07) catch unreachable; // GOAWAY type
+    packet.writeVarInt(writer, 1) catch unreachable; // length 1
+    buf[fbs.seek] = 0xC0; // 8-byte varint prefix but only 1 byte available
+    const result = h3_frame.parse(buf[0 .. fbs.seek + 1]);
+    try testing.expectError(error.MalformedGoaway, result);
+}
+
+// =============================================================================
+// H3Connection integration tests via stream-level injection
+// =============================================================================
+
+const ack_handler = @import("../quic/ack_handler.zig");
+const flow_control = @import("../quic/flow_control.zig");
+const crypto_stream = @import("../quic/crypto_stream.zig");
+const packet_packer = @import("../quic/packet_packer.zig");
+const protocol = @import("../quic/protocol.zig");
+
+// Create a minimal QUIC Connection suitable for H3 tests.
+// The `is_server` flag determines stream ID assignment (server bidi starts at 1, client at 0).
+fn createTestQuicConn(is_server: bool) quic_connection.Connection {
+    const dcid = "testdcid" ++ @as([12]u8, @splat(0));
+    const scid = "testscid" ++ @as([12]u8, @splat(0));
+
+    var conn = quic_connection.Connection{
+        .allocator = testing.allocator,
+        .is_server = is_server,
+        .dcid = dcid.*,
+        .dcid_len = 8,
+        .scid = scid.*,
+        .scid_len = 8,
+        .version = protocol.SUPPORTED_VERSIONS[0],
+        .pkt_handler = ack_handler.PacketHandler.init(testing.allocator),
+        .conn_flow_ctrl = flow_control.ConnectionFlowController.init(1048576, 6 * 1024 * 1024),
+        .streams = stream_mod.StreamsMap.init(testing.allocator, is_server),
+        .crypto_streams = crypto_stream.CryptoStreamManager.init(testing.allocator),
+        .packer = packet_packer.PacketPacker.init(
+            testing.allocator,
+            is_server,
+            dcid[0..8],
+            scid[0..8],
+            protocol.SUPPORTED_VERSIONS[0],
+        ),
+    };
+    // Allow enough streams for H3 control + QPACK + bidi requests
+    conn.streams.setMaxStreams(100, 100);
+    conn.streams.setMaxIncomingStreams(100, 100);
+    // Set send windows so opened streams can write
+    conn.streams.peer_initial_max_stream_data_bidi_local = 1048576;
+    conn.streams.peer_initial_max_stream_data_bidi_remote = 1048576;
+    conn.streams.peer_initial_max_stream_data_uni = 1048576;
+    conn.conn_flow_ctrl.base.send_window = 1048576;
+    return conn;
+}
+
+// Inject H3-encoded bytes into a peer-initiated uni receive stream.
+// For a server: peer (client) uni streams are 2, 6, 10, ...
+// For a client: peer (server) uni streams are 3, 7, 11, ...
+fn injectUniStreamData(quic_conn: *quic_connection.Connection, stream_id: u64, data: []const u8, fin: bool) !void {
+    const rs = try quic_conn.streams.getOrCreateRecvStream(stream_id);
+    try rs.handleStreamFrame(0, data, fin);
+}
+
+// Inject data into a bidi stream's receive side.
+// For a server, client-initiated bidi streams are 0, 4, 8, ...
+fn injectBidiStreamData(quic_conn: *quic_connection.Connection, stream_id: u64, data: []const u8, fin: bool) !void {
+    const stream = try quic_conn.streams.getOrCreateStream(stream_id);
+    try stream.recv.handleStreamFrame(0, data, fin);
+}
+
+// Build a SETTINGS frame with default (empty) settings: type=0x04, length=0x00
+fn buildSettingsFrame(buf: []u8) usize {
+    var fbs = io.fixedBufferStream(buf);
+    h3_frame.write(.{ .settings = .{} }, &fbs) catch unreachable;
+    return fbs.seek;
+}
+
+// Build a control stream type byte + SETTINGS frame
+fn buildControlStreamPayload(buf: []u8) usize {
+    var fbs = io.fixedBufferStream(buf);
+    // Stream type: control = 0x00
+    h3_frame.writeUniStreamType(&fbs, .control) catch unreachable;
+    // Empty SETTINGS frame
+    h3_frame.write(.{ .settings = .{} }, &fbs) catch unreachable;
+    return fbs.seek;
+}
+
+// Inject a peer control stream with SETTINGS, poll once to consume the settings event.
+fn injectPeerControlStream(quic_conn: *quic_connection.Connection, h3: *H3Connection) !void {
+    // Peer uni stream IDs: for server, peer (client) uni = 2,6,10,...
+    // For client, peer (server) uni = 3,7,11,...
+    const peer_uni_id: u64 = if (h3.is_server) 2 else 3;
+    var buf: [64]u8 = undefined;
+    const len = buildControlStreamPayload(&buf);
+    try injectUniStreamData(quic_conn, peer_uni_id, buf[0..len], false);
+
+    // Poll to consume SETTINGS event
+    const ev = try h3.poll();
+    if (ev) |e| {
+        switch (e) {
+            .settings => {}, // expected
+            else => return error.UnexpectedEvent,
+        }
+    } else {
+        return error.ExpectedSettingsEvent;
+    }
+}
+
+// Encode a minimal GET request as QPACK + HEADERS frame
+fn buildGetRequestFrame(buf: []u8) usize {
+    const headers = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    var qpack_buf: [256]u8 = undefined;
+    const qpack_len = qpack.encodeHeaders(&headers, &qpack_buf) catch unreachable;
+
+    var fbs = io.fixedBufferStream(buf);
+    h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, &fbs) catch unreachable;
+    return fbs.seek;
+}
+
+// Build a DATA frame with given payload
+fn buildDataFrame(buf: []u8, payload: []const u8) usize {
+    var fbs = io.fixedBufferStream(buf);
+    h3_frame.write(.{ .data = payload }, &fbs) catch unreachable;
+    return fbs.seek;
+}
+
+// ---- Group A: initConnection tests ----
+
+test "H3 integration: initConnection opens control + QPACK streams" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    try h3.initConnection();
+
+    // Control stream should be opened
+    try testing.expect(h3.local_control_stream != null);
+    const ctrl = h3.local_control_stream.?;
+    // Write buffer should contain type byte (0x00) + SETTINGS frame
+    try testing.expect(ctrl.write_buffer.items.len > 0);
+    // First byte should be the control stream type (0x00)
+    try testing.expectEqual(@as(u8, 0x00), ctrl.write_buffer.items[0]);
+
+    // QPACK encoder stream should be opened with type byte 0x02
+    try testing.expect(h3.local_qpack_enc_stream != null);
+    try testing.expect(h3.local_qpack_enc_stream.?.write_buffer.items.len > 0);
+    try testing.expectEqual(@as(u8, 0x02), h3.local_qpack_enc_stream.?.write_buffer.items[0]);
+
+    // QPACK decoder stream should be opened with type byte 0x03
+    try testing.expect(h3.local_qpack_dec_stream != null);
+    try testing.expect(h3.local_qpack_dec_stream.?.write_buffer.items.len > 0);
+    try testing.expectEqual(@as(u8, 0x03), h3.local_qpack_dec_stream.?.write_buffer.items[0]);
+
+    // RFC 9114 §6.2.1: none of them may close, so none may be reclaimed.
+    try testing.expect(ctrl.pinned);
+    try testing.expect(h3.local_qpack_enc_stream.?.pinned);
+    try testing.expect(h3.local_qpack_dec_stream.?.pinned);
+}
+
+test "H3 integration: initConnection sets initialized flag" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    try testing.expect(!h3.initialized);
+    try h3.initConnection();
+    try testing.expect(h3.initialized);
+}
+
+test "H3 integration: initConnection is idempotent" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    try h3.initConnection();
+    const ctrl_ptr = h3.local_control_stream;
+    const enc_ptr = h3.local_qpack_enc_stream;
+    const dec_ptr = h3.local_qpack_dec_stream;
+
+    // Second call should be a no-op
+    try h3.initConnection();
+    try testing.expectEqual(ctrl_ptr, h3.local_control_stream);
+    try testing.expectEqual(enc_ptr, h3.local_qpack_enc_stream);
+    try testing.expectEqual(dec_ptr, h3.local_qpack_dec_stream);
+}
+
+// ---- Group B: Peer uni stream identification ----
+
+test "H3 integration: poll identifies peer control stream and returns settings" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    // Inject peer control stream (client uni stream id=2 for server)
+    var buf: [64]u8 = undefined;
+    const len = buildControlStreamPayload(&buf);
+    try injectUniStreamData(&quic_conn, 2, buf[0..len], false);
+
+    const ev = try h3.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .settings => {},
+        else => return error.UnexpectedEvent,
+    }
+    try testing.expect(h3.peer_control_stream_id != null);
+    try testing.expectEqual(@as(u64, 2), h3.peer_control_stream_id.?);
+    try testing.expect(h3.peer_settings_received);
+}
+
+test "H3 integration: poll identifies QPACK encoder + decoder streams" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    // Inject QPACK encoder stream (type 0x02) on client uni stream id=6
+    try injectUniStreamData(&quic_conn, 6, &[_]u8{0x02}, false);
+    // Inject QPACK decoder stream (type 0x03) on client uni stream id=10
+    try injectUniStreamData(&quic_conn, 10, &[_]u8{0x03}, false);
+
+    // Poll to identify them
+    _ = try h3.poll();
+
+    try testing.expect(h3.peer_qpack_enc_stream_id != null);
+    try testing.expectEqual(@as(u64, 6), h3.peer_qpack_enc_stream_id.?);
+    try testing.expect(h3.peer_qpack_dec_stream_id != null);
+    try testing.expectEqual(@as(u64, 10), h3.peer_qpack_dec_stream_id.?);
+}
+
+test "H3 integration: Set Dynamic Table Capacity 0 alone makes no decoder" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    // What Chrome sends on its encoder stream, and all it sends.
+    try injectUniStreamData(&quic_conn, 6, &.{ 0x02, 0x20 }, false);
+    _ = try h3.poll();
+    try testing.expect(h3.qpack_decoder == null);
+
+    // A table worth keeping does make one.
+    h3.qpack_capacity = 4096;
+    try h3.encoderInstructions(&.{ 0x3f, 0xe1, 0x1f });
+    try testing.expectEqual(@as(usize, 4096), h3.qpack_decoder.?.dynamic.capacity);
+}
+
+test "H3 integration: a second control or QPACK stream is H3_STREAM_CREATION_ERROR" {
+    // RFC 9114 6.2.1. Replacing the first let its buffer leak and the
+    // original be closed without H3_CLOSED_CRITICAL_STREAM.
+    for ([_]u8{ 0x00, 0x02, 0x03 }) |ty| {
+        var quic_conn = createTestQuicConn(true);
+        defer quic_conn.deinit();
+        var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+        defer h3.deinit();
+        try injectUniStreamData(&quic_conn, 2, &.{ty}, false);
+        _ = try h3.poll();
+        try injectUniStreamData(&quic_conn, 6, &.{ty}, false);
+        try testing.expectError(error.H3StreamCreationError, h3.poll());
+    }
+}
+
+test "H3 integration: an unknown uni stream is abandoned, not re-read for a type" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    var buf: [64]u8 = undefined;
+    const len = buildControlStreamPayload(&buf);
+    try injectUniStreamData(&quic_conn, 2, buf[0..len], false);
+    try injectUniStreamData(&quic_conn, 6, &.{ 0x21, 0xaa }, false); // reserved type
+    while (try h3.poll()) |_| {}
+
+    const rs = quic_conn.streams.recv_streams.get(6).?;
+    try rs.handleStreamFrame(2, &.{0x00}, false);
+    while (try h3.poll()) |_| {}
+    try testing.expectEqual(@as(u64, 2), h3.peer_control_stream_id.?);
+    try testing.expectEqual(@as(?u64, @backingInt(H3Error.stream_creation_error)), rs.stop_sending_err);
+}
+
+// ---- Group C: Control stream tests ----
+
+test "H3 integration: GOAWAY on control stream" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Now inject GOAWAY(4) on the control stream
+    var goaway_buf: [32]u8 = undefined;
+    var goaway_fbs = io.fixedBufferStream(&goaway_buf);
+    h3_frame.write(.{ .goaway = 4 }, &goaway_fbs) catch unreachable;
+    const goaway_data = goaway_fbs.buffered();
+
+    // Append to the control recv stream at next offset
+    const ctrl_rs = quic_conn.streams.recv_streams.get(2).?;
+    const offset = ctrl_rs.sorter.highestReceived();
+    try ctrl_rs.handleStreamFrame(offset, goaway_data, false);
+
+    const ev = try h3.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .goaway => |id| try testing.expectEqual(@as(u64, 4), id),
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "H3 integration: DATA on control stream returns H3FrameUnexpected" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Inject DATA frame on control stream
+    var data_buf: [32]u8 = undefined;
+    var data_fbs = io.fixedBufferStream(&data_buf);
+    h3_frame.write(.{ .data = "hello" }, &data_fbs) catch unreachable;
+    const data_payload = data_fbs.buffered();
+
+    const ctrl_rs = quic_conn.streams.recv_streams.get(2).?;
+    const offset = ctrl_rs.sorter.highestReceived();
+    try ctrl_rs.handleStreamFrame(offset, data_payload, false);
+
+    const result = h3.poll();
+    try testing.expectError(error.H3FrameUnexpected, result);
+}
+
+test "H3 integration: duplicate SETTINGS returns H3FrameUnexpected" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Inject another SETTINGS frame on control stream
+    var settings_buf: [32]u8 = undefined;
+    const settings_len = buildSettingsFrame(&settings_buf);
+
+    const ctrl_rs = quic_conn.streams.recv_streams.get(2).?;
+    const offset = ctrl_rs.sorter.highestReceived();
+    try ctrl_rs.handleStreamFrame(offset, settings_buf[0..settings_len], false);
+
+    const result = h3.poll();
+    try testing.expectError(error.H3FrameUnexpected, result);
+}
+
+test "H3 integration: GOAWAY before SETTINGS returns H3MissingSettings" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    // Inject control stream type byte + GOAWAY (no SETTINGS first)
+    var buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    h3_frame.writeUniStreamType(&fbs, .control) catch unreachable;
+    h3_frame.write(.{ .goaway = 0 }, &fbs) catch unreachable;
+    try injectUniStreamData(&quic_conn, 2, fbs.buffered(), false);
+
+    // First poll identifies control stream, buffers GOAWAY, then pollControlStream
+    // finds GOAWAY before SETTINGS → H3MissingSettings error
+    const result = h3.poll();
+    try testing.expectError(error.H3MissingSettings, result);
+}
+
+// ---- Group D: Request/response lifecycle ----
+
+test "H3 integration: server receives HEADERS event" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Inject GET request on client bidi stream 0
+    var req_buf: [256]u8 = undefined;
+    const req_len = buildGetRequestFrame(&req_buf);
+    try injectBidiStreamData(&quic_conn, 0, req_buf[0..req_len], false);
+
+    const ev = try h3.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .headers => |h| {
+            try testing.expectEqual(@as(u64, 0), h.stream_id);
+            // Should have at least :method, :scheme, :path, :authority
+            try testing.expect(h.headers.len >= 4);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "H3 integration: server receives DATA and recvBody reads it" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Inject HEADERS + DATA on client bidi stream 0
+    var frame_buf: [512]u8 = undefined;
+    var pos: usize = 0;
+
+    // Build HEADERS frame
+    const hdr_len = buildGetRequestFrame(frame_buf[pos..]);
+    pos += hdr_len;
+
+    // Build DATA frame with "Hello, World!"
+    const body = "Hello, World!";
+    const data_len = buildDataFrame(frame_buf[pos..], body);
+    pos += data_len;
+
+    try injectBidiStreamData(&quic_conn, 0, frame_buf[0..pos], false);
+
+    // First poll: headers event
+    const ev1 = try h3.poll();
+    try testing.expect(ev1 != null);
+    switch (ev1.?) {
+        .headers => {},
+        else => return error.UnexpectedEvent,
+    }
+
+    // Second poll: data event
+    const ev2 = try h3.poll();
+    try testing.expect(ev2 != null);
+    switch (ev2.?) {
+        .data => |d| {
+            try testing.expectEqual(@as(u64, 0), d.stream_id);
+            try testing.expectEqual(body.len, d.len);
+        },
+        else => return error.UnexpectedEvent,
+    }
+
+    // Read body
+    var read_buf: [64]u8 = undefined;
+    const n = h3.recvBody(&read_buf);
+    try testing.expectEqual(body.len, n);
+    try testing.expectEqualStrings(body, read_buf[0..n]);
+}
+
+test "H3 integration: recvBody partial reads" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // 100-byte payload
+    var payload: [100]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @intCast(i % 256);
+
+    var frame_buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    const hdr_len = buildGetRequestFrame(frame_buf[pos..]);
+    pos += hdr_len;
+    const data_len = buildDataFrame(frame_buf[pos..], &payload);
+    pos += data_len;
+
+    try injectBidiStreamData(&quic_conn, 0, frame_buf[0..pos], false);
+
+    // Poll headers
+    _ = try h3.poll();
+    // Poll data
+    const ev = try h3.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .data => |d| try testing.expectEqual(@as(usize, 100), d.len),
+        else => return error.UnexpectedEvent,
+    }
+
+    // Read in 30-byte chunks
+    var total_read: usize = 0;
+    var result_buf: [100]u8 = undefined;
+    while (total_read < 100) {
+        var chunk: [30]u8 = undefined;
+        const n = h3.recvBody(&chunk);
+        if (n == 0) break;
+        @memcpy(result_buf[total_read..][0..n], chunk[0..n]);
+        total_read += n;
+    }
+    try testing.expectEqual(@as(usize, 100), total_read);
+    try testing.expectEqualSlices(u8, &payload, &result_buf);
+}
+
+test "H3 integration: recvBody returns 0 with no pending body" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    var buf: [64]u8 = undefined;
+    const n = h3.recvBody(&buf);
+    try testing.expectEqual(@as(usize, 0), n);
+}
+
+test "H3 integration: poll blocks while body pending" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    var frame_buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    const hdr_len = buildGetRequestFrame(frame_buf[pos..]);
+    pos += hdr_len;
+    const data_len = buildDataFrame(frame_buf[pos..], "test body data");
+    pos += data_len;
+
+    try injectBidiStreamData(&quic_conn, 0, frame_buf[0..pos], false);
+
+    // Poll headers
+    _ = try h3.poll();
+    // Poll data event
+    _ = try h3.poll();
+
+    // Body is pending — next poll should return null
+    const ev = try h3.poll();
+    try testing.expect(ev == null);
+
+    // Drain the body
+    var drain_buf: [64]u8 = undefined;
+    _ = h3.recvBody(&drain_buf);
+
+    // Now poll should be able to proceed (no more frames → null)
+    const ev2 = try h3.poll();
+    // Might get a finished event or null; either is fine
+    _ = ev2;
+}
+
+test "H3 integration: stream FIN produces finished event" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Inject HEADERS with fin=true on bidi stream 0
+    var req_buf: [256]u8 = undefined;
+    const req_len = buildGetRequestFrame(&req_buf);
+    try injectBidiStreamData(&quic_conn, 0, req_buf[0..req_len], true);
+
+    // First poll: headers
+    const ev1 = try h3.poll();
+    try testing.expect(ev1 != null);
+    switch (ev1.?) {
+        .headers => {},
+        else => return error.UnexpectedEvent,
+    }
+
+    // Next poll: finished
+    const ev2 = try h3.poll();
+    try testing.expect(ev2 != null);
+    switch (ev2.?) {
+        .finished => |sid| try testing.expectEqual(@as(u64, 0), sid),
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "H3 integration: sendRequest writes HEADERS + DATA" {
+    var quic_conn = createTestQuicConn(false); // client
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    try h3.initConnection();
+
+    const headers = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+
+    const stream_id = try h3.sendRequest(&headers, "request body");
+    try testing.expectEqual(@as(u64, 0), stream_id);
+
+    // Verify the stream's write buffer has content
+    const stream = quic_conn.streams.getStream(stream_id).?;
+    try testing.expect(stream.send.write_buffer.items.len > 0);
+    // Stream should have FIN queued (sendRequest closes the stream)
+    try testing.expect(stream.send.fin_queued);
+}
+
+test "H3 integration: sendResponse writes HEADERS + DATA + FIN" {
+    var quic_conn = createTestQuicConn(true); // server
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Create the client bidi stream (id=0) that the server responds on
+    var req_buf: [256]u8 = undefined;
+    const req_len = buildGetRequestFrame(&req_buf);
+    try injectBidiStreamData(&quic_conn, 0, req_buf[0..req_len], true);
+
+    // Poll to get headers event (this creates the stream in H3)
+    _ = try h3.poll();
+
+    const resp_headers = [_]qpack.Header{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-type", .value = "text/plain" },
+    };
+
+    try h3.sendResponse(0, &resp_headers, "Hello!");
+
+    // Verify stream write buffer has data and FIN queued
+    const stream = quic_conn.streams.getStream(0).?;
+    try testing.expect(stream.send.write_buffer.items.len > 0);
+    try testing.expect(stream.send.fin_queued);
+}
+
+test "H3: the decoder holds the encoder to the table capacity SETTINGS advertised" {
+    // A server with its own settings sent no capacity, meaning 0, but
+    // accepted a dynamic table of 4096 bytes anyway (RFC 9204 4.3.1).
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    h3.local_settings = .{ .enable_connect_protocol = true };
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Client uni stream 6: QPACK encoder stream, Set Dynamic Table Capacity 4096.
+    try injectUniStreamData(&quic_conn, 6, &[_]u8{ 0x02, 0x3f, 0xe1, 0x1f }, false);
+    try testing.expectError(error.H3GeneralProtocolError, h3.poll());
+}
+
+// ---- Group E: Extended CONNECT ----
+
+test "H3 integration: CONNECT request produces connect_request event" {
+    var quic_conn = createTestQuicConn(true); // server
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    h3.local_settings.enable_connect_protocol = true;
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Build Extended CONNECT HEADERS frame
+    const headers = [_]qpack.Header{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "webtransport" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/wt" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    var qpack_buf: [256]u8 = undefined;
+    const qpack_len = qpack.encodeHeaders(&headers, &qpack_buf) catch unreachable;
+
+    var frame_buf: [512]u8 = undefined;
+    var fbs = io.fixedBufferStream(&frame_buf);
+    h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, &fbs) catch unreachable;
+
+    try injectBidiStreamData(&quic_conn, 0, fbs.buffered(), false);
+
+    const ev = try h3.poll();
+    try testing.expect(ev != null);
+    switch (ev.?) {
+        .connect_request => |cr| {
+            try testing.expectEqual(@as(u64, 0), cr.stream_id);
+            try testing.expectEqualStrings("webtransport", cr.protocol);
+            try testing.expectEqualStrings("/wt", cr.path);
+            try testing.expectEqualStrings("example.com", cr.authority);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "H3 integration: sendConnectResponse writes headers without FIN" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Create the bidi stream first by injecting a CONNECT request
+    const headers = [_]qpack.Header{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "webtransport" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    var qpack_buf: [256]u8 = undefined;
+    const qpack_len = qpack.encodeHeaders(&headers, &qpack_buf) catch unreachable;
+
+    var frame_buf: [512]u8 = undefined;
+    var fbs = io.fixedBufferStream(&frame_buf);
+    h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, &fbs) catch unreachable;
+    try injectBidiStreamData(&quic_conn, 0, fbs.buffered(), false);
+
+    _ = try h3.poll(); // consume connect_request event
+
+    try h3.sendConnectResponse(0, "200");
+
+    const stream = quic_conn.streams.getStream(0).?;
+    try testing.expect(stream.send.write_buffer.items.len > 0);
+    // Extended CONNECT response must NOT close the stream
+    try testing.expect(!stream.send.fin_queued);
+}
+
+// ---- Group F: Error handling ----
+
+test "H3 integration: invalid headers (missing :path) closes connection" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Build malformed request (missing :path)
+    const bad_headers = [_]qpack.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        // no :path!
+    };
+    var qpack_buf: [256]u8 = undefined;
+    const qpack_len = qpack.encodeHeaders(&bad_headers, &qpack_buf) catch unreachable;
+
+    var frame_buf: [512]u8 = undefined;
+    var fbs = io.fixedBufferStream(&frame_buf);
+    h3_frame.write(.{ .headers = qpack_buf[0..qpack_len] }, &fbs) catch unreachable;
+
+    try injectBidiStreamData(&quic_conn, 0, fbs.buffered(), false);
+
+    // Poll should close connection with H3_MESSAGE_ERROR
+    const ev = h3.poll();
+    try testing.expectError(error.H3MessageError, ev);
+
+    // Connection should be in closing state with H3_MESSAGE_ERROR
+    try testing.expect(quic_conn.local_err != null);
+    try testing.expectEqual(@backingInt(H3Error.message_error), quic_conn.local_err.?.code);
+}
+
+test "H3 integration: SETTINGS on bidi stream returns H3FrameUnexpected" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Inject SETTINGS frame on bidi stream 0 (wrong stream type for control frames)
+    var settings_buf: [32]u8 = undefined;
+    const settings_len = buildSettingsFrame(&settings_buf);
+    try injectBidiStreamData(&quic_conn, 0, settings_buf[0..settings_len], false);
+
+    const result = h3.poll();
+    try testing.expectError(error.H3FrameUnexpected, result);
+}
+
+test "H3 integration: critical stream closure returns H3ClosedCriticalStream" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+
+    // Inject peer control stream
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Simulate peer resetting the control stream
+    const ctrl_rs = quic_conn.streams.recv_streams.get(2).?;
+    ctrl_rs.reset_err = @backingInt(H3Error.no_error);
+
+    const result = h3.poll();
+    try testing.expectError(error.H3ClosedCriticalStream, result);
+}
+
+test "H3 integration: HTTP/2 frame type on bidi stream returns H3FrameUnexpected" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Inject reserved HTTP/2 PRIORITY frame type (0x02) on bidi stream
+    var buf: [4]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    packet.writeVarInt(&fbs, 0x02) catch unreachable; // HTTP/2 PRIORITY type
+    packet.writeVarInt(&fbs, 0) catch unreachable; // length 0
+    try injectBidiStreamData(&quic_conn, 0, fbs.buffered(), false);
+
+    const result = h3.poll();
+    try testing.expectError(error.H3FrameUnexpected, result);
+}
+
+// ---- Group G: Multiple frames / streams ----
+
+test "H3 integration: HEADERS + DATA in one injection" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Build both HEADERS and DATA frames together
+    var frame_buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    const hdr_len = buildGetRequestFrame(frame_buf[pos..]);
+    pos += hdr_len;
+    const data_len = buildDataFrame(frame_buf[pos..], "combined payload");
+    pos += data_len;
+
+    // Inject both at once
+    try injectBidiStreamData(&quic_conn, 0, frame_buf[0..pos], false);
+
+    // First poll should return headers
+    const ev1 = try h3.poll();
+    try testing.expect(ev1 != null);
+    switch (ev1.?) {
+        .headers => |h| try testing.expectEqual(@as(u64, 0), h.stream_id),
+        else => return error.UnexpectedEvent,
+    }
+
+    // Second poll should return data
+    const ev2 = try h3.poll();
+    try testing.expect(ev2 != null);
+    switch (ev2.?) {
+        .data => |d| {
+            try testing.expectEqual(@as(u64, 0), d.stream_id);
+            try testing.expectEqual(@as(usize, 16), d.len); // "combined payload".len
+        },
+        else => return error.UnexpectedEvent,
+    }
+
+    // Drain body
+    var body_buf: [32]u8 = undefined;
+    const n = h3.recvBody(&body_buf);
+    try testing.expectEqualStrings("combined payload", body_buf[0..n]);
+}
+
+test "H3 integration: multiple concurrent streams" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Inject requests on streams 0, 4, 8
+    var req_buf: [256]u8 = undefined;
+    const req_len = buildGetRequestFrame(&req_buf);
+
+    try injectBidiStreamData(&quic_conn, 0, req_buf[0..req_len], true);
+
+    // Stream 4: need a fresh injection at offset 0
+    const stream4 = try quic_conn.streams.getOrCreateStream(4);
+    try stream4.recv.handleStreamFrame(0, req_buf[0..req_len], true);
+
+    // Stream 8
+    const stream8 = try quic_conn.streams.getOrCreateStream(8);
+    try stream8.recv.handleStreamFrame(0, req_buf[0..req_len], true);
+
+    // Poll should return headers for each stream (order may vary by hash map iteration)
+    var seen_streams = [_]bool{ false, false, false };
+    var polls: usize = 0;
+    while (polls < 10) : (polls += 1) {
+        const ev = try h3.poll();
+        if (ev == null) break;
+        switch (ev.?) {
+            .headers => |h| {
+                if (h.stream_id == 0) seen_streams[0] = true;
+                if (h.stream_id == 4) seen_streams[1] = true;
+                if (h.stream_id == 8) seen_streams[2] = true;
+            },
+            .finished => {}, // fin=true on inject → finished events expected
+            else => {},
+        }
+    }
+    try testing.expect(seen_streams[0]);
+    try testing.expect(seen_streams[1]);
+    try testing.expect(seen_streams[2]);
+}
+
+// ---- Streaming responses ----
+
+// Server H3 with a GET request received on stream 0, its headers polled.
+fn setupRequestStream(quic_conn: *quic_connection.Connection, h3: *H3Connection, fin: bool) !void {
+    try h3.initConnection();
+    try injectPeerControlStream(quic_conn, h3);
+    var req_buf: [256]u8 = undefined;
+    const req_len = buildGetRequestFrame(&req_buf);
+    try injectBidiStreamData(quic_conn, 0, req_buf[0..req_len], fin);
+    const ev = (try h3.poll()).?;
+    try testing.expect(ev == .headers);
+}
+
+// Frame types written to a stream, in order.
+fn writtenFrameTypes(send: *const stream_mod.SendStream, out: []std.meta.Tag(h3_frame.H3Frame)) !usize {
+    var rest = send.write_buffer.items;
+    var n: usize = 0;
+    while (rest.len > 0) : (n += 1) {
+        const r = try h3_frame.parse(rest);
+        out[n] = std.meta.activeTag(r.frame);
+        rest = rest[r.consumed..];
+    }
+    return n;
+}
+
+test "H3 streaming: headers, DATA per call, trailers, then FIN" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try setupRequestStream(&quic_conn, &h3, true);
+
+    try h3.sendResponseHeaders(0, &.{.{ .name = ":status", .value = "103" }});
+    try h3.sendResponseHeaders(0, &.{.{ .name = ":status", .value = "200" }});
+    const stream = quic_conn.streams.getStream(0).?;
+    try testing.expect(!stream.send.fin_queued);
+
+    try h3.sendResponseData(0, "first");
+    try h3.sendResponseData(0, ""); // no frame
+    try h3.sendResponseData(0, "second");
+    try testing.expect(!stream.send.fin_queued);
+
+    try h3.finishResponse(0, &.{.{ .name = "x-checksum", .value = "abc" }});
+    try testing.expect(stream.send.fin_queued);
+
+    var types: [8]std.meta.Tag(h3_frame.H3Frame) = undefined;
+    const n = try writtenFrameTypes(&stream.send, &types);
+    try testing.expectEqualSlices(
+        std.meta.Tag(h3_frame.H3Frame),
+        &.{ .headers, .headers, .data, .data, .headers },
+        types[0..n],
+    );
+
+    try testing.expectError(error.StreamFinished, h3.sendResponseData(0, "late"));
+}
+
+/// A client stream with a GET sent on it, for feeding it a response.
+fn testClientRequest(quic_conn: *quic_connection.Connection, h3: *H3Connection) !u64 {
+    try h3.initConnection();
+    try injectPeerControlStream(quic_conn, h3);
+    return h3.sendRequest(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "example.com" },
+    }, null);
+}
+
+/// Poll to quiescence, reading bodies out, and return the event tags seen.
+fn pollTags(h3: *H3Connection, tags: []std.meta.Tag(H3Event)) ![]std.meta.Tag(H3Event) {
+    var n: usize = 0;
+    var sink: [64]u8 = undefined;
+    while (try h3.poll()) |ev| {
+        if (ev == .data) _ = h3.recvBody(&sink);
+        if (ev == .settings) continue;
+        tags[n] = ev;
+        n += 1;
+    }
+    return tags[0..n];
+}
+
+test "H3: response trailers are accepted, not a message error" {
+    var quic_conn = createTestQuicConn(false);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    const sid = try testClientRequest(&quic_conn, &h3);
+
+    var buf: [512]u8 = undefined;
+    var fbs = io.fixedBufferStream(@as([]u8, &buf));
+    var qb: [256]u8 = undefined;
+    var ql = try qpack.encodeHeaders(&.{.{ .name = ":status", .value = "200" }}, &qb);
+    try h3_frame.write(.{ .headers = qb[0..ql] }, &fbs);
+    try h3_frame.write(.{ .data = "hi" }, &fbs);
+    ql = try qpack.encodeHeaders(&.{.{ .name = "x-checksum", .value = "abc" }}, &qb);
+    try h3_frame.write(.{ .headers = qb[0..ql] }, &fbs);
+    try quic_conn.streams.getStream(sid).?.recv.handleStreamFrame(0, fbs.buffered(), true);
+
+    var tags: [8]std.meta.Tag(H3Event) = undefined;
+    try testing.expectEqualSlices(std.meta.Tag(H3Event), &.{ .headers, .data, .finished }, try pollTags(&h3, &tags));
+}
+
+test "H3: request trailers are accepted, not a message error" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    var buf: [512]u8 = undefined;
+    var pos = buildGetRequestFrame(&buf);
+    pos += buildDataFrame(buf[pos..], "body");
+    var qb: [256]u8 = undefined;
+    const ql = try qpack.encodeHeaders(&.{.{ .name = "grpc-status", .value = "0" }}, &qb);
+    var fbs = io.fixedBufferStream(buf[pos..]);
+    try h3_frame.write(.{ .headers = qb[0..ql] }, &fbs);
+    pos += fbs.seek;
+    try injectBidiStreamData(&quic_conn, 0, buf[0..pos], true);
+
+    var tags: [8]std.meta.Tag(H3Event) = undefined;
+    try testing.expectEqualSlices(std.meta.Tag(H3Event), &.{ .headers, .data, .finished }, try pollTags(&h3, &tags));
+}
+
+fn buildHeadersFrame(buf: []u8, headers: []const qpack.Header) usize {
+    var qb: [256]u8 = undefined;
+    const ql = qpack.encodeHeaders(headers, &qb) catch unreachable;
+    var fbs = io.fixedBufferStream(buf);
+    h3_frame.write(.{ .headers = qb[0..ql] }, &fbs) catch unreachable;
+    return fbs.seek;
+}
+
+test "H3: a header block QPACK cannot decode is refused, not decoded without its dynamic fields" {
+    // RFC 9204 2.2.3. Decoding what the static table covers and dropping the
+    // rest hands the application a request other than the one sent.
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Required Insert Count 1 with no table; GET https / example.com, then a
+    // dynamic reference that has nothing to name.
+    const block = [_]u8{ 0x02, 0x00, 0xd1, 0xd7, 0xc1, 0x50, 0x0b } ++ "example.com".* ++ [_]u8{0x80};
+    var buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    try h3_frame.write(.{ .headers = &block }, &fbs);
+    try injectBidiStreamData(&quic_conn, 0, fbs.buffered(), true);
+
+    var tags: [8]std.meta.Tag(H3Event) = undefined;
+    try testing.expectError(error.H3FrameError, pollTags(&h3, &tags));
+    try testing.expectEqual(@backingInt(H3Error.qpack_decompression_failed), quic_conn.local_err.?.code);
+}
+
+test "H3: a request stream carries one request; nothing follows its trailers" {
+    // A second header section read as a new request smuggles one past
+    // whatever vetted the first.
+    const post = [_]qpack.Header{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/admin" },
+        .{ .name = ":authority", .value = "example.com" },
+    };
+    const trailer = [_]qpack.Header{.{ .name = "grpc-status", .value = "0" }};
+    var buf: [512]u8 = undefined;
+    for (0..3) |case| {
+        var quic_conn = createTestQuicConn(true);
+        defer quic_conn.deinit();
+        var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+        defer h3.deinit();
+        try h3.initConnection();
+        try injectPeerControlStream(&quic_conn, &h3);
+
+        var pos = buildGetRequestFrame(&buf);
+        switch (case) {
+            0 => pos += buildHeadersFrame(buf[pos..], &post),
+            1 => {
+                pos += buildHeadersFrame(buf[pos..], &trailer);
+                pos += buildDataFrame(buf[pos..], "late");
+            },
+            else => {
+                pos += buildHeadersFrame(buf[pos..], &trailer);
+                pos += buildHeadersFrame(buf[pos..], &trailer);
+            },
+        }
+        try injectBidiStreamData(&quic_conn, 0, buf[0..pos], true);
+        var tags: [8]std.meta.Tag(H3Event) = undefined;
+        try testing.expectError(error.H3FrameUnexpected, pollTags(&h3, &tags));
+    }
+}
+
+test "H3: a request body must match its content-length" {
+    // RFC 9114 4.1.2. Forwarded to HTTP/1.1 a mismatch reframes the stream.
+    const Case = struct { cl: []const []const u8, body: []const u8, ok: bool };
+    const cases = [_]Case{
+        .{ .cl = &.{"3"}, .body = "abc", .ok = true },
+        .{ .cl = &.{"5"}, .body = "abc", .ok = false },
+        .{ .cl = &.{"2"}, .body = "abc", .ok = false },
+        .{ .cl = &.{ "3", "4" }, .body = "abc", .ok = false },
+        .{ .cl = &.{"+3"}, .body = "abc", .ok = false },
+        .{ .cl = &.{"3, 3"}, .body = "abc", .ok = false },
+    };
+    var buf: [512]u8 = undefined;
+    for (cases) |c| {
+        var quic_conn = createTestQuicConn(true);
+        defer quic_conn.deinit();
+        var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+        defer h3.deinit();
+        try h3.initConnection();
+        try injectPeerControlStream(&quic_conn, &h3);
+
+        var hdrs: [8]qpack.Header = undefined;
+        const base = [_]qpack.Header{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = "/" },
+            .{ .name = ":authority", .value = "example.com" },
+        };
+        @memcpy(hdrs[0..base.len], &base);
+        for (c.cl, base.len..) |v, i| hdrs[i] = .{ .name = "content-length", .value = v };
+        var pos = buildHeadersFrame(&buf, hdrs[0 .. base.len + c.cl.len]);
+        pos += buildDataFrame(buf[pos..], c.body);
+        try injectBidiStreamData(&quic_conn, 0, buf[0..pos], true);
+
+        var tags: [8]std.meta.Tag(H3Event) = undefined;
+        if (c.ok) {
+            try testing.expectEqualSlices(std.meta.Tag(H3Event), &.{ .headers, .data, .finished }, try pollTags(&h3, &tags));
+        } else {
+            try testing.expectError(error.H3MessageError, pollTags(&h3, &tags));
+        }
+    }
+}
+
+test "H3: a response may follow 1xx responses, but not another final one" {
+    var buf: [512]u8 = undefined;
+    for ([_]bool{ false, true }) |second_final| {
+        var quic_conn = createTestQuicConn(false);
+        defer quic_conn.deinit();
+        var h3 = H3Connection.init(testing.allocator, &quic_conn, false);
+        defer h3.deinit();
+        const sid = try testClientRequest(&quic_conn, &h3);
+
+        var pos = buildHeadersFrame(&buf, &.{.{ .name = ":status", .value = "103" }});
+        pos += buildHeadersFrame(buf[pos..], &.{.{ .name = ":status", .value = "200" }});
+        if (second_final) pos += buildHeadersFrame(buf[pos..], &.{.{ .name = ":status", .value = "200" }});
+        try quic_conn.streams.getStream(sid).?.recv.handleStreamFrame(0, buf[0..pos], true);
+
+        var tags: [8]std.meta.Tag(H3Event) = undefined;
+        if (second_final) {
+            try testing.expectError(error.H3FrameUnexpected, pollTags(&h3, &tags));
+        } else {
+            try testing.expectEqualSlices(std.meta.Tag(H3Event), &.{ .headers, .headers, .finished }, try pollTags(&h3, &tags));
+        }
+    }
+}
+
+test "H3: a response stream ended before its first byte is reported finished" {
+    var quic_conn = createTestQuicConn(false);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    const sid = try testClientRequest(&quic_conn, &h3);
+    try quic_conn.streams.getStream(sid).?.recv.handleStreamFrame(0, &.{}, true);
+
+    var tags: [8]std.meta.Tag(H3Event) = undefined;
+    try testing.expectEqualSlices(std.meta.Tag(H3Event), &.{.finished}, try pollTags(&h3, &tags));
+}
+
+test "H3 streaming: response frames out of order are refused" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try setupRequestStream(&quic_conn, &h3, true);
+
+    // DATA or FIN before any final headers would reach the peer headerless.
+    try testing.expectError(error.ResponseHeadersNotSent, h3.sendResponseData(0, "early"));
+    try testing.expectError(error.ResponseHeadersNotSent, h3.finishResponse(0, null));
+    try h3.sendResponseHeaders(0, &.{.{ .name = ":status", .value = "100" }});
+    try testing.expectError(error.ResponseHeadersNotSent, h3.sendResponseData(0, "early"));
+
+    try h3.sendResponseHeaders(0, &.{.{ .name = ":status", .value = "200" }});
+    try testing.expectError(
+        error.ResponseHeadersAlreadySent,
+        h3.sendResponseHeaders(0, &.{.{ .name = ":status", .value = "200" }}),
+    );
+    try h3.sendResponseData(0, "body");
+    // The peer would read these as trailers carrying :status.
+    try testing.expectError(
+        error.ResponseHeadersAlreadySent,
+        h3.sendResponseHeaders(0, &.{.{ .name = ":status", .value = "500" }}),
+    );
+    try h3.finishResponse(0, &.{.{ .name = "x-checksum", .value = "abc" }});
+
+    const stream = quic_conn.streams.getStream(0).?;
+    var types: [8]std.meta.Tag(h3_frame.H3Frame) = undefined;
+    const n = try writtenFrameTypes(&stream.send, &types);
+    try testing.expectEqualSlices(
+        std.meta.Tag(h3_frame.H3Frame),
+        &.{ .headers, .headers, .data, .headers },
+        types[0..n],
+    );
+}
+
+test "H3 streaming: writes to a stopped stream fail instead of vanishing" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try setupRequestStream(&quic_conn, &h3, true);
+
+    h3.cancelRequest(0, @backingInt(H3Error.internal_error));
+    try testing.expectError(error.StreamReset, h3.sendResponseData(0, "x"));
+    try testing.expectError(error.StreamNotFound, h3.sendResponseData(40, "x"));
+}
+
+test "H3 streaming: header sets past 4 KiB are encoded" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try setupRequestStream(&quic_conn, &h3, true);
+
+    const cookie = &@as([6000]u8, @splat('c'));
+    var headers: [MAX_HEADERS]qpack.Header = undefined;
+    headers[0] = .{ .name = ":status", .value = "200" };
+    headers[1] = .{ .name = "set-cookie", .value = cookie };
+    for (headers[2..]) |*h| h.* = .{ .name = "x-filler", .value = "value" };
+    try h3.sendResponseHeaders(0, &headers);
+
+    // Decode it the way the peer would.
+    const stream = quic_conn.streams.getStream(0).?;
+    const r = try h3_frame.parse(stream.send.write_buffer.items);
+    var decoded: [MAX_HEADERS]qpack.Header = undefined;
+    var scratch: [qpack.SCRATCH_SIZE]u8 = undefined;
+    const count = try qpack.decodeHeaders(r.frame.headers, &decoded, &scratch);
+    try testing.expectEqual(headers.len, count);
+    try testing.expectEqualStrings(cookie, decoded[1].value);
+}
+
+test "H3 streaming: notifyWritable waits for credit and a drained buffer" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try setupRequestStream(&quic_conn, &h3, true);
+    try testing.expect((try h3.poll()).? == .finished);
+
+    try h3.sendResponseHeaders(0, &.{.{ .name = ":status", .value = "200" }});
+    const stream = quic_conn.streams.getStream(0).?;
+    stream.send.send_offset = stream.send.write_offset;
+    stream.send.send_window = stream.send.write_offset + 1000;
+
+    try h3.sendResponseData(0, &@as([600]u8, @splat(0)));
+    try testing.expectEqual(@as(?u64, 603), h3.streamBufferedBytes(0));
+
+    // 397 bytes of credit left and 603 unsent: 300 does not fit behind them.
+    try h3.notifyWritable(0, 300);
+    try testing.expect(try h3.poll() == null);
+
+    // Sent, so the backlog is gone, but the credit is still short.
+    stream.send.send_offset = stream.send.write_offset;
+    try testing.expectEqual(@as(?u64, 0), h3.streamBufferedBytes(0));
+    try h3.notifyWritable(0, 500);
+    try testing.expect(try h3.poll() == null);
+
+    stream.send.updateSendWindow(2000);
+    const ev = (try h3.poll()).?;
+    try testing.expectEqual(@as(u64, 0), ev.writable);
+    try testing.expect(try h3.poll() == null); // once
+
+    // A finished stream's wait is dropped, not fired.
+    try h3.notifyWritable(0, 1);
+    try h3.finishResponse(0, null);
+    try testing.expect(try h3.poll() == null);
+    try testing.expectEqual(@as(usize, 0), h3.writable_waits.items.len);
+}
+
+test "H3 streaming: STOP_SENDING on a response is reported once" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try setupRequestStream(&quic_conn, &h3, true);
+    try testing.expect((try h3.poll()).? == .finished);
+    try h3.sendResponseHeaders(0, &.{.{ .name = ":status", .value = "200" }});
+
+    // What the transport does on STOP_SENDING.
+    const stream = quic_conn.streams.getStream(0).?;
+    stream.send.reset(@backingInt(H3Error.request_cancelled));
+    stream.send.peer_stop_sending = @backingInt(H3Error.request_cancelled);
+
+    const ev = (try h3.poll()).?;
+    try testing.expectEqual(@as(u64, 0), ev.request_cancelled.stream_id);
+    try testing.expectEqual(@backingInt(H3Error.request_cancelled), ev.request_cancelled.error_code);
+    try testing.expect(try h3.poll() == null);
+}
+
+test "H3 streaming: RESET_STREAM on a request is reported once" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try setupRequestStream(&quic_conn, &h3, false);
+
+    const stream = quic_conn.streams.getStream(0).?;
+    try stream.recv.handleResetStream(@backingInt(H3Error.request_cancelled), stream.recv.sorter.highestReceived());
+    stream.send.reset(@backingInt(H3Error.request_cancelled));
+    stream.send.peer_stop_sending = @backingInt(H3Error.request_cancelled);
+
+    const ev = (try h3.poll()).?;
+    try testing.expectEqual(@as(u64, 0), ev.request_cancelled.stream_id);
+    try testing.expect(try h3.poll() == null);
+}
+
+test "H3 pauseBody: mid-frame pause holds the rest, other streams go on, resume delivers it all" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    var payload: [100]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @intCast(i);
+    var frame_buf: [512]u8 = undefined;
+    var pos = buildGetRequestFrame(&frame_buf);
+    pos += buildDataFrame(frame_buf[pos..], &payload);
+    try injectBidiStreamData(&quic_conn, 0, frame_buf[0..pos], true);
+
+    _ = try h3.poll(); // headers
+    try testing.expect((try h3.poll()).? == .data);
+    var got: [100]u8 = undefined;
+    try testing.expectEqual(@as(usize, 30), h3.recvBody(got[0..30]));
+
+    try h3.pauseBody(0);
+    try testing.expectEqual(@as(usize, 0), h3.recvBody(got[30..]));
+
+    // Another request is not held up behind the paused one.
+    const n = buildGetRequestFrame(&frame_buf);
+    try injectBidiStreamData(&quic_conn, 4, frame_buf[0..n], true);
+    var saw_other = false;
+    while (try h3.poll()) |ev| switch (ev) {
+        .headers => |hd| saw_other = saw_other or hd.stream_id == 4,
+        .data => |d| try testing.expect(d.stream_id != 0),
+        .finished => |sid| try testing.expect(sid != 0),
+        else => {},
+    };
+    try testing.expect(saw_other);
+
+    h3.resumeBody(0);
+    var read: usize = 30;
+    var finished = false;
+    while (try h3.poll()) |ev| switch (ev) {
+        .data => |d| if (d.stream_id == 0) {
+            read += h3.recvBody(got[read..]);
+        },
+        .finished => |sid| if (sid == 0) {
+            finished = true;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 100), read);
+    try testing.expectEqualSlices(u8, &payload, &got);
+    try testing.expect(finished);
+}
+
+test "H3 pauseBody: a paused stream leaves its data unread in QUIC" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    var frame_buf: [512]u8 = undefined;
+    const n = buildGetRequestFrame(&frame_buf);
+    try injectBidiStreamData(&quic_conn, 0, frame_buf[0..n], false);
+    try testing.expect((try h3.poll()).? == .headers);
+    try h3.pauseBody(0);
+
+    var payload: [50]u8 = @splat(7);
+    const d = buildDataFrame(&frame_buf, &payload);
+    const stream = quic_conn.streams.getStream(0).?;
+    try stream.recv.handleStreamFrame(n, frame_buf[0..d], false);
+    while (try h3.poll()) |_| {}
+    // Nothing read, so no credit returned to the peer.
+    try testing.expectEqual(@as(u64, n), stream.recv.bytes_read);
+}
+
+fn writeFrameHeaderBytes(buf: []u8, frame_type: u64, len: u64) []const u8 {
+    var fbs = io.fixedBufferStream(buf);
+    packet.writeVarInt(&fbs, frame_type) catch unreachable;
+    packet.writeVarInt(&fbs, len) catch unreachable;
+    return fbs.buffered();
+}
+
+test "H3: a huge DATA frame is surfaced as it arrives and held to the stream window" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try setupRequestStream(&quic_conn, &h3, false);
+    const stream = quic_conn.streams.getStream(0).?;
+    var req_buf: [256]u8 = undefined;
+    var offset: u64 = buildGetRequestFrame(&req_buf);
+    const window: u64 = 64 * 1024;
+    stream.recv.receive_window = offset + window;
+    stream.recv.receive_window_size = window;
+
+    var hdr_buf: [16]u8 = undefined;
+    const hdr = writeFrameHeaderBytes(&hdr_buf, 0x00, (1 << 62) - 1);
+    try stream.recv.handleStreamFrame(offset, hdr, false);
+    offset += hdr.len;
+
+    // The first piece is surfaced without waiting for the rest of the frame.
+    const chunk: [16384]u8 = @splat(0x41);
+    try stream.recv.handleStreamFrame(offset, &chunk, false);
+    offset += chunk.len;
+    const ev = (try h3.poll()).?;
+    try testing.expect(ev == .data);
+    try testing.expectEqual(chunk.len, ev.data.len);
+
+    // Paused before taking it: nothing more is read, nothing credited.
+    try h3.pauseBody(0);
+    while (offset + chunk.len <= stream.recv.receive_window) : (offset += chunk.len) {
+        try stream.recv.handleStreamFrame(offset, &chunk, false);
+    }
+    try testing.expect(try h3.poll() == null);
+    try testing.expect(h3.stream_bufs.get(0).?.items.len <= chunk.len);
+    try testing.expect(stream.recv.getWindowUpdate() == null);
+    try testing.expectError(error.FlowControlError, stream.recv.handleStreamFrame(offset, &chunk, false));
+
+    // Resumed and drained: the window re-opens for what was taken.
+    h3.resumeBody(0);
+    var sink: [4096]u8 = undefined;
+    var taken: usize = 0;
+    while (try h3.poll()) |e| {
+        try testing.expect(e == .data);
+        while (true) {
+            const n = h3.recvBody(&sink);
+            if (n == 0) break;
+            taken += n;
+        }
+    }
+    try testing.expectEqual(@as(usize, @intCast(window - hdr.len - (window - hdr.len) % chunk.len)), taken);
+    try testing.expectEqual(stream.recv.bytes_read, stream.recv.consumed());
+    try testing.expect(stream.recv.getWindowUpdate().? > offset);
+}
+
+test "H3: a HEADERS frame past the size cap is refused before it is buffered" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    var hdr_buf: [16]u8 = undefined;
+    try injectBidiStreamData(&quic_conn, 0, writeFrameHeaderBytes(&hdr_buf, 0x01, MAX_HEADERS_FRAME + 1), false);
+    try testing.expect((try h3.poll()) == null);
+    try expectRefusedWith431(&quic_conn, 0);
+    try testing.expectEqual(@as(usize, 0), h3.stream_bufs.get(0).?.capacity);
+}
+
+test "H3: an unknown frame on a request stream is skipped as it arrives" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try setupRequestStream(&quic_conn, &h3, false);
+    const stream = quic_conn.streams.getStream(0).?;
+    var req_buf: [256]u8 = undefined;
+    var offset: u64 = buildGetRequestFrame(&req_buf);
+
+    var hdr_buf: [16]u8 = undefined;
+    const hdr = writeFrameHeaderBytes(&hdr_buf, 0x21, 1 << 40); // reserved type
+    try stream.recv.handleStreamFrame(offset, hdr, false);
+    offset += hdr.len;
+    const chunk: [16384]u8 = @splat(0x42);
+    for (0..16) |_| {
+        try stream.recv.handleStreamFrame(offset, &chunk, false);
+        offset += chunk.len;
+        try testing.expect(try h3.poll() == null);
+        try testing.expectEqual(@as(usize, 0), h3.stream_bufs.get(0).?.items.len);
+    }
+    // Discarded bytes are credited like consumed ones.
+    try testing.expectEqual(offset, stream.recv.consumed());
+}
+
+test "H3: a request stream ending mid-frame is a frame error" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try setupRequestStream(&quic_conn, &h3, false);
+    const stream = quic_conn.streams.getStream(0).?;
+    var req_buf: [256]u8 = undefined;
+    const offset: u64 = buildGetRequestFrame(&req_buf);
+
+    var frame_buf: [32]u8 = undefined;
+    const hdr = writeFrameHeaderBytes(&frame_buf, 0x00, 100);
+    try stream.recv.handleStreamFrame(offset, hdr, true);
+    try testing.expectError(error.H3FrameError, h3.poll());
+    try testing.expectEqual(@as(u64, @backingInt(H3Error.frame_error)), quic_conn.local_err.?.code);
+}
+
+test "H3 control stream: unknown frames are skipped as they arrive, oversized SETTINGS refused" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+    const rs = quic_conn.streams.recv_streams.get(2).?;
+    var offset: u64 = rs.bytes_read;
+
+    var hdr_buf: [16]u8 = undefined;
+    const hdr = writeFrameHeaderBytes(&hdr_buf, 0x21, 1 << 40);
+    try rs.handleStreamFrame(offset, hdr, false);
+    offset += hdr.len;
+    const chunk: [16384]u8 = @splat(0x43);
+    for (0..8) |_| {
+        try rs.handleStreamFrame(offset, &chunk, false);
+        offset += chunk.len;
+        try testing.expect(try h3.poll() == null);
+        try testing.expectEqual(@as(usize, 0), h3.stream_bufs.get(2).?.items.len);
+    }
+
+    var quic_conn2 = createTestQuicConn(true);
+    defer quic_conn2.deinit();
+    var h3b = H3Connection.init(testing.allocator, &quic_conn2, true);
+    defer h3b.deinit();
+    try h3b.initConnection();
+    var buf: [32]u8 = undefined;
+    buf[0] = 0x00; // control stream type
+    const settings = writeFrameHeaderBytes(buf[1..], 0x04, MAX_CONTROL_FRAME + 1);
+    try injectUniStreamData(&quic_conn2, 2, buf[0 .. 1 + settings.len], false);
+    try testing.expectError(error.H3ExcessiveLoad, h3b.poll());
+    try testing.expectEqual(@as(u64, @backingInt(H3Error.excessive_load)), quic_conn2.local_err.?.code);
+}
+
+// A HEADERS frame carrying `headers`, allocated: big sections are the point.
+fn allocHeadersFrame(headers: []const qpack.Header) ![]u8 {
+    const block = try testing.allocator.alloc(u8, qpack.maxEncodedLen(headers));
+    defer testing.allocator.free(block);
+    const n = try qpack.encodeHeaders(headers, block);
+    var hdr: [16]u8 = undefined;
+    return std.mem.concat(testing.allocator, u8, &.{ writeFrameHeaderBytes(&hdr, 0x01, n), block[0..n] });
+}
+
+const get_with_cookie = [_]qpack.Header{
+    .{ .name = ":method", .value = "GET" },
+    .{ .name = ":scheme", .value = "https" },
+    .{ .name = ":path", .value = "/" },
+    .{ .name = ":authority", .value = "example.com" },
+    .{ .name = "cookie", .value = &@as([qpack.SCRATCH_SIZE]u8, @splat('c')) },
+};
+
+// The response a refused request got: just `:status`, then FIN.
+fn expectRefusedWith431(quic_conn: *quic_connection.Connection, stream_id: u64) !void {
+    const stream = quic_conn.streams.getStream(stream_id).?;
+    const r = try h3_frame.parse(stream.send.write_buffer.items);
+    try testing.expectEqual(stream.send.write_buffer.items.len, r.consumed);
+    var decoded: [4]qpack.Header = undefined;
+    var scratch: [64]u8 = undefined;
+    const count = try qpack.decodeHeaders(r.frame.headers, &decoded, &scratch);
+    try testing.expectEqual(@as(usize, 1), count);
+    try testing.expectEqualStrings(":status", decoded[0].name);
+    try testing.expectEqualStrings("431", decoded[0].value);
+    try testing.expect(stream.send.fin_queued);
+    // RFC 9114 4.1: a complete response, so the rest of the request is
+    // stopped with H3_NO_ERROR.
+    try testing.expectEqual(@as(?u64, @backingInt(H3Error.no_error)), stream.recv.stop_sending_err);
+    try testing.expect(quic_conn.local_err == null);
+}
+
+test "H3: a request past SETTINGS_MAX_FIELD_SECTION_SIZE gets 431 and the connection lives" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    const hf = try allocHeadersFrame(&get_with_cookie);
+    defer testing.allocator.free(hf);
+    var data_buf: [16]u8 = undefined;
+    const data_len = buildDataFrame(&data_buf, "body");
+    const req = try std.mem.concat(testing.allocator, u8, &.{ hf, data_buf[0..data_len] });
+    defer testing.allocator.free(req);
+    try injectBidiStreamData(&quic_conn, 0, req, true);
+
+    try testing.expect((try h3.poll()) == null);
+    try expectRefusedWith431(&quic_conn, 0);
+    // Not read again: no event for the DATA behind it, or for its FIN.
+    try testing.expect((try h3.poll()) == null);
+
+    var req_buf: [256]u8 = undefined;
+    const req_len = buildGetRequestFrame(&req_buf);
+    try injectBidiStreamData(&quic_conn, 4, req_buf[0..req_len], false);
+    const ev = (try h3.poll()).?;
+    try testing.expectEqual(@as(u64, 4), ev.headers.stream_id);
+}
+
+test "H3: more field lines than MAX_HEADERS get 431" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    var headers: [MAX_HEADERS + 1]qpack.Header = undefined;
+    @memcpy(headers[0..4], get_with_cookie[0..4]);
+    for (headers[4..]) |*h| h.* = .{ .name = "x-a", .value = "b" };
+    const hf = try allocHeadersFrame(&headers);
+    defer testing.allocator.free(hf);
+    try injectBidiStreamData(&quic_conn, 0, hf, true);
+
+    try testing.expect((try h3.poll()) == null);
+    try expectRefusedWith431(&quic_conn, 0);
+}
+
+test "H3: SETTINGS advertise the field section size the decoder holds requests to" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    // The event loop replaces local_settings whole; the limit still goes out.
+    h3.local_settings = .{ .enable_connect_protocol = true };
+    try h3.initConnection();
+    const ctrl = h3.local_control_stream.?.write_buffer.items;
+    const sent = try h3_frame.parse(ctrl[1..]);
+    try testing.expectEqual(@as(?u64, qpack.SCRATCH_SIZE), sent.frame.settings.max_field_section_size);
+}
+
+test "H3: a smaller SETTINGS_MAX_FIELD_SECTION_SIZE is the one enforced" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    h3.local_settings.max_field_section_size = 1024;
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    var headers = get_with_cookie;
+    headers[4].value = headers[4].value[0..1024];
+    const hf = try allocHeadersFrame(&headers);
+    defer testing.allocator.free(hf);
+    try injectBidiStreamData(&quic_conn, 0, hf, true);
+    try testing.expect((try h3.poll()) == null);
+    try expectRefusedWith431(&quic_conn, 0);
+}
+
+test "H3: a refused section's dynamic references are released with a Stream Cancellation" {
+    var quic_conn = createTestQuicConn(true);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, true);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+
+    // Encoder stream: capacity 4096, then "x" with a 4000-byte value.
+    var enc: [4200]u8 = undefined;
+    var fbs = io.fixedBufferStream(&enc);
+    try fbs.writeAll(&.{ 0x02, 0x3f, 0xe1, 0x1f, 0x41, 'x', 0x7f, 0xa1, 0x1e });
+    try fbs.writeAll(&@as([4000]u8, @splat('a')));
+    try injectUniStreamData(&quic_conn, 6, fbs.buffered(), false);
+    try testing.expect((try h3.poll()) == null);
+    try testing.expectEqual(@as(u64, 1), h3.qpack_decoder.?.dynamic.insert_count);
+
+    // RIC 1, Base 1, five references to it: 20 KB from seven bytes.
+    var hdr: [16]u8 = undefined;
+    const block = [_]u8{ 0x02, 0x00, 0x80, 0x80, 0x80, 0x80, 0x80 };
+    const req = try std.mem.concat(testing.allocator, u8, &.{ writeFrameHeaderBytes(&hdr, 0x01, block.len), &block });
+    defer testing.allocator.free(req);
+    try injectBidiStreamData(&quic_conn, 0, req, true);
+
+    try testing.expect((try h3.poll()) == null);
+    try expectRefusedWith431(&quic_conn, 0);
+    // Stream type, then Stream Cancellation for stream 0 (RFC 9204 4.4.2).
+    try testing.expectEqualSlices(u8, &.{ 0x03, 0x40 }, h3.local_qpack_dec_stream.?.write_buffer.items);
+}
+
+test "H3 client: a response past the limit cancels its request, not the connection" {
+    var quic_conn = createTestQuicConn(false);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    try h3.initConnection();
+    try injectPeerControlStream(&quic_conn, &h3);
+    const sid = try h3.sendRequest(get_with_cookie[0..4], null);
+
+    const resp = [_]qpack.Header{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "set-cookie", .value = get_with_cookie[4].value },
+    };
+    const hf = try allocHeadersFrame(&resp);
+    defer testing.allocator.free(hf);
+    try injectBidiStreamData(&quic_conn, sid, hf, true);
+
+    const ev = (try h3.poll()).?;
+    try testing.expectEqual(sid, ev.request_cancelled.stream_id);
+    try testing.expectEqual(@as(u64, @backingInt(H3Error.excessive_load)), ev.request_cancelled.error_code);
+    try testing.expect(quic_conn.local_err == null);
+    const stream = quic_conn.streams.getStream(sid).?;
+    try testing.expectEqual(@as(?u64, @backingInt(H3Error.excessive_load)), stream.recv.stop_sending_err);
+    try testing.expect((try h3.poll()) == null);
+}
+
+test "H3: our control and QPACK streams outrank requests" {
+    // Packed behind a CONNECT, they reached imquic after it had switched the
+    // connection to WebTransport, which took them for WebTransport streams.
+    var quic_conn = createTestQuicConn(false);
+    defer quic_conn.deinit();
+    var h3 = H3Connection.init(testing.allocator, &quic_conn, false);
+    defer h3.deinit();
+    try h3.initConnection();
+    for ([_]?*stream_mod.SendStream{ h3.local_control_stream, h3.local_qpack_enc_stream, h3.local_qpack_dec_stream }) |s| {
+        try testing.expectEqual(@as(u3, 0), s.?.urgency);
+    }
+}

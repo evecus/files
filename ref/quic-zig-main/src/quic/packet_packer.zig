@@ -1,0 +1,1907 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const testing = std.testing;
+const io = @import("../io_compat.zig");
+
+const packet_mod = @import("packet.zig");
+const crypto_mod = @import("crypto.zig");
+const frame_mod = @import("frame.zig");
+const Frame = frame_mod.Frame;
+const ack_handler = @import("ack_handler.zig");
+const crypto_stream = @import("crypto_stream.zig");
+const stream_mod = @import("stream.zig");
+const conn_mod = @import("connection.zig");
+const flow_control = @import("flow_control.zig");
+const qlog = @import("qlog.zig");
+
+/// Calculate the overhead of a STREAM frame header (type + stream_id + offset + length varints).
+/// This accounts for the LEN flag always being set.
+fn streamFrameHeaderOverhead(stream_id: u64, offset: u64, max_data_len: u64) usize {
+    return 1 // type byte (always 1 byte, value 0x08-0x0F)
+    + packet_mod.varIntLength(stream_id) + (if (offset > 0) packet_mod.varIntLength(offset) else 0) + packet_mod.varIntLength(max_data_len); // length field (always present with LEN flag)
+}
+
+/// Default QUIC packet size (UDP payload).
+const DEFAULT_MAX_PACKET_SIZE: usize = 1200;
+
+/// Absolute maximum packet size we ever assemble (probes included).
+const ABSOLUTE_MAX_PACKET_SIZE: usize = 1500;
+
+/// Minimum Initial packet size for client.
+const MIN_INITIAL_PACKET_SIZE: usize = 1200;
+
+/// AEAD tag length (AES-128-GCM).
+const AEAD_TAG_LEN: usize = crypto_mod.Aead.tag_length;
+
+/// Maximum packet number length.
+const MAX_PN_LEN: usize = 4;
+
+/// Header protection sample length.
+const SAMPLE_LEN: usize = crypto_mod.SAMPLE_LEN;
+
+/// What STREAM frames leave free for an ACK held to ride behind them: an
+/// ACK_ECN with 4-byte packet numbers and counts, and two gaps.
+const ACK_BEHIND_DATA_ROOM: usize = 32;
+
+/// DATAGRAM_WITH_LENGTH framing at its longest: the type and a 2-byte length.
+pub const DATAGRAM_FRAME_OVERHEAD: usize = 1 + 2;
+
+fn largestAck(ack_frame: Frame) ?u64 {
+    return switch (ack_frame) {
+        .ack => |a| a.largest_ack,
+        .ack_ecn => |a| a.largest_ack,
+        else => null,
+    };
+}
+
+/// The packet packer assembles outgoing QUIC packets.
+///
+/// It handles:
+/// - Coalescing multiple encryption levels into one UDP datagram
+/// - Collecting frames (ACK, CRYPTO, STREAM, control)
+/// - Applying payload encryption and header protection
+/// - Padding Initial packets to minimum 1200 bytes
+pub const PacketPacker = struct {
+    allocator: Allocator,
+    is_server: bool,
+
+    /// Source connection ID (owned buffer to avoid dangling slices).
+    scid_buf: [20]u8 = @splat(0),
+    scid_len: u8 = 0,
+
+    /// Destination connection ID (owned buffer to avoid dangling slices).
+    dcid_buf: [20]u8 = @splat(0),
+    dcid_len: u8 = 0,
+
+    /// QUIC version.
+    version: u32,
+
+    /// Token for Initial packets (from Retry).
+    initial_token: ?[]const u8 = null,
+
+    /// Whether to send HANDSHAKE_DONE frame in the next 1-RTT packet (server only).
+    send_handshake_done: bool = false,
+
+    /// Current key phase bit for 1-RTT packets (toggled on key update).
+    key_phase: bool = false,
+
+    /// Spin bit for passive RTT measurement (RFC 9000 §17.4).
+    spin_bit: bool = false,
+
+    /// Pack queued datagrams ahead of STREAM frames; see
+    /// `ConnectionConfig.datagrams_before_streams`.
+    datagrams_first: bool = false,
+
+    /// Maximum packet size for regular (non-probe) packets.
+    max_packet_size: usize = DEFAULT_MAX_PACKET_SIZE,
+
+    /// Whether outgoing 1-RTT packets should be marked as ECN (ECT(0)).
+    /// Set by connection before packing based on ECN validator state.
+    ecn_mark: bool = false,
+
+    /// Connection-level flow controller (for send-side limit enforcement).
+    conn_flow_ctrl: ?*flow_control.ConnectionFlowController = null,
+
+    /// Where each packet is traced as it is sealed, one event per packet.
+    /// Set by connection before packing.
+    qlog_writer: ?*qlog.QlogWriter = null,
+
+    /// Whether path probes and receiver credit may still go out when
+    /// `ack_only`. Set by connection before packing.
+    urgent_allowed: bool = true,
+
+    /// Bytes the congestion window has left, once the peer was asked to
+    /// acknowledge less often (ACK_FREQUENCY); 0 for a PTO probe. The 1-RTT
+    /// packet that fills it carries IMMEDIATE_ACK. Set by connection before
+    /// packing.
+    window_left: ?u64 = null,
+
+    pub fn init(
+        allocator: Allocator,
+        is_server: bool,
+        scid: []const u8,
+        dcid: []const u8,
+        version: u32,
+    ) PacketPacker {
+        var packer = PacketPacker{
+            .allocator = allocator,
+            .is_server = is_server,
+            .scid_len = @intCast(scid.len),
+            .dcid_len = @intCast(dcid.len),
+            .version = version,
+        };
+        @memcpy(packer.scid_buf[0..scid.len], scid);
+        @memcpy(packer.dcid_buf[0..dcid.len], dcid);
+        return packer;
+    }
+
+    pub fn getScid(self: *const PacketPacker) []const u8 {
+        return self.scid_buf[0..self.scid_len];
+    }
+
+    pub fn getDcid(self: *const PacketPacker) []const u8 {
+        return self.dcid_buf[0..self.dcid_len];
+    }
+
+    pub fn updateDcid(self: *PacketPacker, new_dcid: []const u8) void {
+        @memcpy(self.dcid_buf[0..new_dcid.len], new_dcid);
+        self.dcid_len = @intCast(new_dcid.len);
+    }
+
+    /// The largest datagram an otherwise empty 1-RTT packet holds at this
+    /// packet size and DCID, with the packet number at its longest. Nothing
+    /// larger is ever sent.
+    pub fn maxDatagramPayload(self: *const PacketPacker) usize {
+        const short_header = 1 + @as(usize, self.dcid_len) + MAX_PN_LEN;
+        return self.max_packet_size -| (short_header + AEAD_TAG_LEN + DATAGRAM_FRAME_OVERHEAD);
+    }
+
+    /// Write queued datagrams into the packet while they fit. Whether any went in.
+    fn packDatagrams(
+        self: *PacketPacker,
+        dq: *conn_mod.DatagramQueue,
+        fbs: *io.FixedBufferStream([]u8),
+        payload_start: usize,
+        effective_max: usize,
+        zero_rtt: bool,
+        now: i64,
+    ) !bool {
+        var any = false;
+        // Zero-copy peek: read directly from the queue's buffer.
+        while (dq.peekDataSkipExpired(now)) |dgram_data| {
+            // DATAGRAM_WITH_LENGTH frame: type(1) + varint(len) + payload
+            const varint_overhead: usize = if (dgram_data.len <= 63) 1 else 2;
+            const frame_size = 1 + varint_overhead + dgram_data.len;
+            if (fbs.seek + frame_size + AEAD_TAG_LEN > effective_max) {
+                // No packet of this path holds it, as a smaller MTU or a longer
+                // CID can leave one queued: held, it blocks all behind it.
+                if (!zero_rtt and payload_start + frame_size + AEAD_TAG_LEN > self.max_packet_size) {
+                    dq.drop();
+                    continue;
+                }
+                break;
+            }
+            const dgram_frame = Frame{ .datagram_with_length = .{ .data = dgram_data } };
+            try dgram_frame.write(fbs);
+            dq.consume();
+            any = true;
+        }
+        return any;
+    }
+
+    /// Pack a coalesced packet (Initial + 0-RTT + Handshake + 1-RTT).
+    /// Returns the number of bytes written to out_buf.
+    /// When ack_only is true, only ACK/CRYPTO/HANDSHAKE_DONE/control frames are packed (no stream/datagram data).
+    pub fn packCoalesced(
+        self: *PacketPacker,
+        out_buf: []u8,
+        pkt_handler: *ack_handler.PacketHandler,
+        crypto_mgr: *crypto_stream.CryptoStreamManager,
+        streams: *stream_mod.StreamsMap,
+        pending_frames: *frame_mod.PendingFrameQueue,
+        initial_seal: ?*const crypto_mod.Seal,
+        early_seal: ?*const crypto_mod.Seal,
+        handshake_seal: ?*const crypto_mod.Seal,
+        app_seal: ?*const crypto_mod.Seal,
+        now: i64,
+        datagram_queue: ?*conn_mod.DatagramQueue,
+        ack_only: bool,
+    ) !usize {
+        var offset: usize = 0;
+
+        // Try packing Initial packet
+        // Both client and server MUST pad UDP datagrams carrying ack-eliciting Initial
+        // packets to >= 1200 bytes (RFC 9000 §14.1).
+        // Client: when Handshake keys are available, DON'T pad the Initial — leave room
+        // for a coalesced Handshake packet (which carries the ACK the server needs to
+        // lift the amplification limit). The Handshake portion provides the padding.
+        // Server: don't pad the Initial here — pad the Handshake portion below.
+        if (initial_seal != null) {
+            const pad_target: usize = if (!self.is_server and handshake_seal == null) MIN_INITIAL_PACKET_SIZE else 0;
+            const initial_len = try self.packSinglePacket(
+                out_buf[offset..],
+                .initial,
+                pkt_handler,
+                crypto_mgr,
+                streams,
+                pending_frames,
+                initial_seal.?,
+                now,
+                pad_target,
+                null,
+                false,
+                ack_only,
+            );
+            offset += initial_len;
+        }
+
+        // Try packing 0-RTT packet (Long Header, type 0x10)
+        // If coalesced after a padded Initial, no extra padding needed (already >= 1200)
+        if (early_seal != null and offset < out_buf.len and !ack_only) {
+            const pad_target: usize = if (initial_seal != null and offset > 0)
+                MIN_INITIAL_PACKET_SIZE -| offset
+            else
+                0;
+            const early_len = try self.packSinglePacket(
+                out_buf[offset..],
+                .application,
+                pkt_handler,
+                crypto_mgr,
+                streams,
+                pending_frames,
+                early_seal.?,
+                now,
+                pad_target,
+                datagram_queue,
+                true, // zero_rtt = true
+                false,
+            );
+            offset += early_len;
+        }
+
+        // Try packing Handshake packet
+        // Padding logic: the coalesced datagram (Initial+Handshake) must reach 1200 bytes.
+        // Both client and server pad the Handshake portion to fill the remainder.
+        if (handshake_seal != null and offset < out_buf.len) {
+            const hs_pad: usize = if (offset > 0)
+                MIN_INITIAL_PACKET_SIZE -| offset // Coalesced after Initial: pad remainder
+            else if (!self.is_server and initial_seal == null)
+                MIN_INITIAL_PACKET_SIZE // Standalone client Handshake: full pad
+            else
+                0;
+            const hs_len = try self.packSinglePacket(
+                out_buf[offset..],
+                .handshake,
+                pkt_handler,
+                crypto_mgr,
+                streams,
+                pending_frames,
+                handshake_seal.?,
+                now,
+                hs_pad,
+                null,
+                false,
+                ack_only,
+            );
+            offset += hs_len;
+        }
+
+        // Try packing 1-RTT packet
+        if (app_seal != null and offset < out_buf.len) {
+            const app_len = try self.packSinglePacket(
+                out_buf[offset..],
+                .application,
+                pkt_handler,
+                crypto_mgr,
+                streams,
+                pending_frames,
+                app_seal.?,
+                now,
+                0,
+                datagram_queue,
+                false,
+                ack_only,
+            );
+            offset += app_len;
+        }
+
+        return offset;
+    }
+
+    /// Pack a single packet at the given encryption level.
+    /// Returns the total packet size including header, encrypted payload, and AEAD tag.
+    /// When zero_rtt=true, packs a 0-RTT Long Header packet (type 0x10) with only STREAM/DATAGRAM frames.
+    /// When ack_only=true, skips stream and datagram frames (used when congestion-limited).
+    fn packSinglePacket(
+        self: *PacketPacker,
+        buf: []u8,
+        level: ack_handler.EncLevel,
+        pkt_handler: *ack_handler.PacketHandler,
+        crypto_mgr: *crypto_stream.CryptoStreamManager,
+        streams: *stream_mod.StreamsMap,
+        pending_frames: *frame_mod.PendingFrameQueue,
+        seal: *const crypto_mod.Seal,
+        now: i64,
+        pad_target: usize, // 0 = no padding, >0 = target packet size for this packet
+        datagram_queue: ?*conn_mod.DatagramQueue,
+        zero_rtt: bool,
+        ack_only: bool,
+    ) !usize {
+        if (buf.len < 64) return 0; // Not enough space
+
+        // We build the packet in a temporary buffer, then encrypt into buf
+        var tmp: [ABSOLUTE_MAX_PACKET_SIZE]u8 = undefined;
+        // A packet that may fill the window keeps a byte for IMMEDIATE_ACK.
+        const window_left: ?u64 = if (level == .application and !zero_rtt and !ack_only) self.window_left else null;
+        const imm_room: usize = if (window_left) |left| @intFromBool(left <= self.max_packet_size) else 0;
+        // Account for output buffer size: encrypted output = fbs.seek + AEAD_TAG_LEN
+        const effective_max = @min(self.max_packet_size, @min(tmp.len, buf.len -| AEAD_TAG_LEN)) - imm_room;
+        var fbs = io.fixedBufferStream(tmp[0 .. effective_max + imm_room]);
+        const writer = &fbs;
+
+        // Get packet number and encode it
+        const pn = pkt_handler.nextPacketNumber(level);
+        const largest_acked = pkt_handler.getLargestAcked(level);
+        var pn_buf: [4]u8 = undefined;
+        const pn_len = crypto_mod.encodePacketNumber(pn, largest_acked, &pn_buf);
+
+        // Write header
+        const header_start: usize = 0;
+        const pkt_type = if (zero_rtt)
+            packet_mod.PacketType.zero_rtt
+        else switch (level) {
+            .initial => packet_mod.PacketType.initial,
+            .handshake => packet_mod.PacketType.handshake,
+            .application => packet_mod.PacketType.one_rtt,
+        };
+
+        var length_offset: usize = 0; // where the payload length field is (long headers only)
+
+        if (pkt_type == .one_rtt) {
+            // Short header: 1 byte + DCID
+            var first_byte: u8 = packet_mod.FIXED_BIT;
+            if (self.key_phase) first_byte |= packet_mod.KEY_PHASE_BIT;
+            if (self.spin_bit) first_byte |= packet_mod.PACKET_SPIN_BIT;
+            first_byte |= @as(u8, @intCast(pn_len - 1));
+            try writer.writeByte(first_byte);
+            try writer.writeAll(self.getDcid());
+        } else {
+            // Long header
+            var first_byte: u8 = packet_mod.encodeLongHeaderTypeBits(pkt_type, self.version);
+            first_byte |= @as(u8, @intCast(pn_len - 1));
+            try writer.writeByte(first_byte);
+            try writer.writeInt(u32, self.version, .big);
+
+            try writer.writeByte(@intCast(self.getDcid().len));
+            try writer.writeAll(self.getDcid());
+            try writer.writeByte(@intCast(self.getScid().len));
+            try writer.writeAll(self.getScid());
+
+            // Token (Initial only)
+            if (pkt_type == .initial) {
+                if (self.initial_token) |token| {
+                    try packet_mod.writeVarInt(writer, token.len);
+                    try writer.writeAll(token);
+                } else {
+                    try packet_mod.writeVarInt(writer, 0);
+                }
+            }
+
+            // Payload length placeholder - use 2-byte varint (can hold up to 16383)
+            length_offset = fbs.seek;
+            try writer.writeInt(u16, 0, .big); // placeholder
+        }
+
+        // Write packet number
+        const pn_offset = fbs.seek;
+        try writer.writeAll(pn_buf[0..pn_len]);
+
+        // Record where the plaintext payload starts
+        const payload_start = fbs.seek;
+
+        // RFC 9001 §5.4.2: The header protection sample starts 4 bytes after the PN offset.
+        // We need pn_offset + 4 + SAMPLE_LEN(16) <= total packet length.
+        // Equivalently: plaintext_payload >= 4 - pn_len (minimum to place the sample).
+        // For safety, ensure at least 4 bytes of plaintext regardless of PN length.
+        const min_plaintext: usize = 4;
+        if (effective_max < payload_start + min_plaintext) {
+            pkt_handler.next_pn[@backingInt(level)] -= 1;
+            return 0;
+        }
+
+        // Collect frames
+        var ack_eliciting = false;
+        var has_crypto_data = false;
+        var has_handshake_done = false;
+
+        // Track the largest_ack we send in this packet's ACK frame (for ACK-of-ACK pruning)
+        var ack_largest_sent: ?u64 = null;
+
+        // Control frames to repeat if this packet is lost (RFC 9000 13.3).
+        var control_frames: [ack_handler.MAX_CONTROL_FRAMES_PER_PACKET]ack_handler.SentControlFrame = undefined;
+        var control_frame_count: u8 = 0;
+
+        const ack_delay_exp: u64 = 3;
+        // Held in step 1, sent in step 7.
+        var ack_behind_data = false;
+
+        // 0-RTT packets only contain STREAM and DATAGRAM frames — skip ACK, CRYPTO, control
+        if (!zero_rtt) {
+            // 1. ACK frame, first when due.
+            // Initial and Handshake are acknowledged at once (RFC 9000
+            // 13.2.1). A 1-RTT ACK not yet due only rides behind other
+            // frames: alone it would be a packet per packet received. Not in
+            // ack_only mode, where ACK-only packets bypass congestion control
+            // and forcing them can loop without draining bytes_in_flight.
+            const ack_frame_opt: ?Frame = if (level != .application and !ack_only and pkt_handler.hasUnackedAckEliciting(level))
+                pkt_handler.getAckFrameForced(level, now, ack_delay_exp)
+            else
+                pkt_handler.getAckFrame(level, now, ack_delay_exp);
+            if (ack_frame_opt) |ack_frame| {
+                // Record the largest_ack for ACK-of-ACK pruning (RFC 9000 §13.2.4)
+                ack_largest_sent = largestAck(ack_frame);
+                try ack_frame.write(writer);
+            } else {
+                ack_behind_data = level == .application and !ack_only and pkt_handler.hasUnackedAckEliciting(level);
+            }
+
+            // 2. CRYPTO frames
+            const crypto_level_idx: u8 = switch (level) {
+                .initial => 0,
+                .handshake => 2,
+                .application => 3,
+            };
+            const cs = crypto_mgr.getStream(crypto_level_idx);
+            const remaining_space = effective_max -| (fbs.seek + AEAD_TAG_LEN + 4);
+            // Checked first: past the handshake there is never any.
+            if (remaining_space > 0 and cs.hasData()) {
+                if (cs.popCryptoFrame(remaining_space)) |crypto_frame| {
+                    try crypto_frame.write(writer);
+                    ack_eliciting = true;
+                    has_crypto_data = true;
+                }
+            }
+
+            // 2b. PING and CONNECTION_CLOSE for Initial/Handshake packets
+            // PING: PTO probes need ack-eliciting frames (RFC 9002 §6.2.4)
+            // CONNECTION_CLOSE: valid at all levels (RFC 9000 §10.2.3)
+            if (level == .initial or level == .handshake) {
+                var remaining_pf = pending_frames.len;
+                while (remaining_pf > 0) : (remaining_pf -= 1) {
+                    const pcf = pending_frames.pop() orelse break;
+                    switch (pcf) {
+                        .ping => {
+                            if (!ack_eliciting) {
+                                try writer.writeByte(0x01); // PING frame
+                                ack_eliciting = true;
+                            } else {
+                                pending_frames.requeue(pcf);
+                            }
+                        },
+                        .connection_close => {
+                            try pcf.write(writer);
+                            ack_eliciting = true;
+                            // Keep CONNECTION_CLOSE for higher encryption levels too
+                            // (RFC 9000 §10.2.3: send at all available levels)
+                            pending_frames.requeue(pcf);
+                        },
+                        else => {
+                            // Put it back — other control frames go in 1-RTT
+                            pending_frames.requeue(pcf);
+                        },
+                    }
+                }
+            }
+
+            // 3. HANDSHAKE_DONE frame (server only, 1-RTT)
+            // Sent once per trigger (initial handshake completion or PTO/loss re-arm).
+            // Connection clears send_handshake_done after packing to prevent flooding
+            // the CC window with HANDSHAKE_DONE-only packets in burst loops.
+            // Skip when ack_only (congestion-limited).
+            if (level == .application and self.send_handshake_done and !ack_only) {
+                try writer.writeByte(0x1e); // HANDSHAKE_DONE frame type
+                has_handshake_done = true;
+                ack_eliciting = true;
+                self.send_handshake_done = false; // One-shot: PTO/loss will re-arm
+            }
+
+            // 4. Pending control frames (only in 1-RTT)
+            // PATH_CHALLENGE/PATH_RESPONSE may go out past the window while
+            // `urgent_allowed`, and so may receiver credit: otherwise a small
+            // control packet can fill cwnd and prevent MAX_DATA from unblocking
+            // a peer that is already stuck at the connection window.
+            if (level == .application) {
+                var remaining = pending_frames.len;
+                while (remaining > 0) : (remaining -= 1) {
+                    const pcf = pending_frames.pop() orelse break;
+                    const is_urgent_control = self.urgent_allowed and switch (pcf) {
+                        .path_challenge, .path_response => true,
+                        .max_data, .max_stream_data, .max_streams_bidi, .max_streams_uni => true,
+                        else => false,
+                    };
+                    if (!is_urgent_control and ack_only) {
+                        // Re-queue the rest when congestion-limited
+                        pending_frames.requeue(pcf);
+                        continue;
+                    }
+                    // A frame this packet cannot record, or has no room for,
+                    // waits for the next one rather than going out untracked.
+                    const record = ack_handler.SentControlFrame.from(pcf);
+                    if (record != null and control_frame_count == control_frames.len) {
+                        pending_frames.requeue(pcf);
+                        continue;
+                    }
+                    var scratch: [256]u8 = undefined;
+                    var scratch_fbs = io.fixedBufferStream(&scratch);
+                    pcf.write(&scratch_fbs) catch continue;
+                    const encoded = scratch_fbs.buffered();
+                    if (fbs.seek + encoded.len + AEAD_TAG_LEN > effective_max) {
+                        pending_frames.requeue(pcf);
+                        continue;
+                    }
+                    try writer.writeAll(encoded);
+                    ack_eliciting = true;
+                    if (record) |r| {
+                        control_frames[control_frame_count] = r;
+                        control_frame_count += 1;
+                    }
+                }
+            }
+        }
+
+        // 5a. DATAGRAM frames ahead of streams, when asked: a backlogged
+        // stream would otherwise fill every packet before them.
+        const dgram_queue: ?*conn_mod.DatagramQueue = if (level == .application and !ack_only) datagram_queue else null;
+        var has_datagram = false;
+        if (dgram_queue) |dq| {
+            if (self.datagrams_first) has_datagram = try self.packDatagrams(dq, &fbs, payload_start, effective_max, zero_rtt, now);
+        }
+
+        // 5. Stream frames (only in 1-RTT or 0-RTT, skip when ack_only)
+        // Track stream frames for retransmission on loss
+        var stream_frame_infos: [ack_handler.MAX_STREAM_FRAMES_PER_PACKET]ack_handler.StreamFrameInfo = undefined;
+        var stream_frame_info_count: u8 = 0;
+
+        // Without `send_due` no stream has anything to pack: skip the walk.
+        const send_due = if (streams.send_ledger) |l| l.send_due else true;
+        if (level == .application and !ack_only and send_due) {
+            // Streams split anywhere, so they leave room for the held ACK.
+            const stream_max = if (ack_behind_data) effective_max -| ACK_BEHIND_DATA_ROOM else effective_max;
+            // Connection-level flow control budget for this packet
+            var conn_budget: u64 = if (self.conn_flow_ctrl) |cfc| cfc.sendWindowSize() else std.math.maxInt(u64);
+
+            // Bidirectional streams by RFC 9218 priority, and unidirectional
+            // ones likewise; whichever is more urgent goes first, requests
+            // on a tie. HTTP/3's control and QPACK streams (urgency 0) so
+            // lead the requests that depend on their SETTINGS.
+            var sched_buf: [stream_mod.StreamsMap.MAX_SCHEDULABLE]*stream_mod.Stream = undefined;
+            const sched_count = streams.getScheduledStreams(&sched_buf);
+            var uni_sched_buf: [stream_mod.StreamsMap.MAX_SCHEDULABLE]*stream_mod.SendStream = undefined;
+            const uni_sched_count = streams.getScheduledUniStreams(&uni_sched_buf);
+            const uni_first = uni_sched_count > 0 and
+                (sched_count == 0 or uni_sched_buf[0].urgency < sched_buf[0].send.urgency);
+            for ([_]bool{ uni_first, !uni_first }) |uni_pass| {
+                if (!uni_pass) {
+                    for (sched_buf[0..sched_count]) |s| {
+                        if (fbs.seek + AEAD_TAG_LEN + 16 >= stream_max) break;
+                        const retransmitting = s.send.hasRetransmitData();
+                        if (conn_budget == 0 and !retransmitting) continue;
+                        if (stream_frame_info_count >= ack_handler.MAX_STREAM_FRAMES_PER_PACKET) break;
+                        const remaining = stream_max - fbs.seek - AEAD_TAG_LEN;
+                        const header_overhead = streamFrameHeaderOverhead(s.send.stream_id, s.send.send_offset, remaining);
+                        if (remaining <= header_overhead) break;
+                        const max_stream_data = if (retransmitting)
+                            remaining - header_overhead
+                        else
+                            @min(remaining - header_overhead, conn_budget);
+                        const prev_send_offset = s.send.send_offset;
+                        if (s.send.popStreamFrame(max_stream_data)) |stream_frame| {
+                            try stream_frame.write(writer);
+                            ack_eliciting = true;
+                            if (stream_frame.stream.fin) streams.closeIfDone(s);
+                            // Only count NEW data against connection flow control (not retransmissions)
+                            const new_bytes = s.send.send_offset - prev_send_offset;
+                            if (new_bytes > 0) {
+                                conn_budget -= @min(conn_budget, new_bytes);
+                                if (self.conn_flow_ctrl) |cfc| cfc.base.addBytesSent(new_bytes);
+                            }
+                            // Record for retransmission tracking
+                            stream_frame_infos[stream_frame_info_count] = .{
+                                .stream_id = stream_frame.stream.stream_id,
+                                .offset = stream_frame.stream.offset,
+                                .length = stream_frame.stream.length,
+                                .fin = stream_frame.stream.fin,
+                            };
+                            stream_frame_info_count += 1;
+                        }
+                    }
+                } else {
+                    for (uni_sched_buf[0..uni_sched_count]) |s| {
+                        if (fbs.seek + AEAD_TAG_LEN + 16 >= stream_max) break;
+                        const retransmitting = s.hasRetransmitData();
+                        if (conn_budget == 0 and !retransmitting) continue;
+                        if (stream_frame_info_count >= ack_handler.MAX_STREAM_FRAMES_PER_PACKET) break;
+                        const remaining_uni = stream_max - fbs.seek - AEAD_TAG_LEN;
+                        const uni_header_overhead = streamFrameHeaderOverhead(s.stream_id, s.send_offset, remaining_uni);
+                        if (remaining_uni <= uni_header_overhead) break;
+                        const max_stream_data = if (retransmitting)
+                            remaining_uni - uni_header_overhead
+                        else
+                            @min(remaining_uni - uni_header_overhead, conn_budget);
+                        const prev_uni_offset = s.send_offset;
+                        if (s.popStreamFrame(max_stream_data)) |stream_frame| {
+                            try stream_frame.write(writer);
+                            ack_eliciting = true;
+                            // Only count NEW data against connection flow control
+                            const new_bytes_uni = s.send_offset - prev_uni_offset;
+                            if (new_bytes_uni > 0) {
+                                conn_budget -= @min(conn_budget, new_bytes_uni);
+                                if (self.conn_flow_ctrl) |cfc| cfc.base.addBytesSent(new_bytes_uni);
+                            }
+                            // Record for retransmission tracking
+                            stream_frame_infos[stream_frame_info_count] = .{
+                                .stream_id = stream_frame.stream.stream_id,
+                                .offset = stream_frame.stream.offset,
+                                .length = stream_frame.stream.length,
+                                .fin = stream_frame.stream.fin,
+                            };
+                            stream_frame_info_count += 1;
+                        }
+                    }
+                }
+            }
+
+            if (sched_count == 0 and uni_sched_count == 0) {
+                if (streams.send_ledger) |l| l.send_due = false;
+            }
+        }
+
+        // 6. DATAGRAM frames (RFC 9221) — subject to congestion control (RFC 9221 §5)
+        // Only pack datagrams when CC allows (i.e. not in ack_only mode).
+        if (dgram_queue) |dq| {
+            if (!self.datagrams_first and try self.packDatagrams(dq, &fbs, payload_start, effective_max, zero_rtt, now)) has_datagram = true;
+        }
+        if (has_datagram) ack_eliciting = true;
+
+        // 7. The ACK held in step 1, if anything else went in. Without the
+        // room, the threshold or the alarm sends it later.
+        if (ack_behind_data and ack_eliciting) ack: {
+            const ack_frame = pkt_handler.peekAckFrame(level, now, ack_delay_exp) orelse break :ack;
+            const mark = fbs.seek;
+            const fits = if (ack_frame.write(writer)) |_| fbs.seek + AEAD_TAG_LEN <= effective_max else |_| false;
+            if (!fits) {
+                fbs.seek = mark;
+                break :ack;
+            }
+            pkt_handler.onAckSent(level);
+            ack_largest_sent = largestAck(ack_frame);
+        }
+
+        // 8. IMMEDIATE_ACK when this packet leaves the window full: the
+        // peer's raised threshold would otherwise hold the ACK we wait on
+        // (draft-ietf-quic-ack-frequency 8.1.1, and 7 for PTO probes).
+        if (imm_room > 0 and ack_eliciting and fbs.seek + 1 + AEAD_TAG_LEN >= window_left.?) {
+            try writer.writeByte(0x1f); // IMMEDIATE_ACK frame
+        }
+
+        // Note: RFC 9002 loss detection deadlock prevention is handled by the PTO
+        // mechanism in ack_handler.zig, which sends PING probes when the PTO timer
+        // fires. No need to inject PINGs into every ACK-only packet here — doing so
+        // creates an ACK amplification loop (ACK+PING → server ACKs → client ACK+PING → ...).
+
+        // Check if we have any payload
+        var payload_len = fbs.seek - payload_start;
+        if (payload_len == 0) {
+            // Roll back the packet number we consumed — no packet will be sent.
+            // This applies even with pad_target > 0: sending a padded Initial with
+            // no ACK/CRYPTO content just wastes PNs and pushes the PTO forward.
+            const idx = @backingInt(level);
+            pkt_handler.next_pn[idx] -= 1;
+            return 0; // Nothing to send
+        }
+
+        if (payload_len < min_plaintext) {
+            const min_pad = min_plaintext - payload_len;
+            @memset(tmp[fbs.seek..][0..min_pad], 0x00);
+            fbs.seek += min_pad;
+            payload_len = min_plaintext;
+        }
+
+        // Pad to target size (RFC 9000 §14.1): Initial, 0-RTT, or Handshake
+        // when used to pad a coalesced server datagram to 1200 bytes.
+        if (pad_target > 0 and (pkt_type == .initial or pkt_type == .zero_rtt or pkt_type == .handshake)) {
+            const current_total = fbs.seek - header_start + AEAD_TAG_LEN;
+            if (current_total < pad_target) {
+                // Within effective_max: the send buffer may be cut to the amplification budget.
+                const pad_needed = @min(pad_target - current_total, effective_max - fbs.seek);
+                @memset(tmp[fbs.seek..][0..pad_needed], 0x00);
+                fbs.seek += pad_needed;
+            }
+        }
+
+        // The plaintext payload is tmp[payload_start..fbs.seek]
+        const plaintext_payload = tmp[payload_start..fbs.seek];
+        const header_bytes = tmp[header_start..payload_start];
+
+        // Fill in the payload length field for long headers
+        // Length = pn_len + plaintext_payload.len + AEAD_TAG_LEN
+        if (pkt_type != .one_rtt) {
+            const total_payload_len: u16 = @intCast(pn_len + plaintext_payload.len + AEAD_TAG_LEN);
+            // Encode as 2-byte varint (set high 2 bits to 01)
+            std.mem.writeInt(u16, tmp[length_offset..][0..2], total_payload_len | (0x40 << 8), .big);
+        }
+
+        // Copy header to output buffer
+        const out_header = buf[header_start..][0..header_bytes.len];
+        @memcpy(out_header, header_bytes);
+
+        // Copy packet number to output buffer
+        @memcpy(buf[pn_offset..][0..pn_len], pn_buf[0..pn_len]);
+
+        // Encrypt payload into output buffer (after pn)
+        const encrypted_start = pn_offset + pn_len;
+        // RFC 9001 Section 5.2: AD is the header up to and including the packet number field
+        const ad = buf[header_start..][0..(pn_offset - header_start + pn_len)];
+        const encrypted_len = seal.encryptPayload(
+            pn,
+            ad,
+            plaintext_payload,
+            buf[encrypted_start..],
+        );
+
+        const total_packet_len = encrypted_start + encrypted_len;
+
+        // Apply header protection (uses cached AES HP context when available)
+        seal.applyHeaderProtection(
+            buf[header_start..total_packet_len],
+            pn_offset - header_start,
+            pn_len,
+        );
+
+        // Record the packet as sent, including stream frame info for retransmission
+        var sent_pkt = ack_handler.SentPacket{
+            .pn = pn,
+            .time_sent = now,
+            .size = @intCast(total_packet_len),
+            .ack_eliciting = ack_eliciting,
+            .in_flight = ack_eliciting,
+            .enc_level = level,
+            .has_crypto_data = has_crypto_data,
+            .has_handshake_done = has_handshake_done,
+            .has_datagram = has_datagram,
+            .ecn_marked = level == .application and self.ecn_mark,
+            .largest_acked = ack_largest_sent,
+        };
+        // Copy stream frame records into the SentPacket
+        for (stream_frame_infos[0..stream_frame_info_count]) |info| {
+            sent_pkt.addStreamFrame(info);
+        }
+        @memcpy(sent_pkt.control_frames[0..control_frame_count], control_frames[0..control_frame_count]);
+        sent_pkt.control_frame_count = control_frame_count;
+        if (self.qlog_writer) |ql| ql.packetSentRecord(now, qlog.packetTypeStr(pkt_type), &sent_pkt);
+        try pkt_handler.onPacketSent(sent_pkt);
+
+        return total_packet_len;
+    }
+
+    /// Pack an MTU probe packet (1-RTT PING + PADDING to target size).
+    /// Returns the total bytes written and the packet number used.
+    pub fn packMtuProbe(
+        self: *PacketPacker,
+        buf: []u8,
+        target_size: usize,
+        pkt_handler: *ack_handler.PacketHandler,
+        seal: *const crypto_mod.Seal,
+        now: i64,
+    ) !Ping {
+        return self.packPing(buf, target_size, pkt_handler, seal, now, true);
+    }
+
+    pub const Ping = struct { bytes_written: usize, pn: u64 };
+
+    /// A small 1-RTT PING that keeps no loss-recovery record: not in flight,
+    /// so nothing waits for its ACK. The probe at the record limit.
+    pub fn packBarePing(
+        self: *PacketPacker,
+        buf: []u8,
+        pkt_handler: *ack_handler.PacketHandler,
+        seal: *const crypto_mod.Seal,
+        now: i64,
+    ) !usize {
+        return (try self.packPing(buf, 64, pkt_handler, seal, now, false)).bytes_written;
+    }
+
+    /// A 1-RTT PING padded to `target_size`.
+    fn packPing(
+        self: *PacketPacker,
+        buf: []u8,
+        target_size: usize,
+        pkt_handler: *ack_handler.PacketHandler,
+        seal: *const crypto_mod.Seal,
+        now: i64,
+        in_flight: bool,
+    ) !Ping {
+        if (buf.len < target_size or target_size < 64) return .{ .bytes_written = 0, .pn = 0 };
+
+        var tmp: [ABSOLUTE_MAX_PACKET_SIZE]u8 = undefined;
+        const effective_max = @min(target_size, tmp.len);
+        var fbs = io.fixedBufferStream(tmp[0..effective_max]);
+        const writer = &fbs;
+
+        const pn = pkt_handler.nextPacketNumber(.application);
+        const largest_acked = pkt_handler.getLargestAcked(.application);
+        var pn_buf: [4]u8 = undefined;
+        const pn_len = crypto_mod.encodePacketNumber(pn, largest_acked, &pn_buf);
+
+        // Short header (1-RTT)
+        var first_byte: u8 = packet_mod.FIXED_BIT;
+        if (self.key_phase) first_byte |= packet_mod.KEY_PHASE_BIT;
+        if (self.spin_bit) first_byte |= packet_mod.PACKET_SPIN_BIT;
+        first_byte |= @as(u8, @intCast(pn_len - 1));
+        try writer.writeByte(first_byte);
+        try writer.writeAll(self.getDcid());
+
+        const pn_offset = fbs.seek;
+        try writer.writeAll(pn_buf[0..pn_len]);
+
+        const payload_start = fbs.seek;
+
+        // PING frame (makes it ACK-eliciting)
+        try packet_mod.writeVarInt(writer, 0x01);
+
+        // Fill remaining space with PADDING to reach target_size
+        const overhead = payload_start + AEAD_TAG_LEN;
+        if (target_size > overhead) {
+            const pad_needed = target_size - overhead - (fbs.seek - payload_start);
+            @memset(tmp[fbs.seek..][0..pad_needed], 0x00);
+            fbs.seek += pad_needed;
+        }
+
+        const plaintext_payload = tmp[payload_start..fbs.seek];
+        const header_bytes = tmp[0..payload_start];
+
+        // Copy header
+        @memcpy(buf[0..header_bytes.len], header_bytes);
+        @memcpy(buf[pn_offset..][0..pn_len], pn_buf[0..pn_len]);
+
+        // Encrypt
+        const encrypted_start = pn_offset + pn_len;
+        const ad = buf[0..(pn_offset + pn_len)];
+        const encrypted_len = seal.encryptPayload(pn, ad, plaintext_payload, buf[encrypted_start..]);
+        const total_len = encrypted_start + encrypted_len;
+
+        // Apply header protection (uses cached AES HP context when available)
+        seal.applyHeaderProtection(buf[0..total_len], pn_offset, pn_len);
+
+        if (self.qlog_writer) |ql| ql.packetSent(now, "1RTT", pn, total_len, "{\"frame_type\":\"ping\"}");
+        // An MTU probe is in flight, but its loss is the caller's to handle.
+        try pkt_handler.onPacketSent(.{
+            .pn = pn,
+            .time_sent = now,
+            .size = @intCast(total_len),
+            .ack_eliciting = true,
+            .in_flight = in_flight,
+            .enc_level = .application,
+        });
+
+        return .{ .bytes_written = total_len, .pn = pn };
+    }
+};
+
+// Tests
+
+test "PacketPacker: basic init" {
+    const scid = &[_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const dcid = &[_]u8{ 0x05, 0x06, 0x07, 0x08 };
+    const packer = PacketPacker.init(
+        testing.allocator,
+        false,
+        scid,
+        dcid,
+        0x00000001,
+    );
+    try testing.expectEqualSlices(u8, scid, packer.getScid());
+    try testing.expectEqualSlices(u8, dcid, packer.getDcid());
+}
+
+test "PacketPacker: updateDcid" {
+    const scid = &[_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const dcid = &[_]u8{ 0x05, 0x06, 0x07, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, scid, dcid, 0x00000001);
+    const new_dcid = &[_]u8{ 0xAA, 0xBB, 0xCC };
+    packer.updateDcid(new_dcid);
+    try testing.expectEqualSlices(u8, new_dcid, packer.getDcid());
+}
+
+// Helper: derive Initial crypto keys for packer tests (client side)
+fn testClientKeys() !struct { seal: crypto_mod.Seal, open: crypto_mod.Open } {
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const keys = try crypto_mod.deriveInitialKeyMaterial(&dcid, 0x00000001, false);
+    return .{ .seal = keys[1], .open = keys[0] };
+}
+
+// Helper: derive Initial crypto keys for packer tests (server side)
+fn testServerKeys() !struct { seal: crypto_mod.Seal, open: crypto_mod.Open } {
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const keys = try crypto_mod.deriveInitialKeyMaterial(&dcid, 0x00000001, true);
+    return .{ .seal = keys[1], .open = keys[0] };
+}
+
+test "PacketPacker: pack Initial with CRYPTO data" {
+    // Setup: client packer with Initial keys and CRYPTO data to send
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, scid, dcid, 0x00000001);
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+
+    // Write some CRYPTO data (simulates ClientHello)
+    const crypto_data = "test ClientHello data for packer";
+    try crypto_mgr.getStream(0).writeData(crypto_data);
+
+    const keys = try testClientKeys();
+
+    var out_buf: [1500]u8 = undefined;
+    const written = try packer.packCoalesced(
+        &out_buf,
+        &pkt_handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        &keys.seal, // initial_seal
+        null, // early_seal
+        null, // handshake_seal
+        null, // app_seal
+        1000,
+        null, // datagram_queue
+        false, // ack_only
+    );
+
+    // Client Initial packets MUST be >= 1200 bytes (RFC 9000 §14.1)
+    try testing.expect(written >= MIN_INITIAL_PACKET_SIZE);
+
+    // Verify it's a Long Header Initial packet (high bit set, form bit set)
+    try testing.expect(out_buf[0] & 0x80 != 0); // Long header
+
+    // Verify packet was tracked
+    try testing.expectEqual(@as(u64, 1), pkt_handler.next_pn[0]); // Used PN 0
+
+    // Verify sent packet was recorded
+    try testing.expectEqual(@as(usize, 1), pkt_handler.sent[0].sent_packets.count());
+}
+
+test "PacketPacker: pack 1-RTT with stream data" {
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, scid, dcid, 0x00000001);
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+
+    // Create a stream and write data
+    streams.setMaxStreams(10, 10);
+    streams.setPeerInitialMaxStreamData(65536, 65536, 65536);
+    const s = try streams.openBidiStream();
+    try s.send.writeData("Hello from stream");
+
+    const keys = try testClientKeys();
+
+    var out_buf: [1500]u8 = undefined;
+    const written = try packer.packCoalesced(
+        &out_buf,
+        &pkt_handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        null, // no initial
+        null, // no early
+        null, // no handshake
+        &keys.seal, // app_seal
+        1000,
+        null,
+        false,
+    );
+
+    // Should have produced a packet with stream data
+    try testing.expect(written > 0);
+
+    // Verify it's a Short Header (1-RTT) packet (high bit clear)
+    try testing.expect(out_buf[0] & 0x80 == 0);
+
+    // Verify sent packet tracking
+    const app_idx = @backingInt(ack_handler.EncLevel.application);
+    try testing.expectEqual(@as(usize, 1), pkt_handler.sent[app_idx].sent_packets.count());
+}
+
+test "PacketPacker: no data produces no packet" {
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{0x02};
+    var packer = PacketPacker.init(testing.allocator, false, scid, dcid, 0x00000001);
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+
+    const keys = try testClientKeys();
+
+    var out_buf: [1500]u8 = undefined;
+    // No crypto data, no stream data, no ACKs — should produce nothing
+    const written = try packer.packCoalesced(
+        &out_buf,
+        &pkt_handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        &keys.seal, // initial_seal
+        null,
+        null,
+        null,
+        1000,
+        null,
+        false,
+    );
+
+    try testing.expectEqual(@as(usize, 0), written);
+}
+
+test "PacketPacker: ack_only skips stream data but sends receiver credit" {
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, scid, dcid, 0x00000001);
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+    pending_frames.push(.{ .max_data = 12345 });
+
+    // Create a stream with data
+    streams.setMaxStreams(10, 10);
+    streams.setPeerInitialMaxStreamData(65536, 65536, 65536);
+    const s = try streams.openBidiStream();
+    try s.send.writeData("This data should be skipped");
+
+    // Register 2 received packets to trigger immediate ACK (ACK_ELICITING_THRESHOLD=2)
+    try pkt_handler.recv[2].onPacketReceived(0, true, 1000, 0, 0);
+    try pkt_handler.recv[2].onPacketReceived(1, true, 1000, 0, 0);
+
+    const keys = try testClientKeys();
+
+    var out_buf: [1500]u8 = undefined;
+    const written = try packer.packCoalesced(
+        &out_buf,
+        &pkt_handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        null,
+        null,
+        null,
+        &keys.seal, // app_seal
+        1000,
+        null,
+        true, // ack_only = true
+    );
+
+    // Should produce a packet carrying ACK plus receiver-credit control.
+    try testing.expect(written > 0);
+    try testing.expectEqual(@as(u8, 0), pending_frames.len);
+
+    // Stream data should still be waiting (not consumed)
+    try testing.expect(s.send.hasData());
+}
+
+test "PacketPacker: ack_only does not force sub-threshold ACKs" {
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, scid, dcid, 0x00000001);
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+
+    // One ack-eliciting packet arms a delayed ACK, but it is below the immediate
+    // ACK threshold. ACK-only packing must not force an immediate packet.
+    try pkt_handler.recv[2].onPacketReceived(0, true, 1000, 0, 0);
+
+    const keys = try testClientKeys();
+
+    var out_buf: [1500]u8 = undefined;
+    const written = try packer.packCoalesced(
+        &out_buf,
+        &pkt_handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        null,
+        null,
+        null,
+        &keys.seal,
+        1000,
+        null,
+        true,
+    );
+
+    try testing.expectEqual(@as(usize, 0), written);
+    try testing.expectEqual(@as(u64, 0), pkt_handler.next_pn[2]);
+}
+
+test "PacketPacker: coalesced Initial + Handshake" {
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, true, scid, dcid, 0x00000001); // server
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, true);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+
+    // Write CRYPTO data for Initial and Handshake levels
+    try crypto_mgr.getStream(0).writeData("Initial crypto");
+    try crypto_mgr.getStream(2).writeData("Handshake crypto"); // handshake = index 2
+
+    const keys = try testServerKeys();
+
+    var out_buf: [1500]u8 = undefined;
+    const written = try packer.packCoalesced(
+        &out_buf,
+        &pkt_handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        &keys.seal, // initial_seal
+        null, // no early
+        &keys.seal, // handshake_seal (reuse same keys for test)
+        null, // no app
+        1000,
+        null,
+        false,
+    );
+
+    // Should have coalesced both levels
+    try testing.expect(written > 0);
+
+    // Both Initial and Handshake packet numbers should have been used
+    try testing.expectEqual(@as(u64, 1), pkt_handler.next_pn[0]); // Initial PN 0 used
+    try testing.expectEqual(@as(u64, 1), pkt_handler.next_pn[1]); // Handshake PN 0 used
+}
+
+test "PacketPacker: padding stays inside a buffer cut short by the amplification limit" {
+    const keys = try testServerKeys();
+    const long_cid: [20]u8 = @splat(0x5a);
+    const cases = [_]struct { cid: []const u8, budget: usize }{
+        .{ .cid = &.{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 }, .budget = 300 },
+        .{ .cid = &long_cid, .budget = 70 },
+    };
+    for (cases) |c| {
+        var packer = PacketPacker.init(testing.allocator, true, c.cid, c.cid, 0x00000001);
+        var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+        defer pkt_handler.deinit();
+        var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+        defer crypto_mgr.deinit();
+        var streams = stream_mod.StreamsMap.init(testing.allocator, true);
+        defer streams.deinit();
+        var pending_frames = frame_mod.PendingFrameQueue{};
+
+        try crypto_mgr.getStream(0).writeData("Initial crypto");
+        try crypto_mgr.getStream(2).writeData(&@as([2000]u8, @splat(0xcc)));
+
+        var backing: [1500]u8 = @splat(0xee);
+        const written = try packer.packCoalesced(
+            backing[0..c.budget],
+            &pkt_handler,
+            &crypto_mgr,
+            &streams,
+            &pending_frames,
+            &keys.seal,
+            null,
+            &keys.seal,
+            null,
+            1000,
+            null,
+            false,
+        );
+        try testing.expect(written <= c.budget);
+        for (backing[c.budget..]) |b| try testing.expectEqual(@as(u8, 0xee), b);
+    }
+}
+
+test "PacketPacker: HANDSHAKE_DONE frame packed in 1-RTT" {
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, true, scid, dcid, 0x00000001);
+    packer.send_handshake_done = true;
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, true);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+    const keys = try testServerKeys();
+
+    var out_buf: [1500]u8 = undefined;
+    const written = try packer.packCoalesced(
+        &out_buf,
+        &pkt_handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        null,
+        null,
+        null,
+        &keys.seal, // app_seal
+        1000,
+        null,
+        false,
+    );
+
+    try testing.expect(written > 0);
+
+    // HANDSHAKE_DONE is one-shot: cleared by packer after writing, re-armed by PTO/loss
+    try testing.expect(!packer.send_handshake_done);
+
+    // Sent packet should be tracked as ack-eliciting with handshake_done
+    const app_idx = @backingInt(ack_handler.EncLevel.application);
+    try testing.expectEqual(@as(usize, 1), pkt_handler.sent[app_idx].sent_packets.count());
+    var it = pkt_handler.sent[app_idx].sent_packets.iterator();
+    const pkt = it.next().?;
+    try testing.expect(pkt.ack_eliciting);
+    try testing.expect(pkt.has_handshake_done);
+}
+
+test "PacketPacker: ecn_mark propagates to SentPacket" {
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, scid, dcid, 0x00000001);
+    packer.ecn_mark = true;
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+
+    // Need ack-eliciting content — add stream data
+    streams.setMaxStreams(10, 10);
+    streams.setPeerInitialMaxStreamData(65536, 65536, 65536);
+    const s = try streams.openBidiStream();
+    try s.send.writeData("ecn test data");
+
+    const keys = try testClientKeys();
+
+    var out_buf: [1500]u8 = undefined;
+    const written = try packer.packCoalesced(
+        &out_buf,
+        &pkt_handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        null,
+        null,
+        null,
+        &keys.seal,
+        1000,
+        null,
+        false,
+    );
+
+    try testing.expect(written > 0);
+
+    // Check the sent packet has ecn_marked set
+    const app_idx = @backingInt(ack_handler.EncLevel.application);
+    var it = pkt_handler.sent[app_idx].sent_packets.iterator();
+    const pkt = it.next().?;
+    try testing.expect(pkt.ecn_marked);
+    try testing.expect(pkt.ack_eliciting);
+}
+
+test "PacketPacker: key_phase bit in short header" {
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, scid, dcid, 0x00000001);
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+
+    // Add stream data so we produce a packet
+    streams.setMaxStreams(10, 10);
+    streams.setPeerInitialMaxStreamData(65536, 65536, 65536);
+    const s = try streams.openBidiStream();
+    try s.send.writeData("test data");
+
+    const keys = try testClientKeys();
+
+    // Pack with key_phase = false
+    packer.key_phase = false;
+    var out1: [1500]u8 = undefined;
+    _ = try packer.packCoalesced(&out1, &pkt_handler, &crypto_mgr, &streams, &pending_frames, null, null, null, &keys.seal, 1000, null, false);
+
+    // Write more data and pack with key_phase = true
+    try s.send.writeData("more data");
+    packer.key_phase = true;
+    var out2: [1500]u8 = undefined;
+    _ = try packer.packCoalesced(&out2, &pkt_handler, &crypto_mgr, &streams, &pending_frames, null, null, null, &keys.seal, 1000, null, false);
+
+    // After header protection is applied, the key_phase bit is masked.
+    // But the two packets should differ (different key phase + different content).
+    // Just verify both produced output and used different PNs.
+    const app_idx = @backingInt(ack_handler.EncLevel.application);
+    try testing.expectEqual(@as(u64, 2), pkt_handler.next_pn[app_idx]);
+}
+
+test "PacketPacker: pending control frames in 1-RTT" {
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, scid, dcid, 0x00000001);
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+
+    // Queue a PATH_CHALLENGE control frame
+    const challenge = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE };
+    pending_frames.push(.{ .path_challenge = challenge });
+
+    const keys = try testClientKeys();
+
+    var out_buf: [1500]u8 = undefined;
+    const written = try packer.packCoalesced(
+        &out_buf,
+        &pkt_handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        null,
+        null,
+        null,
+        &keys.seal,
+        1000,
+        null,
+        false,
+    );
+
+    try testing.expect(written > 0);
+
+    // Control frame should be consumed from the queue
+    try testing.expectEqual(@as(?frame_mod.PendingControlFrame, null), pending_frames.pop());
+
+    // Sent packet should be ack-eliciting
+    const app_idx = @backingInt(ack_handler.EncLevel.application);
+    var it = pkt_handler.sent[app_idx].sent_packets.iterator();
+    const pkt = it.next().?;
+    try testing.expect(pkt.ack_eliciting);
+}
+
+test "PacketPacker: stream frame info tracked in SentPacket" {
+    const scid = &[_]u8{0x01};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, scid, dcid, 0x00000001);
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+
+    streams.setMaxStreams(10, 10);
+    streams.setPeerInitialMaxStreamData(65536, 65536, 65536);
+    const s = try streams.openBidiStream();
+    try s.send.writeData("stream data for tracking");
+
+    const keys = try testClientKeys();
+
+    var out_buf: [1500]u8 = undefined;
+    _ = try packer.packCoalesced(
+        &out_buf,
+        &pkt_handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        null,
+        null,
+        null,
+        &keys.seal,
+        1000,
+        null,
+        false,
+    );
+
+    // Verify stream frame info was recorded in SentPacket
+    const app_idx = @backingInt(ack_handler.EncLevel.application);
+    var it = pkt_handler.sent[app_idx].sent_packets.iterator();
+    const pkt = it.next().?;
+    const sf = pkt.getStreamFrames();
+    try testing.expect(sf.len > 0);
+    try testing.expectEqual(@as(u64, 0), sf[0].stream_id);
+    try testing.expectEqual(@as(u64, 0), sf[0].offset);
+    try testing.expect(sf[0].length > 0);
+}
+
+fn packAppOnly(
+    packer: *PacketPacker,
+    pkt_handler: *ack_handler.PacketHandler,
+    crypto_mgr: *crypto_stream.CryptoStreamManager,
+    streams: *stream_mod.StreamsMap,
+    pending_frames: *frame_mod.PendingFrameQueue,
+    out_buf: []u8,
+) !usize {
+    const keys = try testClientKeys();
+    return packer.packCoalesced(out_buf, pkt_handler, crypto_mgr, streams, pending_frames, null, null, null, &keys.seal, 1000, null, false);
+}
+
+test "PacketPacker: packing our FIN closes a stream whose peer finished first" {
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, true, &[_]u8{0x01}, dcid, 0x00000001);
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+    var streams = stream_mod.StreamsMap.init(testing.allocator, true);
+    defer streams.deinit();
+    var pending_frames = frame_mod.PendingFrameQueue{};
+    streams.setMaxStreams(10, 10);
+    streams.setPeerInitialMaxStreamData(65536, 65536, 65536);
+
+    // The request arrives whole; the response is not written yet.
+    const s = try streams.getOrCreateStream(0);
+    try s.recv.handleStreamFrame(0, "GET /", true);
+    streams.collectClosedStreams();
+    try testing.expect(!s.closed_for_gc);
+    try testing.expect(!streams.needs_gc_scan); // no scan left armed to notice later
+
+    try s.send.writeData("200 OK");
+    s.send.close();
+    var out: [1500]u8 = undefined;
+    _ = try packAppOnly(&packer, &pkt_handler, &crypto_mgr, &streams, &pending_frames, &out);
+    try testing.expect(s.send.fin_sent);
+    try testing.expect(s.closed_for_gc);
+    try testing.expectEqual(@as(u64, 1), streams.consumed_bidi_streams);
+}
+
+test "PacketPacker: a sent packet records the control frames to repeat on loss" {
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, &[_]u8{0x01}, dcid, 0x00000001);
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    var pending_frames = frame_mod.PendingFrameQueue{};
+    pending_frames.push(.{ .ping = {} });
+    pending_frames.push(.{ .max_stream_data = .{ .stream_id = 3, .max = 9000 } });
+    pending_frames.push(.{ .reset_stream = .{ .stream_id = 7, .error_code = 1, .final_size = 40 } });
+
+    var out_buf: [1500]u8 = undefined;
+    try testing.expect(try packAppOnly(&packer, &pkt_handler, &crypto_mgr, &streams, &pending_frames, &out_buf) > 0);
+
+    var sent_it = pkt_handler.sent[2].sent_packets.iterator();
+    const sent = sent_it.next().?;
+    const records = sent.getControlFrames();
+    // PING is never repeated, so it is not recorded.
+    try testing.expectEqual(@as(usize, 2), records.len);
+    try testing.expectEqual(@as(u64, 3), records[0].max_stream_data);
+    try testing.expectEqual(@as(u64, 40), records[1].reset_stream.final_size);
+}
+
+test "PacketPacker: control frames past one packet wait for the next" {
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, &[_]u8{0x01}, dcid, 0x00000001);
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+
+    // More RESET_STREAMs than one packet may record, and more NEW_TOKENs
+    // than one packet can hold: none may be lost to a full packet.
+    var pending_frames = frame_mod.PendingFrameQueue{ .allocator = testing.allocator };
+    defer pending_frames.deinit();
+    var id: u64 = 0;
+    while (id < 10) : (id += 1) {
+        try testing.expect(pending_frames.tryPush(.{ .reset_stream = .{ .stream_id = id * 4 + 2, .error_code = 0, .final_size = 0 } }));
+    }
+    var tok: frame_mod.PendingControlFrame = .{ .new_token = .{} };
+    tok.new_token.token_len = 92;
+    var n: usize = 0;
+    while (n < 20) : (n += 1) try testing.expect(pending_frames.tryPush(tok));
+
+    var out_buf: [1500]u8 = undefined;
+    var packets: usize = 0;
+    var resets: usize = 0;
+    var tokens: usize = 0;
+    while (pending_frames.len > 0) : (packets += 1) {
+        if (packets > 30) return error.TestUnexpectedResult;
+        const written = try packAppOnly(&packer, &pkt_handler, &crypto_mgr, &streams, &pending_frames, &out_buf);
+        try testing.expect(written > 0 and written <= packer.max_packet_size);
+    }
+    var sent_it = pkt_handler.sent[2].sent_packets.iterator();
+    while (sent_it.next()) |p| {
+        try testing.expect(p.control_frame_count <= ack_handler.MAX_CONTROL_FRAMES_PER_PACKET);
+        for (p.getControlFrames()) |cf| switch (cf) {
+            .reset_stream => resets += 1,
+            .new_token => tokens += 1,
+            else => {},
+        };
+    }
+    try testing.expectEqual(@as(usize, 10), resets);
+    try testing.expectEqual(@as(usize, 20), tokens);
+}
+
+/// A server's 1-RTT side holding one ack-eliciting packet it has not
+/// acknowledged, received at t=1000.
+const AckRig = struct {
+    packer: PacketPacker,
+    pkt_handler: ack_handler.PacketHandler,
+    crypto_mgr: crypto_stream.CryptoStreamManager,
+    streams: stream_mod.StreamsMap,
+    pending_frames: frame_mod.PendingFrameQueue = .{},
+    dq: conn_mod.DatagramQueue = .{},
+
+    fn init(self: *AckRig) !void {
+        const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+        self.* = .{
+            .packer = PacketPacker.init(testing.allocator, true, &[_]u8{0x01}, dcid, 0x00000001),
+            .pkt_handler = ack_handler.PacketHandler.init(testing.allocator),
+            .crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator),
+            .streams = stream_mod.StreamsMap.init(testing.allocator, true),
+        };
+        self.streams.setMaxStreams(10, 10);
+        self.streams.setPeerInitialMaxStreamData(65536, 65536, 65536);
+        try self.pkt_handler.recv[2].onPacketReceived(0, true, 1000, 0, 0);
+    }
+
+    fn deinit(self: *AckRig) void {
+        self.dq.deinitQueue(testing.allocator);
+        self.streams.deinit();
+        self.crypto_mgr.deinit();
+        self.pkt_handler.deinit();
+    }
+
+    fn pack(self: *AckRig, out: []u8, now: i64) !usize {
+        const keys = try testServerKeys();
+        return self.packer.packCoalesced(out, &self.pkt_handler, &self.crypto_mgr, &self.streams, &self.pending_frames, null, null, null, &keys.seal, now, &self.dq, false);
+    }
+
+    /// The largest packet number the last packet sent acknowledged, if any.
+    /// Only packets in flight leave a record to read it from.
+    fn lastAcked(self: *AckRig) ?u64 {
+        const last = self.pkt_handler.next_pn[2] - 1;
+        var it = self.pkt_handler.sent[2].sent_packets.iterator();
+        while (it.next()) |p| if (p.pn == last) return p.largest_acked;
+        unreachable;
+    }
+};
+
+test "PacketPacker: an ACK not yet due makes no packet of its own" {
+    var rig: AckRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    var out: [1500]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try rig.pack(&out, 1000));
+    try testing.expectEqual(@as(u64, 0), rig.pkt_handler.next_pn[2]);
+    try testing.expect(rig.pkt_handler.hasUnackedAckEliciting(.application));
+
+    // Its alarm sends it alone.
+    const alarm = rig.pkt_handler.recv[2].ack_alarm.?;
+    try testing.expect(try rig.pack(&out, alarm) > 0);
+    try testing.expect(!rig.pkt_handler.hasUnackedAckEliciting(.application));
+}
+
+test "PacketPacker: an ACK not yet due rides on a datagram" {
+    var rig: AckRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    try testing.expect(rig.dq.push(testing.allocator, "state"));
+    var out: [1500]u8 = undefined;
+    try testing.expect(try rig.pack(&out, 1000) > 0);
+    try testing.expectEqual(@as(?u64, 0), rig.lastAcked());
+    try testing.expect(!rig.pkt_handler.hasUnackedAckEliciting(.application));
+    try testing.expectEqual(@as(?i64, null), rig.pkt_handler.recv[2].ack_alarm);
+    try testing.expectEqual(@as(u64, 1), rig.pkt_handler.next_pn[2]);
+}
+
+test "PacketPacker: a stream filling the packet leaves the ACK room" {
+    var rig: AckRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const s = try rig.streams.getOrCreateStream(0);
+    const body: [4000]u8 = @splat('x');
+    try s.send.writeData(&body);
+    var out: [1500]u8 = undefined;
+    const first = try rig.pack(&out, 1000);
+    try testing.expect(first > 0 and first <= rig.packer.max_packet_size);
+    try testing.expectEqual(@as(?u64, 0), rig.lastAcked());
+    // Nothing more owed: the next packet is all stream data.
+    const second = try rig.pack(&out, 1000);
+    try testing.expectEqual(rig.packer.max_packet_size, second);
+    try testing.expectEqual(@as(?u64, null), rig.lastAcked());
+}
+
+test "PacketPacker: Initial packets are acknowledged at once" {
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(testing.allocator, false, &[_]u8{0x01}, dcid, 0x00000001);
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+    var pending_frames = frame_mod.PendingFrameQueue{};
+    try pkt_handler.recv[0].onPacketReceived(0, true, 1000, 0, 0);
+
+    const keys = try testClientKeys();
+    var out: [1500]u8 = undefined;
+    const written = try packer.packCoalesced(&out, &pkt_handler, &crypto_mgr, &streams, &pending_frames, &keys.seal, null, null, null, 1000, null, false);
+    try testing.expect(written > 0);
+    try testing.expect(!pkt_handler.hasUnackedAckEliciting(.initial));
+}
+
+test "PacketPacker: a datagram filling the packet leaves the ACK for later" {
+    var rig: AckRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    // 1174 bytes of plaintext past a 10-byte header: the frame takes 1173.
+    const big: [1170]u8 = @splat('s');
+    try testing.expect(rig.dq.push(testing.allocator, &big));
+    var out: [1500]u8 = undefined;
+    const written = try rig.pack(&out, 1000);
+    try testing.expect(written > 0 and written <= rig.packer.max_packet_size);
+    try testing.expect(rig.dq.isEmpty());
+    try testing.expectEqual(@as(?u64, null), rig.lastAcked());
+    try testing.expect(rig.pkt_handler.hasUnackedAckEliciting(.application));
+}
+
+/// The frames of a 1-RTT packet the rig sealed, decrypted in place.
+fn openRigPacket(pkt: []u8, pn: u64) ![]u8 {
+    const keys = try testClientKeys(); // the client opens what the server seals
+    const pn_offset = 1 + 8;
+    const pn_len = crypto_mod.removeHeaderProtection(pkt, pn_offset, keys.open.hp_key, keys.open.cipher_suite);
+    const header_len = pn_offset + pn_len;
+    return keys.open.decryptPayload(pn, pkt[0..header_len], pkt[header_len..]);
+}
+
+/// The payloads of the DATAGRAM frames in `frames`, and where among the
+/// frames the first DATAGRAM and the first STREAM sat.
+fn datagramsIn(frames: []u8, out: [][]const u8) !struct { n: usize, datagram_at: ?usize, stream_at: ?usize } {
+    var n: usize = 0;
+    var datagram_at: ?usize = null;
+    var stream_at: ?usize = null;
+    var at: usize = 0;
+    var i: usize = 0;
+    while (at < frames.len) : (i += 1) {
+        var size: usize = undefined;
+        const data = switch (try Frame.parseSized(frames[at..], &size)) {
+            .datagram => |d| d.data,
+            .datagram_with_length => |d| d.data,
+            .stream => blk: {
+                if (stream_at == null) stream_at = i;
+                break :blk null;
+            },
+            else => null,
+        };
+        at += size;
+        out[n] = data orelse continue;
+        if (datagram_at == null) datagram_at = i;
+        n += 1;
+    }
+    return .{ .n = n, .datagram_at = datagram_at, .stream_at = stream_at };
+}
+
+test "PacketPacker: a datagram no packet of the path holds is dropped, not left to block the rest" {
+    var rig: AckRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    // Queued when the path took bigger packets; 10 + 1193 + 16 is past 1200 now.
+    const stranded: [1190]u8 = @splat('s');
+    try testing.expect(rig.dq.push(testing.allocator, &stranded));
+    try testing.expect(rig.dq.push(testing.allocator, "behind it"));
+
+    var out: [1500]u8 = undefined;
+    const written = try rig.pack(&out, 1000);
+    try testing.expect(written > 0);
+    try testing.expect(rig.dq.isEmpty());
+    try testing.expectEqual(@as(u64, 1), rig.dq.expired);
+    var got: [4][]const u8 = undefined;
+    const found = try datagramsIn(try openRigPacket(out[0..written], 0), &got);
+    try testing.expectEqual(@as(usize, 1), found.n);
+    try testing.expectEqualStrings("behind it", got[0]);
+}
+
+test "PacketPacker: a datagram that fits only a packet of its own waits for one" {
+    var rig: AckRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const s = try rig.streams.getOrCreateStream(0);
+    try s.send.writeData(&(@as([100]u8, @splat('x'))));
+    const big: [1150]u8 = @splat('b');
+    try testing.expect(rig.dq.push(testing.allocator, &big));
+
+    var out: [1500]u8 = undefined;
+    try testing.expect(try rig.pack(&out, 1000) > 0);
+    try testing.expectEqual(@as(usize, 1), rig.dq.queueLen());
+    const written = try rig.pack(&out, 1000);
+    try testing.expect(rig.dq.isEmpty());
+    try testing.expectEqual(@as(u64, 0), rig.dq.expired);
+    var got: [4][]const u8 = undefined;
+    const found = try datagramsIn(try openRigPacket(out[0..written], 1), &got);
+    try testing.expectEqual(@as(usize, big.len), got[0].len);
+    try testing.expectEqual(@as(usize, 1), found.n);
+}
+
+test "PacketPacker: datagrams_first packs a datagram ahead of a backlogged stream" {
+    var rig: AckRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const s = try rig.streams.getOrCreateStream(0);
+    try s.send.writeData(&(@as([8000]u8, @splat('x'))));
+    // About a game's hot update: more than the room streams leave for an ACK.
+    const update: [200]u8 = @splat('u');
+    try testing.expect(rig.dq.push(testing.allocator, &update));
+    var out: [1500]u8 = undefined;
+    var got: [4][]const u8 = undefined;
+
+    // By default the stream fills the packet and the datagram waits behind it.
+    var written = try rig.pack(&out, 1000);
+    var found = try datagramsIn(try openRigPacket(out[0..written], 0), &got);
+    try testing.expectEqual(@as(usize, 0), found.n);
+    try testing.expect(found.stream_at != null);
+    try testing.expectEqual(@as(usize, 1), rig.dq.queueLen());
+
+    rig.packer.datagrams_first = true;
+    written = try rig.pack(&out, 1000);
+    found = try datagramsIn(try openRigPacket(out[0..written], 1), &got);
+    try testing.expectEqual(@as(usize, 1), found.n);
+    try testing.expectEqualSlices(u8, &update, got[0]);
+    try testing.expect(found.datagram_at.? < found.stream_at.?);
+    try testing.expect(rig.dq.isEmpty());
+    // The stream still fills what the datagram left.
+    try testing.expect(written + 32 >= rig.packer.max_packet_size);
+}
+
+test "PacketPacker: streams are walked only while one may have something to send" {
+    var rig: AckRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    var out: [1500]u8 = undefined;
+    const s = try rig.streams.getOrCreateStream(0);
+    const ledger = rig.streams.send_ledger.?;
+
+    // Bytes slipped in behind the stream's methods raise nothing: not found.
+    try s.send.write_buffer.appendSlice(testing.allocator, "hidden");
+    s.send.write_offset += 6;
+    try testing.expectEqual(@as(usize, 0), try rig.pack(&out, 1000));
+    try testing.expectEqual(@as(u64, 0), s.send.send_offset);
+
+    // A close raises it, and the walk finds them with the FIN.
+    s.send.close();
+    try testing.expect(try rig.pack(&out, 1000) > 0);
+    try testing.expect(s.send.fin_sent and s.send.send_offset == 6);
+    // A walk finding nothing lowers it again.
+    try testing.expectEqual(@as(usize, 0), try rig.pack(&out, 1000));
+    try testing.expect(!ledger.send_due);
+
+    // A write raises it.
+    const w = try rig.streams.getOrCreateStream(4);
+    try w.send.writeData("abc");
+    try testing.expect(try rig.pack(&out, 1000) > 0);
+    try testing.expectEqual(@as(u64, 3), w.send.send_offset);
+    _ = try rig.pack(&out, 1000);
+    try testing.expect(!ledger.send_due);
+
+    // So does a loss.
+    w.send.queueRetransmit(0, 3, false);
+    try testing.expect(try rig.pack(&out, 1000) > 0);
+    try testing.expect(!w.send.hasRetransmitData());
+}
+
+test "PacketPacker: a more urgent unidirectional stream goes ahead of requests" {
+    // Bidirectional streams were always packed first, so an HTTP/3 client's
+    // SETTINGS and QPACK streams followed its CONNECT in the same packet.
+    // imquic answers the CONNECT before it reads on, and took the streams
+    // behind it for WebTransport ones.
+    for ([_]u3{ 0, 3 }) |uni_urgency| {
+        const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+        var packer = PacketPacker.init(testing.allocator, false, &[_]u8{0x01}, dcid, 0x00000001);
+        var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+        defer pkt_handler.deinit();
+        var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+        defer crypto_mgr.deinit();
+        var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+        defer streams.deinit();
+        var pending_frames = frame_mod.PendingFrameQueue{};
+        streams.setMaxStreams(10, 10);
+        streams.setPeerInitialMaxStreamData(65536, 65536, 65536);
+
+        const req = try streams.openBidiStream();
+        try req.send.writeData("CONNECT");
+        const ctrl = try streams.openUniStream();
+        ctrl.urgency = uni_urgency;
+        try ctrl.writeData("SETTINGS");
+
+        var out_buf: [1500]u8 = undefined;
+        _ = try packAppOnly(&packer, &pkt_handler, &crypto_mgr, &streams, &pending_frames, &out_buf);
+        const app_idx = @backingInt(ack_handler.EncLevel.application);
+        var it = pkt_handler.sent[app_idx].sent_packets.iterator();
+        const sf = it.next().?.getStreamFrames();
+        try testing.expectEqual(@as(usize, 2), sf.len);
+        // Urgency 0 beats the request's default 3; a tie keeps requests first.
+        const first: u64 = if (uni_urgency < req.send.urgency) ctrl.stream_id else req.send.stream_id;
+        try testing.expectEqual(first, sf[0].stream_id);
+    }
+}

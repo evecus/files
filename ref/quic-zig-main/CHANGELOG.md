@@ -1,0 +1,776 @@
+# Changelog
+
+Notable changes to quic-zig. Versions follow [semantic versioning](https://semver.org);
+`Unreleased` collects what has landed on `main` since the last tag.
+
+## Unreleased
+
+### Added
+
+- `onHttpHead`, `onHttpBody`, `onHttpEnd` and `onHttpGone`: a handler takes
+  each request at its head, its body as it arrives (sized or chunked), and
+  answers in one go or streamed (`event_loop.Exchange`), over HTTP/1.1 and
+  HTTP/3 alike. `onHttpWritable` paces a long answer.
+- `quic.Mailbox`: work handed back to a loop's thread from other threads.
+  An exchange carries its loop's (`Exchange.mailbox`); a server stopping
+  waits for what's owed.
+- `sys.connect` and `sys.connectState`: nonblocking TCP connects on every
+  platform, for TCP clients.
+- `Config.new_while_draining`: a draining server hands a new connection's
+  first datagram to one still taking connections, rather than refusing it,
+  so a reload beside it under `reuse_port` turns no one away.
+- **MoQ Transport draft-22**, beside 17 and 18: the relay serves each peer at
+  the draft it asks for, and `moq-test-client` offers all three, newest first.
+  `ClientConfig.alpns` lets a native-QUIC client offer several ALPNs.
+- The MoQ relay answers draft-18 SUBSCRIBE_TRACKS with a PUBLISH for every
+  matching track, present and future, and refuses overlapping namespace
+  subscriptions with PREFIX_OVERLAP.
+- `moq-test-client` runs the interop runner's `subscribe-namespace-lifecycle`,
+  `publish-namespace-multi-publisher-retention` and `data-subgroup-basic`.
+- `moq.object.writeSubgroupObject` and `readSubgroupObject`, and
+  `ClientSession.resetQuicStream` and `stopSendingQuicStream` for native-QUIC
+  clients.
+
+### Changed
+
+- A WebSocket's answers to frames that arrive together leave in one send,
+  not a syscall each: pipelined echo runs 6× faster or more. In
+  `onWsMessage`, `uncork` now sends with the rest of that read's answers.
+- Built and tested with Zig 0.17.1. Nothing needed changing, and 0.17.0
+  still builds it.
+- `moq.session.Event.namespace_done` carries the namespace suffix.
+
+### Fixed
+
+- The MoQ relay subscribed upstream for Largest Object whatever its
+  subscriber asked for, so a publisher could start past objects the
+  subscriber wanted. It now forwards the subscriber's filter, or none.
+- A namespace withdrawn by finishing its PUBLISH_NAMESPACE stream, as moq-net
+  does on drafts 17 and 18, is now withdrawn at the relay, and its
+  subscribers hear NAMESPACE_DONE.
+- The relay no longer drops a group or datagram that arrives before the
+  publisher's SUBSCRIBE_OK; it waits up to 2 s for the alias.
+- The MoQ relay answers every REQUEST_UPDATE, as both drafts require, and
+  resumes a publication that started paused once a subscriber wants objects.
+- NAMESPACE_DONE reaches subscribers even when another publisher holds a
+  shorter prefix of the namespace, and the relay's group cache no longer mixes
+  two groups that arrive at once.
+
+## 0.6.0
+
+Ready for the open internet: the fixes from a security review, a cap on each
+source's handshakes, JA4 fingerprints and source filters that refuse a client
+before key exchange, and `drain()` for a graceful exit. quic-zig now needs Zig
+0.17 and runs natively on Windows, and gains TLS 1.3 over TCP, SNI, RSA and
+client certificates, shared event loops and connection handover between servers.
+
+### Added
+
+- Windows. The library, its tests and the apps build and run natively: sockets
+  on Winsock, the event loop on libxev's IOCP backend. ECN is not read or set
+  on Windows yet. See [SPEC/STATUS.md](SPEC/STATUS.md#platforms).
+- JA4 client fingerprints. Set `fingerprint_filter` in `tls_server.Config`
+  or a QUIC server's `TlsConfig`, and each connection's first ClientHello
+  is fingerprinted and offered to it before any key exchange; false fails
+  the handshake. `fingerprint()` on the connection or `Session` returns it,
+  and `quic.ja4.compute` takes one from any ClientHello.
+- `Config.source_filter`: a server asks it before an Initial opens a
+  connection, and drops the datagram without a reply when it says no, so a
+  denylist costs a banned client neither a Retry nor a handshake.
+- A server can hand a live connection, streams and WebTransport sessions
+  included, to a sibling server on another thread sharing its port
+  (`Session.handOver`, `Server.adopt`, a shared `Config.moved_cids`); the
+  client is moved onto CIDs naming the new server. See QUIC-LB.md.
+- Client certificates (mutual TLS) for QUIC servers and `tls_server`: give a
+  certificate entry a `ClientAuth` (CA bundle, `.required` or `.optional`)
+  and clients reaching it by SNI are asked for a certificate, verified
+  against the bundle, and readable through `peerCertificate()` on the
+  connection or `Session`. No session tickets are issued or accepted under
+  it. `tls_client` and the QUIC client present `client_certificate` when a
+  server asks.
+- `quic.tls_client`, a sans-IO TLS 1.3 client for TLS over TCP, the
+  counterpart of `tls_server`. It verifies the server (chain, host name or IP
+  address, CertificateVerify with ECDSA, Ed25519 or RSA-PSS) against the
+  platform's trust store, or a `ca_bundle` you give it, unless
+  `skip_cert_verify` is set. It does SNI and ALPN, and holds data written
+  before the handshake finishes. No resumption or 0-RTT.
+- `quic.tls_server`, a sans-IO TLS 1.3 server for TLS over TCP: feed it the
+  bytes you read and send what it queues, from any event loop. It negotiates
+  AES-GCM or ChaCha20, X25519 or P-256 (with HelloRetryRequest), picks the
+  certificate by SNI, and can resume sessions from tickets.
+- A QUIC server can serve several certificates and pick one by SNI, via
+  `TlsConfig.certs`.
+- QUIC servers answer a ClientHello with no key share they can use with a
+  HelloRetryRequest for X25519 or P-256, so OpenSSL clients configured with
+  `Groups = X25519MLKEM768:X25519` (a share for the first group only) connect.
+  The QUIC client follows one too, and `TlsConfig.key_share_groups` sets the
+  shares its first ClientHello sends.
+- RSA server certificates, for QUIC and `tls_server`: 2048 to 4096-bit keys in
+  PKCS#1 or PKCS#8, signing with RSA-PSS. `tls13.extractPrivateKey` reads EC,
+  Ed25519 and RSA keys. When several certificates match a name, the server
+  picks one whose key the client can verify.
+- `Server` can join an event loop you own through `Config.loop`, next to your
+  own sockets, timers and `Client`s. `stop()` then leaves the loop running, and
+  `isStopped()` says when `deinit()` is safe; `Client` gained the same
+  `isStopped()`, so one of several clients on a loop can be torn down alone.
+- HTTP/3 responses can be streamed: `sendResponseHeaders` (repeatable for 1xx),
+  `sendResponseData`, `finishResponse` with optional trailers, and
+  `resetRequest` to abort. Calls out of that order return an error rather
+  than sending the peer a malformed response. `notifyWritable` and `streamBufferedBytes` now work
+  on request streams, so a body can be paced against the peer.
+- New optional server callbacks: `onRequestEnd` when a request body is
+  complete, `onRequestCancelled` when the peer resets the request or stops the
+  response, and `onConnectionClosed` once per connection before it is freed.
+  `Session.id()` gives each connection a stable key.
+- A `.webtransport` server also serves ordinary HTTP/3 requests through
+  `onRequest` / `onData` / `onRequestEnd`, so one listener can do both.
+- `Config.reuse_port`, `recv_buffer_size` / `send_buffer_size`,
+  `max_connections` (default still 256) and `alpn`.
+- Writes made outside a `Server` or `Client` callback — from a TCP callback on
+  a shared loop, say — are sent on the next loop iteration without calling
+  `flush()`.
+- `Server.drain()` shuts an HTTP/3 server down gracefully: GOAWAY on every
+  connection, new connections refused, in-flight requests allowed to finish.
+  Poll `isDrained()` against your own deadline, then call `stop()`.
+- `Session.pauseRequestBody` / `resumeRequestBody` hold back a request body
+  through flow control, so a proxy with a slow upstream no longer has to
+  buffer the whole upload.
+- `pauseStream` / `resumeStream` on `Session` and `ClientSession` do the same
+  for WebTransport streams: `onStreamData` stops for that stream and the peer
+  is held back by its window until you resume, so a relay between two
+  sessions need not buffer for its slower side.
+- Clients get an optional `onRequestCancelled` when the server resets a
+  request, including the H3_REQUEST_REJECTED that follows a GOAWAY.
+- Workers sharing a port with `reuse_port` can pass a migrated client's
+  packets to the worker that owns its connection instead of resetting it:
+  give each worker its own id in `Config.quic_lb`, and hand what
+  `Config.foreign_datagram` reports to the owner's `Server.injectDatagram`.
+  See QUIC-LB.md.
+- `Config.retry_threshold` makes new clients validate their address with a
+  Retry once that many connections are live, and `Server.setRequireRetry`
+  switches it on for load signals of your own.
+- `Config.stateless_reply_rate` caps Version Negotiation, stateless reset and
+  CONNECTION_REFUSED replies per second, each kind separately (default 200).
+- `websocket.min_receive_rate` (default 500 bytes/s): a WebSocket peer holding a
+  half-sent message, or leaving its output unread, must keep up this rate or is
+  dropped as silent. `0` counts any byte as a sign of life.
+- `Connection.sendBufferedBytes()` and `Session.sendBufferedBytes()`: bytes
+  written to all of a connection's streams and not yet sent.
+- C API: `ERR_INVALID_ARG` (-6) for a NULL handle, or a NULL pointer with a
+  non-zero length.
+- `Config.max_handshakes`: past that many connections still in their
+  handshake, a new client must answer a Retry before it gets any state. It
+  defaults to a quarter of `max_connections`.
+- `ConnectionConfig.handshake_timeout` (default 10 s): a handshake not done in
+  that time closes the connection, client or server.
+- `Session.rejectSession(id, status)` (C: `qz_session_reject`) refuses a
+  WebTransport session with an HTTP status and leaves the connection's other
+  sessions open.
+- `ConnectionConfig.datagrams_before_streams` (or `Config.datagrams_before_streams`
+  on a server) packs datagrams ahead of stream data, so a backlogged stream no
+  longer holds them back. Off by default.
+- `WsConn.rtt()`: the kernel's smoothed round trip for a WebSocket's TCP
+  connection, in nanoseconds (Linux and macOS).
+- `onSessionClosed` may take a sixth parameter, `abrupt` (and
+  `WtEvent.session_closed` has the field): true when the peer reset or stopped
+  the session's CONNECT stream, or sent it a malformed capsule, instead of
+  closing it. That is when a browser rejects `closed` rather than resolving it.
+- A connection closes once the WebTransport sessions it carried are over and
+  no HTTP/3 request is open: GOAWAY, then CONNECTION_CLOSE with H3_NO_ERROR
+  when the peer has the end of its sessions, or after 3 PTO. Chrome leaves
+  such a connection without a word, so the server used to hold it for the
+  idle timeout. `wt_close_after_sessions` (on, server and client) turns it off
+  for a client that pools sessions with plain requests.
+- `Session.drainConnection()` drains one connection as `Server.drain()`
+  drains them all, and `drain()` takes `DrainOptions`: `.signal_peers = false`
+  refuses newcomers without the GOAWAY and WT_DRAIN_SESSION, for an
+  application that tells its clients itself. C: `qz_server_drain`,
+  `qz_server_is_drained`, `qz_session_drain`, `qz_client_drain`.
+- The conformance suite runs Playwright's WebKit headless (`--webkit`), keys
+  its expected failures by browser version, and has a `server-goaway`
+  scenario.
+
+### Changed
+
+- **Breaking:** quic-zig now needs Zig 0.17.0; 0.16 no longer builds it.
+- **Breaking:** when a connection ends, `onSessionClosed` reports each
+  WebTransport session it still held, once, by its own id: our close with its
+  code, any other as `abrupt`. It used to fire once with session 0, a real id,
+  for every connection, sessions or not. A handler that freed per-connection
+  state there should do it in `onConnectionClosed`. Clients now report it too,
+  and a CONNECT still waiting on its answer as `onSessionRejected`.
+- **Breaking:** a closed WebTransport session takes no new stream or datagram
+  and its streams take no writes: `error.SessionGone`. Its streams are reset
+  even after their FIN, so a last message can't ride out on a close: FIN it,
+  and let the side that read it end the session. `sendStreamData` writes only
+  WebTransport streams, and `acceptSession` only a session not yet answered.
+- **Breaking:** `Server.drain()` takes `DrainOptions` (`drain(.{})` as before),
+  closes no connection in use, raw QUIC and HTTP/0.9 included, and closes the
+  HTTP/1.1 listener's socket instead of accepting connections to close them.
+  `isDrained()` also waits for WebSockets. Its GOAWAY waits for the peer to ack
+  each session's 200 and drain capsule: one right behind the 200 can crash
+  Firefox 158. `stop()` closes HTTP/3 connections with H3_NO_ERROR, and both
+  may be called from the handler's callbacks, `onPass` included.
+- C API: SESSION_CLOSED carries `abrupt` in flags bit 0, every client gets
+  CLIENT_DISCONNECTED after its sessions' SESSION_CLOSED, and a send on a
+  closed session returns `ERR_SESSION_GONE`.
+- **Breaking:** the event-loop `Client` now verifies servers against the
+  platform's trust store by default (`ClientConfig.ca = .system`, loaded once
+  per process), and a server whose chain ends at no trusted anchor is refused.
+  `.ca = .none` is gone. `tls13.TlsConfig.skip_cert_verify` now defaults to
+  `false`, and verifying with neither `ca_bundle` nor `cert_hashes` fails.
+  `skip_cert_verify = true` still accepts any certificate, now whatever `ca`
+  says.
+- A server opens a new client's first Initial before giving it any state, so
+  datagrams that only look like Initials no longer hold a connection slot.
+- A QUIC server now aborts with `missing_extension` when a ClientHello without
+  a PSK has no `signature_algorithms`, and with `handshake_failure` when it
+  offers no scheme for the certificate, instead of signing anyway.
+- A server at `max_connections` now answers new clients with
+  CONNECTION_REFUSED instead of ignoring them until they time out.
+- Request headers, and a CONNECT's path, are valid only during their callback:
+  every connection on an event loop decodes into one buffer. Copy what you keep.
+- HTTP/3 requests are held to RFC 9114: connection-specific fields, a second
+  request on one stream and a body that disagrees with `content-length` are
+  refused.
+- WebTransport endpoints hold peers to the QPACK table capacity they advertise,
+  which is zero.
+- Servers under `reuse_port` that share a `static_reset_key` send no stateless
+  resets unless `foreign_datagram` steers packets to their owner.
+- The HTTP/1.1 listener stops reading from a connection while more than 256 KiB
+  of its responses are unsent.
+- C API: `qz_server_poll` hands out stream data in parts when it doesn't fit
+  the buffer (FIN on the last part), drops a datagram that doesn't fit and
+  refuses a CONNECT whose path doesn't. Past 1 MiB queued for a client, its
+  streams are paused until the host catches up.
+- MoQ relays drop a subscriber more than 1 MiB behind on a group
+  (TOO_FAR_BEHIND in the MoQT relay), and the MoQT relay refuses namespaces
+  whose key would pass 256 bytes (NAMESPACE_TOO_LARGE).
+- Handling an ACK now costs what it acknowledges, not a pass over every
+  packet in flight: 14× less with 512 packets in flight, 184× with 8192.
+- The event loop's server and client look for flow-control frames to send
+  once per burst of packets instead of before every packet: 4% less CPU per
+  10 KB HTTP/3 response in routez. A send loop of your own gets the same from
+  `Connection.beginBurst` and `endBurst`.
+- A connection keeps up to two large send buffers that streams have drained
+  or finished with, and hands them to the next stream that needs one, instead
+  of freeing them. A server streaming large responses no longer maps, faults
+  in and unmaps a buffer for each burst: routez serves 1 MB HTTP/3 responses
+  26% faster, with 17% less CPU each. The buffers go when the connection has
+  no bidirectional streams left.
+- Outgoing datagrams now expire after max(1.25 × min RTT, 20 ms) unless
+  `setOutgoingDatagramMaxAge` sets an age; `null` restores that default rather
+  than meaning no limit. Expired ones count in `Stats.datagrams_expired_outgoing`.
+- `sendDatagram` fails with `error.DatagramTooLarge` for anything over
+  `maxDatagramPayloadSize()`, which now also respects the peer's
+  `max_datagram_frame_size`.
+- `tls_server` and `tls_client` key AES-128-GCM once per connection instead
+  of once per record: a 16 KB record seals in 2.8 µs, where std's AES-GCM
+  took 4.5 µs (8.7 µs under Zig 0.17), and routez serves 10 KB files over
+  HTTPS with 18% less CPU each. It costs about 1 KB per connection.
+
+### Fixed
+
+- A signal handler can now end `Server.run()`: call the new `requestStop()` or
+  `requestDrain()` there, or from another thread. `stop()`, as the README
+  showed, left an idle server's `run()` waiting forever. `Client.requestStop()`
+  too. Thanks @ChrisTrenkamp! [#48](https://github.com/endel/quic-zig/issues/48)
+
+- Bytes after a peer's WT_CLOSE_SESSION now reset the CONNECT stream with
+  H3_MESSAGE_ERROR whichever packet brings them; only the capsule's own read
+  was checked.
+- When both sides close a session at once, each reports its own close, as a
+  browser does; the peer's capsule could overwrite ours.
+- A client hears a drain once per session whether GOAWAY or WT_DRAIN_SESSION
+  brought it; GOAWAY reached only the first session.
+- A server's CONNECT that the peer resets before it is answered is reported
+  closed; its slot used to stay taken, and a later accept answered it 200.
+- A WebTransport session whose peer finished, reset or stopped the CONNECT
+  stream without a close capsule stayed open until the connection ended. A
+  bare FIN now closes it with code 0, answered with our own FIN, and a reset
+  or STOP_SENDING closes it as `abrupt`.
+- A client whose CONNECT the server reset without answering, as a quic-zig
+  server does past its session slots, now gets `onSessionRejected` with an
+  empty status instead of waiting out its idle timeout.
+- Close reasons over 1024 bytes are now cut at a UTF-8 character boundary;
+  cut mid-character, Firefox failed the session rather than report its code.
+- Unknown capsule types on a CONNECT stream are ignored, as RFC 9297 asks;
+  after our own close they reset the stream, which could cost the peer our
+  close code. A malformed capsule, or a peer's close reason over 1024 bytes or
+  not UTF-8, now ends the session with H3_MESSAGE_ERROR.
+- A WebTransport server's `closeSession` on a session it hadn't accepted made
+  the client close the whole connection, ending its other sessions too. It now
+  refuses the session with 403.
+- A queued datagram too large for any packet (about 1168–1199 bytes) blocked
+  every datagram behind it for good.
+- qlog traces now have a `packet_sent` event for every packet, under its own
+  type; coalesced packets and those sent while congestion-limited or closing
+  were missing.
+- A connection whose peer updated its keys a second time could stop dead,
+  every later packet dropped. OpenSSL, which updates again as soon as it may,
+  hit it from either side.
+- A client that heard nothing back during its handshake never gave up, since
+  each probe restarted the idle timer; it now closes after the idle timeout,
+  and `event_loop.Client.run()` returns once the connection closes, as
+  documented, rather than only after `stop()`. Past 60 s, an application
+  calling `onTimeout()` in a loop made the same client send ~38,000 probes a
+  second.
+- The QUIC client accepts servers with P-384 certificates.
+- QUIC servers choose AES-128-GCM over ChaCha20 when AES runs in hardware,
+  unless the client lists ChaCha20 first; OpenSSL clients always got ChaCha20.
+  No cipher suite in common is now `handshake_failure`, not `protocol_version`.
+- A peer's malformed certificate could crash the TLS and QUIC clients (an
+  out-of-bounds read in std's DER parser); certificates are now checked for
+  a well-formed structure before they are parsed.
+- A stream's send buffer now shrinks back to 64 KiB once a burst is
+  acknowledged, instead of holding its peak size (megabytes for a relay writing
+  ahead of a slow peer) until the stream closes.
+- On macOS/BSD, a busy event loop could log "invalid state in submission queue"
+  and lose or double-queue a socket event. libxev now comes from the
+  [endel/libxev](https://github.com/endel/libxev/tree/kqueue-fixes) fork,
+  which carries the kqueue fix.
+- On macOS/BSD, a non-blocking loop tick (`.no_wait`) no longer leaves a
+  disarmed socket registered with kqueue, where it could fire again for a freed
+  completion.
+- Stateless resets now work in both directions: a client whose server lost the
+  connection (after an idle timeout or restart) stops sending and closes instead of
+  retransmitting until its own timeout, and a server drops a connection its
+  client reset. `Connection.received_stateless_reset` tells the two apart from
+  other closes.
+- A QPACK encoder- or decoder-stream instruction that arrived split across
+  two packets closed the connection; it is now held until the rest arrives.
+- A request or response body whose last packet overtook an earlier one could
+  lose the earlier data: the stream was freed once both FINs had crossed, and
+  the retransmission was then discarded. It now stays open until every byte
+  has arrived.
+- A MoQ relay now answers a subscriber that arrived before its publisher as
+  soon as the publisher sends PUBLISH, instead of leaving it to wait out its
+  rendezvous timeout. [#34](https://github.com/endel/quic-zig/pull/34)
+- HTTP/3 header sets over 4 KiB (large cookies) failed to encode; there is no
+  fixed limit now, and up to 128 headers are accepted instead of 64.
+- A Huffman-encoded header name or value that decodes past 4 KiB, such as a
+  large cookie from a browser, no longer closes the connection.
+- Peers that keep a QPACK dynamic table (Firefox, quic-go, ngtcp2) could
+  decode the wrong headers from us. The QPACK encoder is now static-only:
+  header blocks are larger, but always decode as sent.
+- QPACK Duplicate and dynamic Insert With Name Reference instructions from a
+  peer picked the wrong table entry, giving the wrong header or closing the
+  connection.
+- A malformed QPACK header block or encoder-stream instruction from a peer
+  could crash the process or read out of bounds; it now closes the connection.
+- An HTTP/3 body larger than one poll's worth could stall on the event-loop
+  client and server until the next packet arrived, and a response could lose
+  its tail once the stream was reclaimed.
+- `stop()` on an idle server that owns its loop now ends `run()` at once,
+  instead of waiting for the next packet.
+- Rescheduling a server or client timer right as it fired could corrupt
+  libxev's queue when the loop is run blocking (`.once`, `.until_done`).
+- A paused stream (WebTransport `pauseStream`, HTTP/3 `pauseRequestBody`)
+  receiving over a path that reorders packets no longer has its connection
+  closed with "too many reassembly gaps".
+- A peer can no longer send past a stream's flow-control window; it now gets
+  FLOW_CONTROL_ERROR instead of having the server buffer whatever it sends.
+- Peer-opened unidirectional streams (HTTP/3 control, WebTransport, MoQ)
+  stalled once their first 1 MiB was used, as their window was never raised.
+  A raw-QUIC server also stalled, or closed the connection, when a peer sent
+  faster than one read per loop pass.
+- Lost control frames — RESET_STREAM, STOP_SENDING, MAX_DATA,
+  MAX_STREAM_DATA, NEW_CONNECTION_ID and the like — are now resent, and a busy
+  connection no longer drops them when its queue fills. A lost window update
+  could stall a stream for good.
+- Hardening for servers on the open internet: an ACK for a packet never sent
+  or with malformed ranges closes the connection; a new connection needs a
+  full-size Initial with a DCID of at least 8 bytes; Version Negotiation is
+  sent only for full-size datagrams; a closing connection no longer answers
+  every packet with CONNECTION_CLOSE; stateless resets are not sent for small
+  packets; and CRYPTO buffering, received-packet tracking and the congestion
+  window are all bounded.
+- A client sending an oversized Retry token could crash a server that
+  requires Retry.
+- Trailers on an HTTP/3 request or response no longer close the connection
+  with H3_MESSAGE_ERROR. They are accepted, though not yet surfaced.
+- `Server.stop()` now refuses connections that arrive while it finishes;
+  under steady arrivals they could keep it from ever finishing.
+
+### Security
+
+A security review found about 70 issues, all fixed below except three that
+need a design decision. Thanks @notramo for suggesting it
+([#44](https://github.com/endel/quic-zig/issues/44)).
+
+- Reachable with one packet or handshake: a stack overflow from an oversized
+  PSK identity; an infinite loop on a PADDING frame type encoded longer than
+  needed; crashes on overflowing ACK Delay and ACK_FREQUENCY values; a
+  use-after-free through retired connection IDs; buffer overflows and path
+  traversal in the `hq-interop` file server; padding written past an
+  amplification-limited buffer; Retry and NEW_TOKEN tokens that didn't bind an
+  IPv4 client on a dual-stack socket.
+- TLS and the handshake: the QUIC client could finish a handshake without
+  verifying the server (an empty Certificate message); the server accepted
+  1-RTT data before the client's Finished; ServerHello extensions were read
+  past the message. Handshake connection IDs, transport parameters and CRYPTO
+  levels are now validated, and a QUIC v2 client no longer switches versions
+  on an unauthenticated header.
+- QUIC: reset streams inflated flow-control and stream credit; replayed 0-RTT
+  and duplicate packets were processed again; clients followed server address
+  changes, and unvalidated paths escaped the amplification limit; BLOCKED,
+  PATH_CHALLENGE and datagram floods could starve the server; `reuse_port`
+  workers sharing a reset key could leak stateless reset tokens.
+- HTTP/3 and WebTransport: a stalled WebTransport stream let later ones be
+  read as HTTP/3 requests; a closed session's streams reached the HTTP/3 and
+  QPACK parsers; session limits weren't enforced before answering 200; QPACK
+  decoded around errors and could be made to copy a table's worth per
+  encoder-stream byte; a kept header slice could show another client's headers.
+- HTTP/1.1 and WebSocket: a client that doesn't read grew the send queue, and a
+  WebSocket peer could pin a half-sent message by trickling bytes.
+- MoQ relays: any client could end any broadcast; namespaces could collide or
+  be empty; slots leaked on resets and failed subscriptions; a leaving
+  subscriber's group went to the next client in its slot; a reused track slot
+  could replay another track's cache; slow subscribers were queued for without
+  bound.
+- C API: the event queue had no bound, an event larger than the host's buffer
+  stalled every client, and NULL handles were dereferenced.
+- One host that answers Retry could fill a server's connection table with
+  handshakes it never finished, and one Retry token opened any number of
+  connections. A source (an IPv4 address or IPv6 /64) now holds at most
+  `Config.max_handshakes_per_source` handshakes once its address is proven,
+  and a Retry token admits only the connection it was issued for. Thanks
+  @wallace0409 ([#45](https://github.com/endel/quic-zig/issues/45)).
+- A peer that acknowledged nothing could run the server out of memory. Thanks
+  @wallace0409 ([#46](https://github.com/endel/quic-zig/issues/46)).
+
+## 0.5.0
+
+Servers that stay up: finished unidirectional streams are freed, a WebTransport
+writer can see its peer's flow-control credit and wait for it instead of
+queueing, and a peer can no longer grow stream reassembly without bound.
+
+### Added
+
+- WebTransport applications can tell when they are ahead of the peer's
+  flow-control credit. `sendCapacity` / `streamSendCapacity` report how much
+  more fits, and `notifyWritable` asks for an `onWritable` callback when there
+  is room again. A server writing to Safari, which never raises MAX_DATA, can
+  now hold instead of queueing without bound.
+
+### Fixed
+
+- Unidirectional streams we open are freed once the peer has all of their
+  data, or once they are reset. A server sending a stream per message kept
+  every message until the connection closed: 178 MiB after 40 s of Chrome's
+  firehose, where it now holds at 6 MiB.
+- A lost tail on a unidirectional stream is resent by the PTO probe instead of
+  waiting for loss detection. [#25](https://github.com/endel/quic-zig/issues/25)
+- A peer's STOP_SENDING on a unidirectional stream we opened closed the whole
+  connection with STREAM_STATE_ERROR; it now stops that stream. A late STREAM,
+  STOP_SENDING or MAX_STREAM_DATA for a stream we had already freed hit the
+  same error.
+- Resetting a unidirectional stream never told the peer, leaving its side of
+  the stream hanging.
+- RESET_STREAM gave the bytes written rather than the bytes sent as the final
+  size, so resetting a stream with data queued past the peer's window was a
+  flow-control violation on the peer's side.
+- A peer could burn a server's CPU and memory by sending stream data full of
+  gaps: nothing capped how many out-of-order pieces were buffered, and each
+  cost more to place than the last — 236 ms once 32k were held. A stream now
+  closes the connection past 1000 gaps, and CRYPTO data has a ceiling of its
+  own. [#24](https://github.com/endel/quic-zig/issues/24)
+- A malformed packet could crash a server on Linux.
+
+## 0.4.0
+
+WebTransport, held to what browsers actually do: one conformance suite that the
+Zig client and Chrome, Firefox and Safari all run against the same server, and
+the draft-13 session flow control Safari needs before it will open a stream.
+MoQ relay and certificate fixes ride along from the same cycle.
+
+### Fixed
+
+- A WebTransport connection never read its peer's SETTINGS. The WebTransport
+  layer looks at the peer's unidirectional streams before HTTP/3 does, and it
+  consumed the control stream's first read — SETTINGS and all. Nothing looked
+  broken (`webtransport_max_sessions` quietly read as 1, the QPACK dynamic
+  table stayed off) until a feature needed to know what the peer advertised.
+- Datagrams larger than 8 KB were dropped as decryption failures. A peer may
+  fill the path MTU, which on loopback is 16 KB, and the receive buffer was
+  8 KB: such a datagram arrived truncated and failed AEAD authentication. A
+  64 KB WebTransport stream write from Safari lost its first packets and
+  stalled for good. The buffer is now sized from the `max_udp_payload_size` we
+  advertise, and a datagram that still does not fit is reported as truncated
+  rather than left to surface as a decryption error.
+- Every browser lost the WebTransport session close code. Outgoing capsules
+  were written bare instead of inside an HTTP/3 DATA frame (RFC 9297 §3.2), so
+  peers discarded them as an unknown frame type and the session ended on the
+  FIN alone: Chrome and Safari timed out, Firefox reported `closeCode: 0`.
+- A peer's RESET_STREAM or STOP_SENDING on a WebTransport stream never reached
+  the application — the code was recorded and nothing was emitted, so a stream
+  died silently. `onStreamReset` and `onStopSending` now report it with the
+  application error code the peer sent.
+- The draft-13 `WT_MAX_SESSIONS` setting was never sent, despite a comment
+  saying it was emitted alongside the older codepoint. Safari 26.4 reads only
+  the new one.
+- A MoQ subscription through the relay never ended. Our relay ignored the
+  publisher's PUBLISH_DONE, so a subscriber sat waiting for objects that were
+  never coming — for moq-rs's test client, until its ten-second deadline. Each
+  subscriber is now told the publication has finished, with the number of data
+  streams the relay opened for it, and a publisher that disconnects without a
+  PUBLISH_DONE has one sent on its behalf.
+- The relay's WebTransport side answered no namespace discovery at all:
+  SUBSCRIBE_NAMESPACE was dropped, so a subscriber that waits to be told a
+  namespace exists before subscribing — moq-dev-rs's client does — never got
+  past it. The raw-QUIC side did answer, but parsed draft-18 with draft-17's
+  field list and sent the whole namespace where only the part after the
+  subscribed prefix belongs.
+- Every subgroup stream the relay forwarded said it did not start at the
+  subgroup's first object, whether or not it did; draft-18 §2.2 requires the
+  FIRST_OBJECT bit in exactly that case.
+- A parameter value the draft makes session-fatal — an undefined subscription
+  filter type, an unknown parameter type, a GROUP_ORDER or FORWARD outside its
+  range — is answered with the PROTOCOL_VIOLATION session close it asks for
+  rather than a REQUEST_ERROR. A peer sending one used to get an error that
+  read as "that track is malformed", which let a subscribe test pass on a
+  message we had never parsed.
+- Certificate validity was checked against the monotonic clock, whose zero is
+  the last boot, so every real certificate looked not-yet-valid and no chain
+  could verify — which is why `skip_cert_verify` was the only way to connect
+  anywhere. Session tickets carried the same timestamp, making a ticket
+  issued by one host meaningless to another, and one older than 49 days
+  aborted the process instead of wrapping.
+- A server asking for a client certificate ended the handshake. Cloudflare's
+  edge does, so `cdn.moq.dev` — and presumably any relay behind Cloudflare —
+  could not be reached at all, over either transport. The request is now
+  answered the way RFC 8446 says to when there is nothing to offer: with an
+  empty certificate. `cdn.moq.dev` now runs a full session over either
+  transport, verified against the system trust store.
+- A peer could abort the process before the handshake completed. A QUIC packet
+  whose Length field was below its packet number length read gigabytes past
+  the datagram, and one below the 16-byte AEAD tag tripped an assertion; an
+  Initial carrying a token of ~500 bytes or more overflowed the buffer the
+  associated data is built in; and a QPACK integer with a long enough
+  continuation run overflowed its accumulator, which any HTTP/3 peer can send.
+- A peer's QPACK encoder stream could corrupt our dynamic table. `Duplicate`
+  and `Insert With Name Reference` both name an entry the table already holds,
+  and inserting the copy can evict the original first — so the insert read
+  from the bytes it was overwriting. The visible effect is one header's value
+  filed under another header's name, which for a proxy means attributing a
+  request field it was never sent.
+- QPACK header encoding wrote past the end of its output buffer when the
+  headers did not fit. The size check only covered the first byte of each one.
+- Rejecting a peer's packet no longer logs at error level. An unsupported QUIC
+  version, a failed decryption and an undecryptable packet are ordinary events
+  a peer chooses, so a junk-packet flood was also a log flood.
+
+### Added
+
+- WebTransport session flow control (draft-ietf-webtrans-http3-13 §5.3-§5.6):
+  `WT_MAX_STREAMS`, `WT_MAX_DATA` and their `*_BLOCKED` partners. Safari 26.4
+  opens no client-initiated stream without them, so bidirectional and
+  unidirectional streams from Safari now work against a quic-zig server — nine
+  of the ten conformance scenarios it used to fail. Peers that do not speak
+  draft-13, Chrome and Firefox among them, see none of it.
+- `Session.peerSettings()` reports what the peer advertised in its HTTP/3
+  SETTINGS, which is what says which WebTransport draft it speaks.
+- A WebTransport conformance suite: one scenario list that the Zig client and
+  Chrome, Firefox and Safari all run against the same Zig server, so our own
+  client is held to the bar a browser sets. `./tools/wt_conformance.sh`; the
+  Zig leg runs in CI.
+- `ClientConfig.ca = .{ .pinned_hashes = … }` accepts a server by the SHA-256
+  of its leaf certificate, which is how a browser reaches a self-signed test
+  server — the `serverCertificateHashes` equivalent. CertificateVerify still
+  runs.
+- Server-side `Session.drainSession()`, so a Zig server can resolve a browser's
+  `WebTransport.draining` promise. It existed on the client only.
+- `ClientConfig.ca` loads trust anchors — `.system` for the platform store,
+  `.file` for a PEM bundle of your own — and turns certificate verification
+  on when set. The `ca_cert_path` it replaces had done nothing but log a
+  warning since the Zig 0.16 migration, so a client could not verify a server
+  against anything. `moq-lite` and `moq-test-client` now use the trust store
+  unless `--tls-disable-verify` is passed.
+- `ClientConfig.loop` joins an event loop instead of creating one, so several
+  clients share it and one `run()` drives them all. A client needing two
+  connections at once no longer means two loops and a caller spinning `tick()`
+  over both.
+- Randomized sweeps over the QUIC packet, frame, transport-parameter, HTTP/3
+  frame, QPACK, Huffman and capsule parsers, and over a connection fed a
+  stream of datagrams. They are what found the above; `zig build fuzz` runs
+  them. Zig 0.16's `-ffuzz` does not compile, so until it does this is the
+  only thing feeding those parsers bytes they did not expect.
+
+## 0.3.0
+
+Media over QUIC, in both dialects the ecosystem uses, and an interop client
+for the runner that tests them. Closes
+[#21](https://github.com/endel/quic-zig/issues/21).
+
+### Added
+
+- **MoQ Transport draft-18**, alongside draft-17 and chosen by ALPN per
+  peer, so a relay serves each client at the draft it asked for. draft-18
+  is what the MoQ interop runner targets.
+- **moq-lite** (draft-lcurley-moq-lite-05), the dialect `moq-relay`,
+  `cdn.moq.dev` and the `@moq/net` browser client actually speak. Wire and
+  message codecs, a session layer, and a `moq-lite` binary that publishes,
+  subscribes, discovers broadcasts, or serves as an origin. Verified in both
+  directions against `moq-relay` v0.14.16 and `moq-clock`, and from a browser.
+- **`moq-test-client`**, the interop client for
+  [moq-interop-runner](https://github.com/englishm/moq-interop-runner): seven
+  control-plane test cases over either transport, TAP 14 output, packaged as a
+  container. `tools/moq_interop.sh` runs it against a relay list. Registering
+  with the runner is prepared but not submitted — see `SPEC/moq-interop.md`.
+  [#21](https://github.com/endel/quic-zig/issues/21)
+- **WebTransport application-protocol negotiation** (`WT-Available-Protocols` /
+  `WT-Protocol`). Both moq-lite and moq-transport from draft-15 on choose their
+  wire version this way over WebTransport, so nothing browser-facing could
+  negotiate one before.
+- MoQ relays hold a `SUBSCRIBE` open when the subscriber asks them to, and
+  answer `DOES_NOT_EXIST` when it does not.
+- An event-loop handler can declare `poll_interval_ms` to be woken on a
+  cadence rather than only when the peer sends something.
+- A `.quic` handler receives QUIC datagrams, and MoQ objects can be
+  published over them (`moq-client --mode publish --datagrams`).
+- `Connection.negotiatedAlpn()` reports the protocol in force.
+- The WebTransport MoQ relay negotiates its draft per session and enforces
+  the same namespace rules as the raw-QUIC one.
+
+### Fixed
+
+- A TLS server that advertised several ALPN protocols echoed
+  `config.alpn[0]` to every client rather than the one that matched, so
+  the client and server could disagree about what they were speaking.
+- An event-loop client queued its `CONNECTION_CLOSE` and never flushed it,
+  so the connection ended with the process and the peer held the session
+  until its own idle timeout — half a minute of a server's capacity per
+  short-lived client.
+- The browser MoQ demos encoded `PUBLISH` without its request id, delta or
+  parameter count, and subscribed with no `RENDEZVOUS_TIMEOUT`.
+- **MoQ draft-17 control messages did not match the draft.** Most were
+  encode-only, so their round-trip tests agreed with a shape no peer spoke.
+  PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE, PUBLISH, REQUEST_UPDATE and FETCH
+  were missing their Request ID and Required Request ID Delta; GOAWAY its
+  Timeout, REQUEST_ERROR its Retry Interval, PUBLISH_DONE its Stream Count;
+  FETCH had no Fetch Type and so no joining form; FETCH_OK, PUBLISH_OK and
+  PUBLISH_BLOCKED had invented bodies; NAMESPACE_DONE carried nothing. The
+  error codes were a pre-draft-17 list that mixed the session and request
+  number spaces.
+- A MoQ peer could abort the process with one byte: a `GroupOrder` outside
+  `0x00`-`0x02` reached `@enumFromInt` in four decoders.
+- `decodeSubscribe` and `decodePublish` returned a track namespace that
+  pointed into their own stack frame.
+- The MoQ relay tracked stream roles in a 256-entry array indexed by stream
+  id, so a long-lived connection stopped being able to tell a control stream
+  from a subgroup header. It also read a connection pointer the event loop
+  had already freed.
+- `interop/runner/matrix.sh` removed every container on the machine between
+  test cases, not just its own.
+
+- Unidirectional receive streams were never freed. A connection kept a receive
+  buffer and its reassembly state for every uni stream it had ever accepted, so
+  anything that puts messages on uni streams — MoQ objects, WebTransport uni
+  streams — grew for the life of the connection. They are released once the
+  application has been handed the stream's FIN.
+- `RESET_STREAM` on a peer-initiated unidirectional stream was ignored
+  completely. The sender counts the whole final size against connection flow
+  control when it sends, so a reset stream permanently consumed that much of the
+  connection window; enough of them stall the connection. A retransmitted FIN on
+  a uni stream also counted twice against the stream limit.
+- A `STREAMS_BLOCKED` frame was answered with the limit the peer had just said
+  it was stuck at, which unblocks nothing. The peer is now granted the credit
+  its closed streams have earned, and the current limit is resent only when the
+  peer's view of it is behind ours.
+- A send stream held every byte it had ever sent until it closed, so a long
+  transfer held the whole transfer in memory. Acknowledged data is released as
+  it goes.
+- `closeConnection()` on a client session closed the connection but left the
+  run loop spinning forever, so a client that finished its work never exited.
+- A connection no longer holds on to the streams it has finished with. They were
+  marked closed but never removed, so a long-lived connection serving many
+  short-lived streams — a relay, a WebTransport session pulling byte ranges —
+  grew for its whole lifetime, and every PTO walked every stream it had ever
+  opened. Underneath, a stream that sent a FIN counted as unacknowledged forever,
+  because the FIN is not a byte and the check compared byte offsets; it is now
+  tracked from the flag on the acknowledged frame. HTTP/3's own per-stream
+  bookkeeping is pruned alongside. Reported in
+  [#29](https://github.com/endel/quic-zig/pull/29) — thanks @MKS2508!
+
+  8000 sequential HTTP/3 requests on one connection: 6364 live streams at the
+  end, now 6; peak server memory 18.3 MB above idle, now 2.8 MB; 3183 → 3623
+  requests/s.
+- Every server in `apps/` allocated from an arena, where freeing does nothing, so
+  a server's memory grew for as long as the process ran no matter what the
+  library released. They now use an allocator that reuses it. Clients keep the
+  arena; they exit.
+- PTO could push data past the peer's `MAX_STREAM_DATA`. It queued everything
+  from the last acknowledged byte to the last byte the *application* had written,
+  including bytes never sent, and the retransmit path is the one send path with
+  no window check of its own. quic-go closed our transfer with FLOW_CONTROL_ERROR
+  under the blackhole test.
+- The Application-space PTO ran before the handshake was confirmed, concluded
+  that 0-RTT data the peer had not yet had a chance to acknowledge was lost, and
+  re-sent every early request at 1-RTT — spending the round trip 0-RTT exists to
+  save. RFC 9002 §6.2.1 gives that space no timer until confirmation.
+- A server that accepted a resumption ticket sent the `early_data` extension in
+  EncryptedExtensions whether or not the client had offered early data.
+  BoringSSL calls that an unexpected extension, so every quiche client resuming
+  against us was closed with alert 110.
+- Stream credit was only extended once a quarter of the initial limit had been
+  consumed, so a peer whose remaining work was smaller than that batch waited
+  forever for credit it would never be offered — quiche's client stalled at 1988
+  of 1999 requests. The remainder is now granted once the peer has opened
+  everything it was allowed.
+- A `CRYPTO`, `NEW_TOKEN` or `CONNECTION_CLOSE` frame whose declared length ran
+  past the end of the datagram read out of bounds — an 8-byte datagram claiming
+  16383 bytes of crypto data panicked. `NEW_CONNECTION_ID` never checked its
+  declared connection ID length at all. All four are reachable from the network
+  before the handshake completes. Transport parameters, `STREAM`, `DATAGRAM`,
+  QPACK strings and the MoQ wire layer had the same shape and are fixed too.
+- QPACK decoding shared one process-wide buffer and handed out `Header` slices
+  into it, so two connections decoding on different threads corrupted each
+  other's headers.
+- Closing a server connection leaked its HTTP/3 and WebTransport state — nine
+  hash maps per connection — because nothing ever deinitialised them.
+- A peer's advertised QPACK table capacity is no longer trusted: it is clamped to
+  what we can hold, and the clamped value is what we announce back.
+
+### Changed
+
+- Per-connection memory. A connection speaking raw QUIC used to carry HTTP/3 and
+  WebTransport state it never touched; those layers are now allocated only when a
+  protocol needs them, and the connection table entry goes from 181,640 bytes to
+  256. The HTTP/3 layer itself goes from 175,776 to 21,160 bytes, almost all of it
+  QPACK: every dynamic table entry reserved a 128-byte name and a 512-byte value,
+  twice per connection, so a table advertising 4 KB of capacity reserved 82 KB to
+  hold it. Entries now share one capacity-sized arena.
+- Entries larger than 128/512 bytes are now indexable in the QPACK dynamic
+  table, which they were not before.
+- `Connection` and the TLS 1.3 handshake are no longer returned by value, so
+  constructing one no longer costs 185 KB and 52 KB of the caller's stack.
+- The interop image's binaries are cross-compiled on the host rather than built
+  inside the linux/amd64 image. On an Apple-silicon host that stage ran the
+  x86_64 Zig compiler under emulation and produced a server whose ECDSA
+  CertificateVerify no peer would accept. Building the image is now 7 seconds
+  rather than 25-30 minutes.
+
+Measured on an interleaved A/B over loopback against the pre-merge tree: on the
+workload the reclamation is about — 8000 sequential HTTP/3 requests on one
+connection — 3192 → 3652 requests/s. Single-stream bulk download is unchanged;
+48 order-balanced runs a side put the two within 1% of each other, which is well
+inside this benchmark's ±5% per-run spread.
+
+### Added
+
+- `tools/interop_local.sh` runs eleven interop cases — handshake, transfer,
+  http3, chacha20, keyupdate, multiconnect, retry, v2, resumption, zerortt, ecn —
+  against our own client and server, with no Docker.
+- `tools/bench_local.sh` reports single-stream download throughput and
+  handshake/request rate over loopback.
+- `interop/runner/matrix.sh` runs the quic-interop-runner matrix against a peer
+  in both directions, one case at a time, recording each verdict so an
+  interrupted run resumes where it stopped.
+- `interop/run_local_tests.sh` covers quic-zig against quiche directly, in both
+  directions and over HTTP/3; previously quiche was only ever run against
+  quic-go. Every client now runs under a watchdog, so a client that does not exit
+  no longer stalls the rest of the suite.
+
+## 0.2.0
+
+Baseline for this changelog. See `SPEC/STATUS.md` for the state of each RFC.
