@@ -1,0 +1,23 @@
+bind = "0.0.0.0"
+port = 8443
+cipher = "aegis128l"
+psk = "multi-service-psk-2024"
+token = "multi-service-token-2024"
+
+[reverse_services]
+emby = "0.0.0.0:8096"
+emby.token = "media-only-token"
+ssh = "0.0.0.0:2222"
+ssh.token = "ssh-only-token"
+
+[advanced]
+tcp_nodelay = true
+tcp_keepalive = true
+tcp_keepalive_idle = 45
+tcp_keepalive_interval = 10
+tcp_keepalive_count = 3
+socket_buffer_size = 8388608
+pin_threads = true
+io_batch_bytes = 131072
+heartbeat_interval_seconds = 30
+heartbeat_timeout_seconds = 50

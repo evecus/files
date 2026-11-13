@@ -1,0 +1,44 @@
+# Floo Client Config - Expose Home Media Server Example
+# =======================================================
+# Run this on your HOME MACHINE where Jellyfin/Plex runs
+
+server = "YOUR_VPS_IP_OR_HOSTNAME:8443" # ← Replace with your VPS address
+cipher = "aes256gcm"
+
+# MUST MATCH SERVER! Use same credentials from floos.toml
+psk = "REPLACE_WITH_SAME_PSK_AS_SERVER"
+token = "REPLACE_WITH_SAME_TOKEN_AS_SERVER"
+
+[reverse_services]
+# Expose your local Jellyfin instance
+# Make sure Jellyfin is running on this port locally!
+jellyfin = "127.0.0.1:8096"
+
+[advanced]
+# Match tunnel fan-out to your CPU cores (override with >0 if needed)
+num_tunnels = 0
+
+# Keep tunnel threads on dedicated cores (Linux/Unix)
+pin_threads = true
+
+# Per-stream buffering for smoother video
+io_batch_bytes = 131072
+
+# TCP optimization for streaming
+tcp_nodelay = true
+tcp_keepalive = true
+tcp_keepalive_idle = 45
+tcp_keepalive_interval = 10
+tcp_keepalive_count = 3
+
+# Larger buffers for smooth 4K streaming
+socket_buffer_size = 8388608 # 8MB
+
+# Auto-reconnect if internet drops
+reconnect_enabled = true
+reconnect_initial_delay_ms = 1000
+reconnect_max_delay_ms = 30000
+reconnect_backoff_multiplier = 2
+
+# Heartbeat keeps connection alive
+heartbeat_timeout_seconds = 60

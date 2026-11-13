@@ -1,0 +1,317 @@
+const std = @import("std");
+const posix = std.posix;
+const Io = std.Io;
+const tunnel = @import("tunnel.zig");
+const noise = @import("noise.zig");
+const common = @import("common.zig");
+
+/// Per-syscall recv timeout on each session's UDP socket.  Picked so that
+/// `sessionRecvThread` re-checks shutdown flags ~once per second; chosen
+/// independently of the forwarder's idle timeout (which can be much longer)
+/// because it controls liveness, not eviction.
+const RECV_TIMEOUT_SECONDS: u32 = 1;
+
+/// Server-side UDP forwarder.
+///
+/// Each tunnel stream gets an independent ephemeral UDP socket so replies
+/// from the target can be associated with the originating client stream.
+/// Unlike the previous "connected UDP" design, std.Io.net.Socket has no
+/// connect operation for datagrams, so we keep `target_addr` on the
+/// forwarder and pass it to every send().
+pub const UdpForwarder = struct {
+    allocator: std.mem.Allocator,
+    io: Io,
+    service_id: tunnel.ServiceId,
+    target_addr: Io.net.IpAddress,
+    tunnel_conn: *anyopaque,
+    send_fn: *const fn (conn: *anyopaque, buffer: []u8, payload_len: usize) anyerror!void,
+    running: std.atomic.Value(bool),
+    timeout_ns: i64,
+    sessions: std.AutoHashMap(tunnel.StreamId, *Session),
+    /// common.HotMutex — held briefly per inbound UDP datagram and per
+    /// reverse-direction send.  See transport/Channel.send_mutex for
+    /// rationale.
+    sessions_mutex: common.HotMutex,
+    last_prune_ns: std.atomic.Value(i64),
+
+    pub fn create(
+        allocator: std.mem.Allocator,
+        io: Io,
+        service_id: tunnel.ServiceId,
+        target_host: []const u8,
+        target_port: u16,
+        tunnel_conn: *anyopaque,
+        send_fn: *const fn (conn: *anyopaque, buffer: []u8, payload_len: usize) anyerror!void,
+        timeout_seconds: u64,
+    ) !*UdpForwarder {
+        const target_addr = try common.resolveHostPort(io, target_host, target_port);
+        const forwarder = try allocator.create(UdpForwarder);
+        forwarder.* = .{
+            .allocator = allocator,
+            .io = io,
+            .service_id = service_id,
+            .target_addr = target_addr,
+            .tunnel_conn = tunnel_conn,
+            .send_fn = send_fn,
+            .running = std.atomic.Value(bool).init(true),
+            .timeout_ns = @as(i64, @intCast(timeout_seconds * std.time.ns_per_s)),
+            .sessions = std.AutoHashMap(tunnel.StreamId, *Session).init(allocator),
+            .sessions_mutex = .{},
+            .last_prune_ns = std.atomic.Value(i64).init(0),
+        };
+        return forwarder;
+    }
+
+    pub fn handleUdpData(self: *UdpForwarder, udp_msg: tunnel.UdpDataMsg) !void {
+        if (udp_msg.source_addr.len == 0 or udp_msg.source_addr.len > 16) {
+            return error.InvalidSourceAddress;
+        }
+
+        const now = @as(i64, @intCast(common.nanoTimestamp()));
+        self.maybePrune(now);
+
+        const session = try self.ensureSession(udp_msg.stream_id, udp_msg.source_addr, udp_msg.source_port, now);
+
+        session.socket.send(self.io, &self.target_addr, udp_msg.data) catch |err| {
+            std.debug.print("[UDP-SERVER] send error for stream {}: {}\n", .{ udp_msg.stream_id, err });
+            return err;
+        };
+        session.last_activity_ns.store(now, .release);
+    }
+
+    pub fn stop(self: *UdpForwarder) void {
+        self.running.store(false, .release);
+
+        // Pop one session at a time under the lock. This avoids:
+        //   - The audit's B-5 leak: previously an OOM in the snapshot
+        //     ArrayList.append broke the loop and abandoned the
+        //     remaining sessions' threads + sockets.
+        //   - The B-4 race: any session created between the old
+        //     snapshot-collect and remove-loop was missed; now sessions
+        //     created concurrently are observed on the next iteration.
+        // The cost is one mutex acquire per session instead of one for
+        // the whole snapshot — fine for shutdown.
+        while (true) {
+            self.sessions_mutex.lock();
+            var iter = self.sessions.keyIterator();
+            const next_key = iter.next();
+            const stream_id_opt = if (next_key) |k| k.* else null;
+            self.sessions_mutex.unlock();
+
+            if (stream_id_opt) |stream_id| {
+                self.removeSession(stream_id, false);
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn destroy(self: *UdpForwarder) void {
+        self.stop();
+        self.sessions.deinit();
+        self.allocator.destroy(self);
+    }
+
+    const Session = struct {
+        stream_id: tunnel.StreamId,
+        socket: Io.net.Socket,
+        thread: std.Thread,
+        running: std.atomic.Value(bool),
+        forwarder: *UdpForwarder,
+        last_activity_ns: std.atomic.Value(i64),
+        source_addr: [16]u8,
+        source_addr_len: u8,
+        source_port: u16,
+    };
+
+    fn ensureSession(
+        self: *UdpForwarder,
+        stream_id: tunnel.StreamId,
+        source_addr: []const u8,
+        source_port: u16,
+        now: i64,
+    ) !*Session {
+        // Fast path: session already exists.
+        {
+            self.sessions_mutex.lock();
+            defer self.sessions_mutex.unlock();
+            if (self.sessions.get(stream_id)) |session| {
+                if (session.source_addr_len != source_addr.len or
+                    session.source_port != source_port or
+                    !std.mem.eql(u8, session.source_addr[0..session.source_addr_len], source_addr))
+                {
+                    return error.UdpForwarderBusy;
+                }
+                return session;
+            }
+        }
+
+        // Slow path: bind + spawn outside the lock (these can take µs–ms each).
+        // Two callers with the same stream_id can both reach this point and
+        // both create a session; the late-arriver detects the race below and
+        // tears its duplicate down. AutoHashMap.put would otherwise silently
+        // overwrite the loser, leaking its socket and recv thread.
+        const ephemeral: Io.net.IpAddress = switch (self.target_addr) {
+            .ip4 => .{ .ip4 = Io.net.Ip4Address.unspecified(0) },
+            .ip6 => .{ .ip6 = Io.net.Ip6Address.unspecified(0) },
+        };
+        const sock = try ephemeral.bind(self.io, .{ .mode = .dgram });
+
+        // Apply a short recv timeout so sessionRecvThread wakes periodically
+        // and re-checks `running`. Without this, a target server that never
+        // replies pins this thread + socket + session struct for the lifetime
+        // of the process — the only existing exit path is shutdown(SHUT.RD)
+        // from removeSession, which won't fire until something else triggers
+        // session teardown. SO_RCVTIMEO on a blocking dgram socket returns
+        // EAGAIN/EWOULDBLOCK on expiry, which we treat as non-fatal below.
+        common.applySocketTimeout(sock.handle, RECV_TIMEOUT_SECONDS);
+
+        const session = self.allocator.create(Session) catch |err| {
+            sock.close(self.io);
+            return err;
+        };
+        session.* = .{
+            .stream_id = stream_id,
+            .socket = sock,
+            .thread = undefined,
+            .running = std.atomic.Value(bool).init(true),
+            .forwarder = self,
+            .last_activity_ns = std.atomic.Value(i64).init(now),
+            .source_addr = [_]u8{0} ** 16,
+            .source_addr_len = @intCast(source_addr.len),
+            .source_port = source_port,
+        };
+        std.mem.copyForwards(u8, session.source_addr[0..session.source_addr_len], source_addr);
+
+        session.thread = std.Thread.spawn(.{
+            .stack_size = common.DEFAULT_THREAD_STACK,
+        }, sessionRecvThread, .{session}) catch |err| {
+            sock.close(self.io);
+            self.allocator.destroy(session);
+            return err;
+        };
+
+        // Race-safe insert: re-check under the lock, install if free, otherwise
+        // tear down our duplicate and return the winner (or error on mismatch).
+        self.sessions_mutex.lock();
+        if (self.sessions.get(stream_id)) |existing| {
+            self.sessions_mutex.unlock();
+            session.running.store(false, .release);
+            _ = posix.system.shutdown(session.socket.handle, posix.SHUT.RD);
+            session.thread.join();
+            session.socket.close(self.io);
+            self.allocator.destroy(session);
+            if (existing.source_addr_len != source_addr.len or
+                existing.source_port != source_port or
+                !std.mem.eql(u8, existing.source_addr[0..existing.source_addr_len], source_addr))
+            {
+                return error.UdpForwarderBusy;
+            }
+            return existing;
+        }
+        self.sessions.put(stream_id, session) catch |err| {
+            self.sessions_mutex.unlock();
+            session.running.store(false, .release);
+            _ = posix.system.shutdown(session.socket.handle, posix.SHUT.RD);
+            session.thread.join();
+            session.socket.close(self.io);
+            self.allocator.destroy(session);
+            return err;
+        };
+        self.sessions_mutex.unlock();
+
+        return session;
+    }
+
+    fn sessionRecvThread(session: *Session) void {
+        var buf: [common.SOCKET_BUFFER_SIZE]u8 align(64) = undefined;
+        const forwarder = session.forwarder;
+
+        while (session.running.load(.acquire) and forwarder.running.load(.acquire)) {
+            const msg = session.socket.receive(forwarder.io, &buf) catch |err| {
+                // EAGAIN/EWOULDBLOCK from SO_RCVTIMEO is the periodic wakeup
+                // we asked for — re-check shutdown flags and continue.  Any
+                // other error is treated as fatal (the original behaviour).
+                if (err == error.WouldBlock or err == error.Timeout) continue;
+                break;
+            };
+            if (msg.data.len == 0) continue;
+
+            session.last_activity_ns.store(@as(i64, @intCast(common.nanoTimestamp())), .release);
+
+            var encode_buf: [70016]u8 = undefined;
+            const udp_msg = tunnel.UdpDataMsg{
+                .service_id = forwarder.service_id,
+                .stream_id = session.stream_id,
+                .source_addr = session.source_addr[0..session.source_addr_len],
+                .source_port = session.source_port,
+                .data = msg.data,
+            };
+
+            const encoded_len = udp_msg.encodeInto(&encode_buf) catch {
+                continue;
+            };
+
+            forwarder.send_fn(forwarder.tunnel_conn, encode_buf[0 .. encoded_len + noise.TAG_LEN], encoded_len) catch |err| {
+                std.debug.print("[UDP-SERVER] Failed to send to tunnel: {}\n", .{err});
+            };
+        }
+
+        forwarder.removeSession(session.stream_id, true);
+    }
+
+    const PRUNE_INTERVAL_NS: i64 = std.time.ns_per_s;
+
+    fn maybePrune(self: *UdpForwarder, now: i64) void {
+        const last = self.last_prune_ns.load(.monotonic);
+        if (last != 0 and now - last < PRUNE_INTERVAL_NS) return;
+        if (self.last_prune_ns.cmpxchgStrong(last, now, .monotonic, .monotonic) != null) return;
+        self.pruneExpiredSessions(now);
+    }
+
+    fn pruneExpiredSessions(self: *UdpForwarder, now: i64) void {
+        if (self.timeout_ns == 0) return;
+
+        var expired_items = std.ArrayListUnmanaged(tunnel.StreamId).empty;
+        defer expired_items.deinit(self.allocator);
+
+        {
+            self.sessions_mutex.lock();
+            defer self.sessions_mutex.unlock();
+
+            var iter = self.sessions.iterator();
+            while (iter.next()) |entry| {
+                const session_ptr = entry.value_ptr.*;
+                const last_activity = session_ptr.last_activity_ns.load(.acquire);
+                const time_elapsed = now - last_activity;
+
+                if (time_elapsed > self.timeout_ns) {
+                    const stream_id = entry.key_ptr.*;
+                    expired_items.append(self.allocator, stream_id) catch continue;
+                }
+            }
+        }
+
+        for (expired_items.items) |stream_id| {
+            self.removeSession(stream_id, false);
+        }
+    }
+
+    fn removeSession(self: *UdpForwarder, stream_id: tunnel.StreamId, caller_is_thread: bool) void {
+        self.sessions_mutex.lock();
+        const entry = self.sessions.fetchRemove(stream_id);
+        self.sessions_mutex.unlock();
+
+        if (entry) |removed| {
+            const session = removed.value;
+            session.running.store(false, .release);
+            _ = posix.system.shutdown(session.socket.handle, posix.SHUT.RD);
+            if (!caller_is_thread) {
+                session.thread.join();
+            }
+            session.socket.close(self.io);
+            self.allocator.destroy(session);
+            std.debug.print("[UDP-SERVER] Session {} closed\n", .{stream_id});
+        }
+    }
+};

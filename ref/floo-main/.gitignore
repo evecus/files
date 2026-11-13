@@ -1,0 +1,39 @@
+# Zig build artifacts
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Build directories
+build/
+dist/
+
+# Editor directories and files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test and log files
+*.log
+
+# User-specific configs (keep out of repo)
+*-emby.toml
+*-minimal.toml
+EMBY_*.md
+EMBY_*.txt
+QUICKSTART_EMBY.md
+
+# Test configurations
+test-*.toml
+
+# Build artifacts
+build-deb/
+.DS_Store
+
+# Claude Code runtime lock
+.claude/scheduled_tasks.lock

@@ -1,0 +1,978 @@
+const std = @import("std");
+const crypto = std.crypto;
+const Io = std.Io;
+const common = @import("common.zig");
+const protocol = @import("protocol.zig");
+
+/// Debug logging for Noise protocol (disable in production for performance)
+const enable_noise_debug = false;
+
+/// Debug print helper - compiles out when disabled
+inline fn debugPrint(comptime fmt: []const u8, args: anytype) void {
+    if (enable_noise_debug) {
+        std.debug.print(fmt, args);
+    }
+}
+
+test "transport cipher advances nonce and output" {
+    var key: [KEY_LEN]u8 = undefined;
+    @memset(&key, 0x42);
+
+    var cipher = TransportCipher.init(key, .chacha20poly1305);
+
+    var plaintext: [32]u8 = undefined;
+    var idx: usize = 0;
+    while (idx < plaintext.len) : (idx += 1) {
+        plaintext[idx] = @as(u8, @intCast(idx));
+    }
+
+    var ct1: [32 + TAG_LEN]u8 = undefined;
+    var ct2: [32 + TAG_LEN]u8 = undefined;
+
+    try cipher.encrypt(plaintext[0..], ct1[0..], 0, &[_]u8{});
+    try cipher.encrypt(plaintext[0..], ct2[0..], 1, &[_]u8{});
+
+    try std.testing.expect(!std.mem.eql(u8, ct1[0..], ct2[0..]));
+}
+
+test "AEGIS-128X2 encrypt/decrypt roundtrip" {
+    var key: [KEY_LEN]u8 = undefined;
+    @memset(&key, 0x42);
+
+    var cipher_enc = TransportCipher.init(key, .aegis128x2);
+    var cipher_dec = TransportCipher.init(key, .aegis128x2);
+
+    const plaintext = "Hello, AEGIS-128X2!";
+    var ciphertext: [plaintext.len + TAG_LEN]u8 = undefined;
+    var decrypted: [plaintext.len]u8 = undefined;
+
+    try cipher_enc.encrypt(plaintext, &ciphertext, 0, &[_]u8{});
+    try cipher_dec.decrypt(&ciphertext, &decrypted, 0, &[_]u8{});
+
+    try std.testing.expectEqualStrings(plaintext, &decrypted);
+}
+
+test "AEGIS-128X4 encrypt/decrypt roundtrip" {
+    var key: [KEY_LEN]u8 = undefined;
+    @memset(&key, 0x42);
+
+    var cipher_enc = TransportCipher.init(key, .aegis128x4);
+    var cipher_dec = TransportCipher.init(key, .aegis128x4);
+
+    const plaintext = "Hello, AEGIS-128X4!";
+    var ciphertext: [plaintext.len + TAG_LEN]u8 = undefined;
+    var decrypted: [plaintext.len]u8 = undefined;
+
+    try cipher_enc.encrypt(plaintext, &ciphertext, 0, &[_]u8{});
+    try cipher_dec.decrypt(&ciphertext, &decrypted, 0, &[_]u8{});
+
+    try std.testing.expectEqualStrings(plaintext, &decrypted);
+}
+
+test "CipherType.fromString parses new AEGIS variants" {
+    try std.testing.expectEqual(CipherType.aegis128x2, try CipherType.fromString("aegis128x2"));
+    try std.testing.expectEqual(CipherType.aegis128x4, try CipherType.fromString("aegis128x4"));
+    try std.testing.expectEqual(@as(usize, 16), CipherType.aegis128x2.nonceLen());
+    try std.testing.expectEqual(@as(usize, 16), CipherType.aegis128x4.nonceLen());
+}
+
+test "AEGIS-256X2 encrypt/decrypt roundtrip" {
+    var key: [KEY_LEN]u8 = undefined;
+    @memset(&key, 0x42);
+
+    var cipher_enc = TransportCipher.init(key, .aegis256x2);
+    var cipher_dec = TransportCipher.init(key, .aegis256x2);
+
+    const plaintext = "Hello, AEGIS-256X2!";
+    var ciphertext: [plaintext.len + TAG_LEN]u8 = undefined;
+    var decrypted: [plaintext.len]u8 = undefined;
+
+    try cipher_enc.encrypt(plaintext, &ciphertext, 0, &[_]u8{});
+    try cipher_dec.decrypt(&ciphertext, &decrypted, 0, &[_]u8{});
+
+    try std.testing.expectEqualStrings(plaintext, &decrypted);
+}
+
+test "AEGIS-256X4 encrypt/decrypt roundtrip" {
+    var key: [KEY_LEN]u8 = undefined;
+    @memset(&key, 0x42);
+
+    var cipher_enc = TransportCipher.init(key, .aegis256x4);
+    var cipher_dec = TransportCipher.init(key, .aegis256x4);
+
+    const plaintext = "Hello, AEGIS-256X4!";
+    var ciphertext: [plaintext.len + TAG_LEN]u8 = undefined;
+    var decrypted: [plaintext.len]u8 = undefined;
+
+    try cipher_enc.encrypt(plaintext, &ciphertext, 0, &[_]u8{});
+    try cipher_dec.decrypt(&ciphertext, &decrypted, 0, &[_]u8{});
+
+    try std.testing.expectEqualStrings(plaintext, &decrypted);
+}
+
+test "CipherType.fromString parses AEGIS-256 variants" {
+    try std.testing.expectEqual(CipherType.aegis256x2, try CipherType.fromString("aegis256x2"));
+    try std.testing.expectEqual(CipherType.aegis256x4, try CipherType.fromString("aegis256x4"));
+    try std.testing.expectEqual(@as(usize, 32), CipherType.aegis256x2.nonceLen());
+    try std.testing.expectEqual(@as(usize, 32), CipherType.aegis256x4.nonceLen());
+}
+
+// In-place decryption: pass the same buffer as both ciphertext source and
+// plaintext destination (sliced to drop the tag). Verifies that the
+// std.crypto AEAD implementation reads each ciphertext byte before
+// overwriting it. If this test ever fails for a cipher, the channel
+// layer's decrypt-in-place hot path must NOT be used for that cipher.
+test "AEAD decrypt is safe in-place across all cipher types" {
+    const types = [_]CipherType{
+        .chacha20poly1305,
+        .aes256gcm,
+        .aes128gcm,
+        .aegis128l,
+        .aegis128x2,
+        .aegis128x4,
+        .aegis256,
+        .aegis256x2,
+        .aegis256x4,
+    };
+
+    var key: [KEY_LEN]u8 = undefined;
+    @memset(&key, 0x42);
+
+    const plaintext_in = "in-place AEAD decryption regression vector — abcdefghijklmnopqrstuvwxyz0123456789";
+
+    inline for (types) |ct_type| {
+        var cipher_enc = TransportCipher.init(key, ct_type);
+        var cipher_dec_oop = TransportCipher.init(key, ct_type); // out-of-place decryptor
+        var cipher_dec_in = TransportCipher.init(key, ct_type); // in-place decryptor
+
+        // Encrypt into a fresh buffer so we know the ciphertext.
+        const ct_len = plaintext_in.len + TAG_LEN;
+        var ct_buf: [200]u8 = undefined;
+        try cipher_enc.encrypt(plaintext_in, ct_buf[0..ct_len], 0, &[_]u8{});
+
+        // Out-of-place decrypt as the reference.
+        var pt_oop: [plaintext_in.len]u8 = undefined;
+        try cipher_dec_oop.decrypt(ct_buf[0..ct_len], &pt_oop, 0, &[_]u8{});
+        try std.testing.expectEqualSlices(u8, plaintext_in, &pt_oop);
+
+        // In-place decrypt: source and dest alias the same backing storage.
+        var ct_alias: [200]u8 = undefined;
+        @memcpy(ct_alias[0..ct_len], ct_buf[0..ct_len]);
+        try cipher_dec_in.decrypt(ct_alias[0..ct_len], ct_alias[0..plaintext_in.len], 0, &[_]u8{});
+        try std.testing.expectEqualSlices(u8, plaintext_in, ct_alias[0..plaintext_in.len]);
+    }
+}
+
+test "AAD binds length||seq; wrong AAD fails closed" {
+    var key: [KEY_LEN]u8 = undefined;
+    @memset(&key, 0x11);
+    var enc = TransportCipher.init(key, .aes128gcm);
+    var dec = TransportCipher.init(key, .aes128gcm);
+
+    const plaintext = "aad-bound payload";
+    var ciphertext: [plaintext.len + TAG_LEN]u8 = undefined;
+    const aad = protocol.makeAad(@intCast(plaintext.len + TAG_LEN), 9);
+    try enc.encrypt(plaintext, &ciphertext, 9, &aad);
+    var out: [plaintext.len]u8 = undefined;
+    try dec.decrypt(&ciphertext, &out, 9, &aad);
+    try std.testing.expectEqualSlices(u8, plaintext, &out);
+
+    const bad_aad = protocol.makeAad(@intCast(plaintext.len + TAG_LEN), 10);
+    try std.testing.expectError(error.AuthenticationFailed, dec.decrypt(&ciphertext, &out, 9, &bad_aad));
+}
+
+/// Cipher type for Noise transport
+pub const CipherType = enum {
+    chacha20poly1305,
+    aes256gcm,
+    aes128gcm,
+    aegis128l,
+    aegis128x2,
+    aegis128x4,
+    aegis256,
+    aegis256x2,
+    aegis256x4,
+
+    pub fn fromString(s: []const u8) !CipherType {
+        if (std.mem.eql(u8, s, "chacha20poly1305")) return .chacha20poly1305;
+        if (std.mem.eql(u8, s, "aes256gcm")) return .aes256gcm;
+        if (std.mem.eql(u8, s, "aes128gcm")) return .aes128gcm;
+        if (std.mem.eql(u8, s, "aegis128l")) return .aegis128l;
+        if (std.mem.eql(u8, s, "aegis128x2")) return .aegis128x2;
+        if (std.mem.eql(u8, s, "aegis128x4")) return .aegis128x4;
+        if (std.mem.eql(u8, s, "aegis256")) return .aegis256;
+        if (std.mem.eql(u8, s, "aegis256x2")) return .aegis256x2;
+        if (std.mem.eql(u8, s, "aegis256x4")) return .aegis256x4;
+        return error.InvalidCipher;
+    }
+
+    pub fn nonceLen(self: CipherType) usize {
+        return switch (self) {
+            .chacha20poly1305, .aes256gcm, .aes128gcm => 12,
+            .aegis128l, .aegis128x2, .aegis128x4 => 16,
+            .aegis256, .aegis256x2, .aegis256x4 => 32,
+        };
+    }
+};
+
+pub const KEY_LEN = 32;
+pub const TAG_LEN = 16;
+
+// Compile-time guarantee that every AEAD we wire into TransportCipher emits a
+// 16-byte authentication tag. The encrypt/decrypt paths slice off exactly
+// `TAG_LEN` bytes of tag from the ciphertext layout; if std.crypto ever ships
+// a variant where `tag_length` differs, this build-time check fails before
+// silent truncation can leak ciphertext bytes into the tag region.
+comptime {
+    const aead = crypto.aead;
+    if (aead.chacha_poly.ChaCha20Poly1305.tag_length != TAG_LEN) @compileError("ChaCha20Poly1305 tag_length != TAG_LEN");
+    if (aead.aes_gcm.Aes256Gcm.tag_length != TAG_LEN) @compileError("Aes256Gcm tag_length != TAG_LEN");
+    if (aead.aes_gcm.Aes128Gcm.tag_length != TAG_LEN) @compileError("Aes128Gcm tag_length != TAG_LEN");
+    if (aead.aegis.Aegis128L.tag_length != TAG_LEN) @compileError("Aegis128L tag_length != TAG_LEN");
+    if (aead.aegis.Aegis128X2.tag_length != TAG_LEN) @compileError("Aegis128X2 tag_length != TAG_LEN");
+    if (aead.aegis.Aegis128X4.tag_length != TAG_LEN) @compileError("Aegis128X4 tag_length != TAG_LEN");
+    if (aead.aegis.Aegis256.tag_length != TAG_LEN) @compileError("Aegis256 tag_length != TAG_LEN");
+    if (aead.aegis.Aegis256X2.tag_length != TAG_LEN) @compileError("Aegis256X2 tag_length != TAG_LEN");
+    if (aead.aegis.Aegis256X4.tag_length != TAG_LEN) @compileError("Aegis256X4 tag_length != TAG_LEN");
+}
+// Force reconnection before theoretical nonce limit to prevent wraparound
+// 2^40 (~1.1 trillion messages) provides 256x safety margin before 2^48 limit
+pub const MAX_NONCE = 0xFFFFFFFFFF; // 2^40 - 1
+pub const DH_LEN = 32; // X25519 public key length
+pub const HASH_LEN = 32; // SHA256 hash length
+
+/// Transport cipher for encrypting/decrypting messages
+pub const TransportCipher = struct {
+    key: [KEY_LEN]u8,
+    nonce: std.atomic.Value(u64),
+    cipher_type: CipherType,
+
+    pub fn init(key: [KEY_LEN]u8, cipher_type: CipherType) TransportCipher {
+        return .{
+            .key = key,
+            .nonce = std.atomic.Value(u64).init(0),
+            .cipher_type = cipher_type,
+        };
+    }
+
+    fn makeNonce12(n: u64) [12]u8 {
+        var nonce: [12]u8 = undefined;
+        @memset(nonce[0..4], 0);
+        std.mem.writeInt(u64, nonce[4..12], n, .little);
+        return nonce;
+    }
+
+    fn makeNonce16(n: u64) [16]u8 {
+        var nonce: [16]u8 = undefined;
+        @memset(nonce[0..8], 0);
+        std.mem.writeInt(u64, nonce[8..16], n, .little);
+        return nonce;
+    }
+
+    fn makeNonce32(n: u64) [32]u8 {
+        var nonce: [32]u8 = undefined;
+        @memset(nonce[0..24], 0);
+        std.mem.writeInt(u64, nonce[24..32], n, .little);
+        return nonce;
+    }
+
+    /// Encrypt plaintext into ciphertext (includes 16-byte tag).
+    /// `seq` is the wire/nonce counter; the receiver must use the same value.
+    pub fn encrypt(self: *TransportCipher, plaintext: []const u8, ciphertext: []u8, seq: u64, aad: []const u8) !void {
+        if (ciphertext.len != plaintext.len + TAG_LEN) return error.InvalidLength;
+        if (seq >= MAX_NONCE) return error.NonceExhausted;
+        aeadDispatch(.encrypt, self.cipher_type, ciphertext[0..plaintext.len], ciphertext[plaintext.len..][0..TAG_LEN], plaintext, aad, .fromSeq(seq), self.key) catch unreachable;
+    }
+
+    /// Decrypt ciphertext into plaintext using the frame's seq (never a guessed counter).
+    pub fn decrypt(self: *TransportCipher, ciphertext: []const u8, plaintext: []u8, seq: u64, aad: []const u8) !void {
+        if (ciphertext.len < TAG_LEN) return error.InvalidLength;
+        if (plaintext.len != ciphertext.len - TAG_LEN) return error.InvalidLength;
+        if (seq >= MAX_NONCE) return error.NonceExhausted;
+        const ct = ciphertext[0..plaintext.len];
+        var tag: [TAG_LEN]u8 = undefined;
+        @memcpy(&tag, ciphertext[plaintext.len..][0..TAG_LEN]);
+        aeadDispatch(.decrypt, self.cipher_type, plaintext, &tag, ct, aad, .fromSeq(seq), self.key) catch return error.AuthenticationFailed;
+    }
+};
+
+/// HKDF-SHA256 with two outputs (Noise MixKey / Split)
+fn hkdf2(output1: *[HASH_LEN]u8, output2: *[KEY_LEN]u8, chaining_key: [HASH_LEN]u8, input_key_material: []const u8) void {
+    // HKDF-Extract
+    var temp_key: [HASH_LEN]u8 = undefined;
+    crypto.auth.hmac.sha2.HmacSha256.create(&temp_key, input_key_material, &chaining_key);
+
+    // HKDF-Expand - first output
+    var hmac1 = crypto.auth.hmac.sha2.HmacSha256.init(&temp_key);
+    hmac1.update(&[_]u8{1});
+    hmac1.final(output1);
+
+    // HKDF-Expand - second output
+    var hmac2 = crypto.auth.hmac.sha2.HmacSha256.init(&temp_key);
+    hmac2.update(output1);
+    hmac2.update(&[_]u8{2});
+    hmac2.final(output2);
+}
+
+const NonceSource = union(enum) {
+    seq: u64,
+    handshake: [12]u8,
+
+    fn fromSeq(seq: u64) NonceSource {
+        return .{ .seq = seq };
+    }
+};
+
+fn aeadDispatch(
+    comptime op: enum { encrypt, decrypt },
+    cipher_type: CipherType,
+    dest: []u8,
+    tag: []u8,
+    src: []const u8,
+    ad: []const u8,
+    nonce_src: NonceSource,
+    key: [KEY_LEN]u8,
+) !void {
+    if (tag.len != TAG_LEN) return error.InvalidLength;
+
+    const aead = crypto.aead;
+    switch (cipher_type) {
+        .chacha20poly1305 => {
+            const nonce = switch (nonce_src) {
+                .seq => |n| TransportCipher.makeNonce12(n),
+                .handshake => |n| n,
+            };
+            if (op == .encrypt) {
+                aead.chacha_poly.ChaCha20Poly1305.encrypt(dest, tag[0..TAG_LEN], src, ad, nonce, key);
+            } else {
+                aead.chacha_poly.ChaCha20Poly1305.decrypt(dest, src, tag[0..TAG_LEN].*, ad, nonce, key) catch return error.DecryptionFailed;
+            }
+        },
+        .aes256gcm => {
+            const nonce = switch (nonce_src) {
+                .seq => |n| TransportCipher.makeNonce12(n),
+                .handshake => |n| n,
+            };
+            if (op == .encrypt) {
+                aead.aes_gcm.Aes256Gcm.encrypt(dest, tag[0..TAG_LEN], src, ad, nonce, key);
+            } else {
+                aead.aes_gcm.Aes256Gcm.decrypt(dest, src, tag[0..TAG_LEN].*, ad, nonce, key) catch return error.DecryptionFailed;
+            }
+        },
+        .aes128gcm => {
+            const nonce = switch (nonce_src) {
+                .seq => |n| TransportCipher.makeNonce12(n),
+                .handshake => |n| n,
+            };
+            const key128 = key[0..16].*;
+            if (op == .encrypt) {
+                aead.aes_gcm.Aes128Gcm.encrypt(dest, tag[0..TAG_LEN], src, ad, nonce, key128);
+            } else {
+                aead.aes_gcm.Aes128Gcm.decrypt(dest, src, tag[0..TAG_LEN].*, ad, nonce, key128) catch return error.DecryptionFailed;
+            }
+        },
+        .aegis128l => {
+            const nonce = switch (nonce_src) {
+                .seq => |n| TransportCipher.makeNonce16(n),
+                .handshake => |n12| padHandshakeNonce16(n12),
+            };
+            const key128 = key[0..16].*;
+            if (op == .encrypt) {
+                aead.aegis.Aegis128L.encrypt(dest, tag[0..TAG_LEN], src, ad, nonce, key128);
+            } else {
+                aead.aegis.Aegis128L.decrypt(dest, src, tag[0..TAG_LEN].*, ad, nonce, key128) catch return error.DecryptionFailed;
+            }
+        },
+        .aegis128x2 => {
+            const nonce = switch (nonce_src) {
+                .seq => |n| TransportCipher.makeNonce16(n),
+                .handshake => |n12| padHandshakeNonce16(n12),
+            };
+            const key128 = key[0..16].*;
+            if (op == .encrypt) {
+                aead.aegis.Aegis128X2.encrypt(dest, tag[0..TAG_LEN], src, ad, nonce, key128);
+            } else {
+                aead.aegis.Aegis128X2.decrypt(dest, src, tag[0..TAG_LEN].*, ad, nonce, key128) catch return error.DecryptionFailed;
+            }
+        },
+        .aegis128x4 => {
+            const nonce = switch (nonce_src) {
+                .seq => |n| TransportCipher.makeNonce16(n),
+                .handshake => |n12| padHandshakeNonce16(n12),
+            };
+            const key128 = key[0..16].*;
+            if (op == .encrypt) {
+                aead.aegis.Aegis128X4.encrypt(dest, tag[0..TAG_LEN], src, ad, nonce, key128);
+            } else {
+                aead.aegis.Aegis128X4.decrypt(dest, src, tag[0..TAG_LEN].*, ad, nonce, key128) catch return error.DecryptionFailed;
+            }
+        },
+        .aegis256 => {
+            const nonce = switch (nonce_src) {
+                .seq => |n| TransportCipher.makeNonce32(n),
+                .handshake => |n12| padHandshakeNonce32(n12),
+            };
+            if (op == .encrypt) {
+                aead.aegis.Aegis256.encrypt(dest, tag[0..TAG_LEN], src, ad, nonce, key);
+            } else {
+                aead.aegis.Aegis256.decrypt(dest, src, tag[0..TAG_LEN].*, ad, nonce, key) catch return error.DecryptionFailed;
+            }
+        },
+        .aegis256x2 => {
+            const nonce = switch (nonce_src) {
+                .seq => |n| TransportCipher.makeNonce32(n),
+                .handshake => |n12| padHandshakeNonce32(n12),
+            };
+            if (op == .encrypt) {
+                aead.aegis.Aegis256X2.encrypt(dest, tag[0..TAG_LEN], src, ad, nonce, key);
+            } else {
+                aead.aegis.Aegis256X2.decrypt(dest, src, tag[0..TAG_LEN].*, ad, nonce, key) catch return error.DecryptionFailed;
+            }
+        },
+        .aegis256x4 => {
+            const nonce = switch (nonce_src) {
+                .seq => |n| TransportCipher.makeNonce32(n),
+                .handshake => |n12| padHandshakeNonce32(n12),
+            };
+            if (op == .encrypt) {
+                aead.aegis.Aegis256X4.encrypt(dest, tag[0..TAG_LEN], src, ad, nonce, key);
+            } else {
+                aead.aegis.Aegis256X4.decrypt(dest, src, tag[0..TAG_LEN].*, ad, nonce, key) catch return error.DecryptionFailed;
+            }
+        },
+    }
+}
+
+fn padHandshakeNonce16(n12: [12]u8) [16]u8 {
+    var out: [16]u8 = @splat(0);
+    @memcpy(out[0..12], &n12);
+    return out;
+}
+
+fn padHandshakeNonce32(n12: [12]u8) [32]u8 {
+    var out: [32]u8 = @splat(0);
+    @memcpy(out[0..12], &n12);
+    return out;
+}
+
+fn nextHandshakeNonce(n: *u64) [12]u8 {
+    const nonce = TransportCipher.makeNonce12(n.*);
+    n.* += 1;
+    return nonce;
+}
+
+fn mixHash(h: *[HASH_LEN]u8, data: []const u8) void {
+    var hasher = crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(h);
+    hasher.update(data);
+    hasher.final(h);
+}
+
+fn aeadEncrypt(
+    cipher_type: CipherType,
+    ciphertext: []u8,
+    tag: *[TAG_LEN]u8,
+    plaintext: []const u8,
+    ad: []const u8,
+    nonce: [12]u8,
+    key: [KEY_LEN]u8,
+) void {
+    aeadDispatch(.encrypt, cipher_type, ciphertext, tag, plaintext, ad, .{ .handshake = nonce }, key) catch unreachable;
+}
+
+fn aeadDecrypt(
+    cipher_type: CipherType,
+    plaintext: []u8,
+    ciphertext: []const u8,
+    tag: [TAG_LEN]u8,
+    ad: []const u8,
+    nonce: [12]u8,
+    key: [KEY_LEN]u8,
+) !void {
+    var tag_buf = tag;
+    try aeadDispatch(.decrypt, cipher_type, plaintext, &tag_buf, ciphertext, ad, .{ .handshake = nonce }, key);
+}
+
+/// Handshake helpers
+pub const HandshakeResult = struct {
+    send_cipher: TransportCipher,
+    recv_cipher: TransportCipher,
+};
+
+fn computeAuthTag(psk: []const u8, handshake_hash: []const u8, role: u8) [HASH_LEN]u8 {
+    var tag: [HASH_LEN]u8 = undefined;
+    var hmac = crypto.auth.hmac.sha2.HmacSha256.init(psk);
+    hmac.update(handshake_hash);
+    hmac.update(&[_]u8{role});
+    hmac.final(&tag);
+    return tag;
+}
+
+/// Plaintext-mode PSK proof-of-knowledge.
+///
+/// When the operator selects `cipher = "none"` the Noise XX handshake is
+/// skipped entirely — there is no DH, no chaining key, no AEAD.  The
+/// pre-S-1 code path silently accepted any peer in this mode (the README
+/// says "Debug/testing only" but the failure mode was "open relay").
+///
+/// This routine preserves *mutual authentication* even when encryption is
+/// off: each side draws a 32-byte random nonce, exchanges nonces, and both
+/// compute `HMAC-SHA256(psk, label || initiator_nonce || responder_nonce ||
+/// role_byte)`.  The role byte (`I`/`R`) is direction-bound to prevent a
+/// peer from echoing back our own tag.  Binding both nonces makes each
+/// successful exchange unique — replay across connections fails because
+/// the nonces differ.
+///
+/// Confidentiality: still none.  Integrity of subsequent traffic: still
+/// none.  But "I know the PSK" is proven by *both* parties before any data
+/// frame is exchanged.  An attacker without the PSK cannot complete the
+/// exchange, so the stream stays closed.  Cost: one HMAC + one round
+/// trip; this only runs in the explicitly-debug `cipher=none` path so the
+/// hot path is unaffected.
+pub fn plaintextPskHandshake(
+    io: Io,
+    reader: *Io.Reader,
+    writer: *Io.Writer,
+    is_initiator: bool,
+    psk: []const u8,
+) !void {
+    if (psk.len == 0) return error.MissingPsk;
+
+    const NONCE_LEN: usize = 32;
+    const LABEL = "floo-plaintext-psk-v1";
+
+    var local_nonce: [NONCE_LEN]u8 = undefined;
+    io.random(&local_nonce);
+    defer crypto.secureZero(u8, &local_nonce);
+
+    var peer_nonce: [NONCE_LEN]u8 = undefined;
+    defer crypto.secureZero(u8, &peer_nonce);
+
+    // Exchange nonces.  Initiator goes first so the wire order is
+    // deterministic regardless of role.
+    if (is_initiator) {
+        try writer.writeAll(&local_nonce);
+        try writer.flush();
+        try reader.readSliceAll(&peer_nonce);
+    } else {
+        try reader.readSliceAll(&peer_nonce);
+        try writer.writeAll(&local_nonce);
+        try writer.flush();
+    }
+
+    const initiator_nonce = if (is_initiator) &local_nonce else &peer_nonce;
+    const responder_nonce = if (is_initiator) &peer_nonce else &local_nonce;
+
+    const local_role: u8 = if (is_initiator) 'I' else 'R';
+    const peer_role: u8 = if (is_initiator) 'R' else 'I';
+
+    var local_tag: [HASH_LEN]u8 = undefined;
+    {
+        var hmac = crypto.auth.hmac.sha2.HmacSha256.init(psk);
+        hmac.update(LABEL);
+        hmac.update(initiator_nonce);
+        hmac.update(responder_nonce);
+        hmac.update(&[_]u8{local_role});
+        hmac.final(&local_tag);
+    }
+
+    var expected_peer_tag: [HASH_LEN]u8 = undefined;
+    {
+        var hmac = crypto.auth.hmac.sha2.HmacSha256.init(psk);
+        hmac.update(LABEL);
+        hmac.update(initiator_nonce);
+        hmac.update(responder_nonce);
+        hmac.update(&[_]u8{peer_role});
+        hmac.final(&expected_peer_tag);
+    }
+
+    var peer_tag: [HASH_LEN]u8 = undefined;
+    if (is_initiator) {
+        try writer.writeAll(&local_tag);
+        try writer.flush();
+        try reader.readSliceAll(&peer_tag);
+    } else {
+        try reader.readSliceAll(&peer_tag);
+        try writer.writeAll(&local_tag);
+        try writer.flush();
+    }
+
+    if (!common.constantTimeEqual(peer_tag[0..], expected_peer_tag[0..])) {
+        return error.AuthenticationFailed;
+    }
+}
+
+/// Noise_XX handshake pattern
+/// XX:
+///   -> e
+///   <- e, ee, s, es
+///   -> s, se
+pub fn noiseXXHandshake(
+    io: Io,
+    reader: *Io.Reader,
+    writer: *Io.Writer,
+    cipher_type: CipherType,
+    is_initiator: bool,
+    static_keypair: crypto.dh.X25519.KeyPair,
+    psk: []const u8,
+) !HandshakeResult {
+    if (psk.len == 0) return error.MissingPsk;
+    const X25519 = crypto.dh.X25519;
+
+    // Generate ephemeral keypair (static keypair is provided)
+    const e_keypair = X25519.KeyPair.generate(io);
+    // Zeroize ephemeral private key on every exit path. Stack frames
+    // otherwise persist after return until overwritten by later calls,
+    // leaving session-key material in memory across the channel's lifetime.
+    defer crypto.secureZero(u8, @constCast(&e_keypair.secret_key));
+    const s_keypair = static_keypair;
+
+    // Initialize Noise state
+    var chaining_key: [HASH_LEN]u8 = undefined;
+    defer crypto.secureZero(u8, &chaining_key);
+    var h: [HASH_LEN]u8 = undefined;
+
+    // h = HASH(protocol_name) - build based on actual cipher
+    const protocol_name = switch (cipher_type) {
+        .chacha20poly1305 => "Noise_XX_25519_ChaChaPoly_SHA256",
+        .aes256gcm => "Noise_XX_25519_AESGCM_SHA256",
+        .aes128gcm => "Noise_XX_25519_AES128GCM_SHA256",
+        .aegis128l => "Noise_XX_25519_AEGIS128L_SHA256",
+        .aegis128x2 => "Noise_XX_25519_AEGIS128X2_SHA256",
+        .aegis128x4 => "Noise_XX_25519_AEGIS128X4_SHA256",
+        .aegis256 => "Noise_XX_25519_AEGIS256_SHA256",
+        .aegis256x2 => "Noise_XX_25519_AEGIS256X2_SHA256",
+        .aegis256x4 => "Noise_XX_25519_AEGIS256X4_SHA256",
+    };
+    crypto.hash.sha2.Sha256.hash(protocol_name, &h, .{});
+    chaining_key = h;
+
+    if (is_initiator) {
+        debugPrint("[NOISE] Initiator: sending ephemeral key ({} bytes)\n", .{e_keypair.public_key.len});
+        // -> e
+        try writer.writeAll(&e_keypair.public_key);
+        try writer.flush();
+        debugPrint("[NOISE] Initiator: ephemeral key sent\n", .{});
+
+        // Mix e into handshake hash
+        var h_hash = crypto.hash.sha2.Sha256.init(.{});
+        h_hash.update(&h);
+        h_hash.update(&e_keypair.public_key);
+        h_hash.final(&h);
+
+        // <- e, ee, s, es
+        debugPrint("[NOISE] Initiator: receiving msg2 ({} bytes)\n", .{DH_LEN + DH_LEN + TAG_LEN + TAG_LEN});
+        var msg2: [DH_LEN + DH_LEN + TAG_LEN + TAG_LEN]u8 = undefined;
+        try reader.readSliceAll(&msg2);
+        debugPrint("[NOISE] Initiator: msg2 received\n", .{});
+
+        const re = msg2[0..DH_LEN];
+        const encrypted_rs = msg2[DH_LEN .. DH_LEN + DH_LEN + TAG_LEN];
+
+        // Mix re into h
+        h_hash = crypto.hash.sha2.Sha256.init(.{});
+        h_hash.update(&h);
+        h_hash.update(re);
+        h_hash.final(&h);
+
+        // ee - MixKey(dh_ee): Updates ck and derives temp_k from DH output
+        const dh_ee = X25519.scalarmult(e_keypair.secret_key, re.*) catch return error.DHFailed;
+        defer crypto.secureZero(u8, @constCast(&dh_ee));
+
+        // Decrypt rs
+        var temp_k: [KEY_LEN]u8 = undefined;
+        defer crypto.secureZero(u8, &temp_k);
+        var rs: [DH_LEN]u8 = undefined;
+        hkdf2(&chaining_key, &temp_k, chaining_key, &dh_ee);
+        var n: u64 = 0;
+
+        const encrypted_rs_ct = encrypted_rs[0..DH_LEN];
+        const encrypted_rs_tag = encrypted_rs[DH_LEN .. DH_LEN + TAG_LEN].*;
+        try aeadDecrypt(
+            cipher_type,
+            &rs,
+            encrypted_rs_ct,
+            encrypted_rs_tag,
+            &h,
+            nextHandshakeNonce(&n),
+            temp_k,
+        );
+
+        // Mix encrypted_rs into h
+        mixHash(&h, encrypted_rs);
+
+        // es - MixKey(dh_es): Updates ck and derives temp_k from DH output
+        const dh_es = X25519.scalarmult(e_keypair.secret_key, rs) catch return error.DHFailed;
+        defer crypto.secureZero(u8, @constCast(&dh_es));
+
+        // Verify empty payload tag from msg2
+        hkdf2(&chaining_key, &temp_k, chaining_key, &dh_es);
+        n = 0;
+        const payload_tag_from_msg2 = msg2[DH_LEN + DH_LEN + TAG_LEN ..].*;
+        var decrypted_payload: [0]u8 = undefined;
+        try aeadDecrypt(
+            cipher_type,
+            &decrypted_payload,
+            &[_]u8{},
+            payload_tag_from_msg2,
+            &h,
+            nextHandshakeNonce(&n),
+            temp_k,
+        );
+        mixHash(&h, &payload_tag_from_msg2);
+
+        // -> s, se
+        var msg3: [DH_LEN + TAG_LEN + TAG_LEN]u8 = undefined;
+
+        // Encrypt s (same temp_k as the empty decrypt; n already incremented)
+        var encrypted_s: [DH_LEN + TAG_LEN]u8 = undefined;
+        aeadEncrypt(
+            cipher_type,
+            encrypted_s[0..DH_LEN],
+            encrypted_s[DH_LEN..][0..TAG_LEN],
+            &s_keypair.public_key,
+            &h,
+            nextHandshakeNonce(&n),
+            temp_k,
+        );
+        @memcpy(msg3[0 .. DH_LEN + TAG_LEN], &encrypted_s);
+
+        // Mix encrypted_s into h
+        mixHash(&h, &encrypted_s);
+
+        // se - MixKey(dh_se): Updates ck and derives temp_k from DH output
+        const dh_se = X25519.scalarmult(s_keypair.secret_key, re.*) catch return error.DHFailed;
+        defer crypto.secureZero(u8, @constCast(&dh_se));
+        hkdf2(&chaining_key, &temp_k, chaining_key, &dh_se);
+        n = 0;
+
+        // Encrypt empty payload (using temp_k from se operation)
+        var payload_tag: [TAG_LEN]u8 = undefined;
+        aeadEncrypt(
+            cipher_type,
+            &[_]u8{},
+            &payload_tag,
+            &[_]u8{},
+            &h,
+            nextHandshakeNonce(&n),
+            temp_k,
+        );
+        mixHash(&h, &payload_tag);
+        @memcpy(msg3[DH_LEN + TAG_LEN ..], &payload_tag);
+
+        debugPrint("[NOISE] Initiator: sending msg3 ({} bytes)\n", .{msg3.len});
+        try writer.writeAll(&msg3);
+        try writer.flush();
+        debugPrint("[NOISE] Initiator: msg3 sent\n", .{});
+
+        // Split into transport keys
+        var key1: [KEY_LEN]u8 = undefined;
+        var key2: [KEY_LEN]u8 = undefined;
+        hkdf2(&key1, &key2, chaining_key, &[_]u8{});
+
+        const result = HandshakeResult{
+            .send_cipher = TransportCipher.init(key1, cipher_type),
+            .recv_cipher = TransportCipher.init(key2, cipher_type),
+        };
+        // TransportCipher.init copied the keys into its own state — wipe
+        // local copies before continuing into the PSK auth exchange.
+        crypto.secureZero(u8, &key1);
+        crypto.secureZero(u8, &key2);
+
+        const handshake_hash: []const u8 = h[0..];
+        const local_tag = computeAuthTag(psk, handshake_hash, 'I');
+        debugPrint("[NOISE] Initiator: sending PSK auth tag ({} bytes)\n", .{local_tag.len});
+        try writer.writeAll(local_tag[0..]);
+        try writer.flush();
+        debugPrint("[NOISE] Initiator: PSK auth tag sent\n", .{});
+        var peer_tag_buf: [HASH_LEN]u8 = undefined;
+        debugPrint("[NOISE] Initiator: waiting for server PSK auth tag ({} bytes)\n", .{peer_tag_buf.len});
+        try reader.readSliceAll(peer_tag_buf[0..]);
+        debugPrint("[NOISE] Initiator: received server PSK auth tag\n", .{});
+        const expected_peer = computeAuthTag(psk, handshake_hash, 'R');
+        // Use constant-time comparison to prevent timing attacks on PSK authentication
+        if (!common.constantTimeEqual(peer_tag_buf[0..], expected_peer[0..])) return error.AuthenticationFailed;
+
+        return result;
+    } else {
+        debugPrint("[NOISE] Responder: waiting for ephemeral key ({} bytes)\n", .{DH_LEN});
+        // <- e
+        var re: [DH_LEN]u8 = undefined;
+        try reader.readSliceAll(&re);
+        debugPrint("[NOISE] Responder: ephemeral key received\n", .{});
+
+        // Mix re into h
+        var h_hash = crypto.hash.sha2.Sha256.init(.{});
+        h_hash.update(&h);
+        h_hash.update(&re);
+        h_hash.final(&h);
+
+        // -> e, ee, s, es
+        var msg2: [DH_LEN + DH_LEN + TAG_LEN + TAG_LEN]u8 = undefined;
+        @memcpy(msg2[0..DH_LEN], &e_keypair.public_key);
+
+        // Mix e into h
+        h_hash = crypto.hash.sha2.Sha256.init(.{});
+        h_hash.update(&h);
+        h_hash.update(&e_keypair.public_key);
+        h_hash.final(&h);
+
+        // ee - MixKey(dh_ee): Updates ck and derives temp_k from DH output
+        const dh_ee = X25519.scalarmult(e_keypair.secret_key, re) catch return error.DHFailed;
+        defer crypto.secureZero(u8, @constCast(&dh_ee));
+        var temp_k: [KEY_LEN]u8 = undefined;
+        defer crypto.secureZero(u8, &temp_k);
+        hkdf2(&chaining_key, &temp_k, chaining_key, &dh_ee);
+        var n: u64 = 0;
+
+        // Encrypt s (using temp_k from ee operation)
+        var encrypted_s: [DH_LEN + TAG_LEN]u8 = undefined;
+        aeadEncrypt(
+            cipher_type,
+            encrypted_s[0..DH_LEN],
+            encrypted_s[DH_LEN..][0..TAG_LEN],
+            &s_keypair.public_key,
+            &h,
+            nextHandshakeNonce(&n),
+            temp_k,
+        );
+        @memcpy(msg2[DH_LEN .. DH_LEN + DH_LEN + TAG_LEN], &encrypted_s);
+
+        // Mix encrypted_s into h
+        mixHash(&h, &encrypted_s);
+
+        // es - MixKey(dh_es): Updates ck and derives temp_k from DH output
+        const dh_es = X25519.scalarmult(s_keypair.secret_key, re) catch return error.DHFailed;
+        defer crypto.secureZero(u8, @constCast(&dh_es));
+        hkdf2(&chaining_key, &temp_k, chaining_key, &dh_es);
+        n = 0;
+
+        // Encrypt empty payload (using temp_k from es operation)
+        var payload_tag: [TAG_LEN]u8 = undefined;
+        aeadEncrypt(
+            cipher_type,
+            &[_]u8{},
+            &payload_tag,
+            &[_]u8{},
+            &h,
+            nextHandshakeNonce(&n),
+            temp_k,
+        );
+        mixHash(&h, &payload_tag);
+        @memcpy(msg2[DH_LEN + DH_LEN + TAG_LEN ..], &payload_tag);
+
+        debugPrint("[NOISE] Responder: sending msg2 ({} bytes)\n", .{msg2.len});
+        try writer.writeAll(&msg2);
+        try writer.flush();
+        debugPrint("[NOISE] Responder: msg2 sent\n", .{});
+
+        // <- s, se
+        debugPrint("[NOISE] Responder: waiting for msg3 ({} bytes)\n", .{DH_LEN + TAG_LEN + TAG_LEN});
+        var msg3: [DH_LEN + TAG_LEN + TAG_LEN]u8 = undefined;
+        try reader.readSliceAll(&msg3);
+        debugPrint("[NOISE] Responder: msg3 received\n", .{});
+
+        // Decrypt s (using temp_k from previous es operation)
+        debugPrint("[NOISE] Responder: decrypting static key\n", .{});
+        const encrypted_rs = msg3[0 .. DH_LEN + TAG_LEN];
+        var rs: [DH_LEN]u8 = undefined;
+
+        const encrypted_rs_ct = encrypted_rs[0..DH_LEN];
+        const encrypted_rs_tag = encrypted_rs[DH_LEN..].*;
+        aeadDecrypt(
+            cipher_type,
+            &rs,
+            encrypted_rs_ct,
+            encrypted_rs_tag,
+            &h,
+            nextHandshakeNonce(&n),
+            temp_k,
+        ) catch |err| {
+            debugPrint("[NOISE] Responder: static key decryption failed: {}\n", .{err});
+            return error.DecryptionFailed;
+        };
+        debugPrint("[NOISE] Responder: static key decrypted successfully\n", .{});
+
+        // Mix encrypted_rs into h
+        mixHash(&h, encrypted_rs);
+
+        // se - MixKey(dh_se): Updates ck and derives temp_k from DH output
+        const dh_se = X25519.scalarmult(e_keypair.secret_key, rs) catch return error.DHFailed;
+        defer crypto.secureZero(u8, @constCast(&dh_se));
+        hkdf2(&chaining_key, &temp_k, chaining_key, &dh_se);
+        n = 0;
+
+        // Decrypt empty payload (verify tag using temp_k from se operation)
+        const payload_tag2 = msg3[DH_LEN + TAG_LEN ..].*;
+        var decrypted: [0]u8 = undefined;
+        try aeadDecrypt(
+            cipher_type,
+            &decrypted,
+            &[_]u8{},
+            payload_tag2,
+            &h,
+            nextHandshakeNonce(&n),
+            temp_k,
+        );
+        mixHash(&h, &payload_tag2);
+
+        // Split into transport keys (reversed for responder)
+        var key1: [KEY_LEN]u8 = undefined;
+        var key2: [KEY_LEN]u8 = undefined;
+        hkdf2(&key1, &key2, chaining_key, &[_]u8{});
+
+        const result = HandshakeResult{
+            .send_cipher = TransportCipher.init(key2, cipher_type),
+            .recv_cipher = TransportCipher.init(key1, cipher_type),
+        };
+        // TransportCipher.init copied the keys into its own state — wipe
+        // local copies before continuing into the PSK auth exchange.
+        crypto.secureZero(u8, &key1);
+        crypto.secureZero(u8, &key2);
+
+        const handshake_hash: []const u8 = h[0..];
+        var peer_tag_buf: [HASH_LEN]u8 = undefined;
+        debugPrint("[NOISE] Responder: waiting for client PSK auth tag ({} bytes)\n", .{peer_tag_buf.len});
+        try reader.readSliceAll(peer_tag_buf[0..]);
+        debugPrint("[NOISE] Responder: received client PSK auth tag\n", .{});
+        const expected_peer = computeAuthTag(psk, handshake_hash, 'I');
+        // Use constant-time comparison to prevent timing attacks on PSK authentication
+        if (!common.constantTimeEqual(peer_tag_buf[0..], expected_peer[0..])) return error.AuthenticationFailed;
+
+        const local_tag = computeAuthTag(psk, handshake_hash, 'R');
+        debugPrint("[NOISE] Responder: sending PSK auth tag ({} bytes)\n", .{local_tag.len});
+        try writer.writeAll(local_tag[0..]);
+        try writer.flush();
+        debugPrint("[NOISE] Responder: PSK auth tag sent\n", .{});
+
+        return result;
+    }
+}
+
+test "handshake AEAD nonce is unique per op on a key" {
+    var key: [KEY_LEN]u8 = undefined;
+    @memset(&key, 0x11);
+    const ad = "handshake-hash-associated-data!";
+
+    var n: u64 = 0;
+    var tag0: [TAG_LEN]u8 = undefined;
+    var tag1: [TAG_LEN]u8 = undefined;
+    aeadEncrypt(.chacha20poly1305, &[_]u8{}, &tag0, &[_]u8{}, ad, nextHandshakeNonce(&n), key);
+    aeadEncrypt(.chacha20poly1305, &[_]u8{}, &tag1, &[_]u8{}, ad, nextHandshakeNonce(&n), key);
+    try std.testing.expectEqual(@as(u64, 2), n);
+    try std.testing.expect(!std.mem.eql(u8, &tag0, &tag1));
+
+    n = 0;
+    var aegis0: [TAG_LEN]u8 = undefined;
+    var aegis1: [TAG_LEN]u8 = undefined;
+    aeadEncrypt(.aegis128l, &[_]u8{}, &aegis0, &[_]u8{}, ad, nextHandshakeNonce(&n), key);
+    aeadEncrypt(.aegis128l, &[_]u8{}, &aegis1, &[_]u8{}, ad, nextHandshakeNonce(&n), key);
+    try std.testing.expect(!std.mem.eql(u8, &aegis0, &aegis1));
+
+    const n12 = TransportCipher.makeNonce12(1);
+    const n16 = padHandshakeNonce16(n12);
+    const n32 = padHandshakeNonce32(n12);
+    try std.testing.expect(std.mem.eql(u8, n16[0..12], &n12));
+    try std.testing.expect(std.mem.eql(u8, n32[0..12], &n12));
+    try std.testing.expect(!std.mem.eql(u8, n16[0..12], &([_]u8{0} ** 12)));
+}
